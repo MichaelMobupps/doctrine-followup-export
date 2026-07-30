@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Doctrine Follow-up — API Dashboard</title>
+  <style>
+    :root { --bg: #0e0f11; --card: #16171b; --border: #2a2c33; --text: #e4e4e7; --dim: #5c5e66; --accent: #4f8ff7; --green: #34d399; --amber: #f59e0b; --mono: 'SF Mono', 'Cascadia Mono', monospace; }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); padding: 2rem; max-width: 800px; margin: 0 auto; }
+    h1 { font-size: 18px; font-weight: 600; margin-bottom: 6px; }
+    .sub { color: var(--dim); font-size: 13px; margin-bottom: 2rem; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin-bottom: 2rem; }
+    .stat { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+    .stat-label { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
+    .stat-val { font-family: var(--mono); font-size: 20px; font-weight: 600; margin-top: 4px; }
+    .stat-val.a { color: var(--accent); } .stat-val.g { color: var(--green); } .stat-val.w { color: var(--amber); }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 2rem; }
+    button { font-family: inherit; font-size: 13px; padding: 8px 16px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); color: var(--text); cursor: pointer; }
+    button:hover { border-color: #444; }
+    .log { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; font-family: var(--mono); font-size: 12px; color: var(--dim); max-height: 400px; overflow-y: auto; white-space: pre-wrap; line-height: 1.6; }
+    .log .ok { color: var(--green); } .log .err { color: #ef4444; } .log .info { color: var(--accent); }
+    .section { margin-bottom: 1.5rem; }
+    .section h2 { font-size: 14px; font-weight: 500; color: var(--dim); margin-bottom: 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th { text-align: left; padding: 6px 8px; color: var(--dim); border-bottom: 1px solid var(--border); font-weight: 500; text-transform: uppercase; letter-spacing: .05em; font-size: 10px; }
+    td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
+    .badge { font-size: 10px; padding: 2px 6px; border-radius: 4px; }
+    .b-queued { background: rgba(79,143,247,.1); color: var(--accent); }
+    .b-sent { background: rgba(52,211,153,.1); color: var(--green); }
+  </style>
+</head>
+<body>
+  <h1>Doctrine Follow-up API</h1>
+  <p class="sub">Test dashboard — the real UI lives in the Gmail sidebar add-on</p>
+
+  <div class="stats">
+    <div class="stat"><div class="stat-label">Total sent</div><div class="stat-val" id="s-total">—</div></div>
+    <div class="stat"><div class="stat-label">Unreplied</div><div class="stat-val w" id="s-unrep">—</div></div>
+    <div class="stat"><div class="stat-label">Replied</div><div class="stat-val g" id="s-rep">—</div></div>
+    <div class="stat"><div class="stat-label">Queued FU</div><div class="stat-val a" id="s-q">—</div></div>
+    <div class="stat"><div class="stat-label">Sent FU</div><div class="stat-val g" id="s-fu">—</div></div>
+  </div>
+
+  <div class="actions">
+    <button onclick="testEndpoint('GET', '/api/stats')">GET /api/stats</button>
+    <button onclick="testEndpoint('GET', '/api/prospects')">GET /api/prospects</button>
+    <button onclick="testEndpoint('GET', '/api/prospects?vertical=gaming_ua')">prospects?vertical=gaming_ua</button>
+    <button onclick="testEndpoint('GET', '/api/followups?status=queued')">queued follow-ups</button>
+    <button onclick="testEndpoint('GET', '/api/followups?status=sent')">sent follow-ups</button>
+    <button onclick="testEndpoint('POST', '/api/sync')">POST /api/sync</button>
+    <button onclick="testEndpoint('POST', '/api/process')">POST /api/process</button>
+  </div>
+
+  <div class="section" id="groups-section" style="display:none">
+    <h2>Prospect groups</h2>
+    <div id="groups-table"></div>
+  </div>
+
+  <div class="section">
+    <h2>API log</h2>
+    <div class="log" id="log">Ready. Click a button to test an endpoint.\n</div>
+  </div>
+
+  <script>
+    const log = document.getElementById('log');
+    function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+    function appendLog(msg, cls) {
+      log.innerHTML += '<span class="' + (cls||'') + '">' + esc(msg) + '</span>\n';
+      log.scrollTop = log.scrollHeight;
+    }
+
+    async function loadStats() {
+      try {
+        const res = await fetch('/api/stats');
+        const d = await res.json();
+        document.getElementById('s-total').textContent = d.total_sent;
+        document.getElementById('s-unrep').textContent = d.unreplied;
+        document.getElementById('s-rep').textContent = d.replied;
+        document.getElementById('s-q').textContent = d.queued_followups;
+        document.getElementById('s-fu').textContent = d.sent_followups;
+      } catch(e) { appendLog('Stats load failed: ' + e.message, 'err'); }
+    }
+
+    async function testEndpoint(method, path) {
+      appendLog('→ ' + method + ' ' + path, 'info');
+      try {
+        const opts = { method };
+        if (method === 'POST') opts.headers = { 'Content-Type': 'application/json' };
+        const res = await fetch(path, opts);
+        const data = await res.json();
+        appendLog('← ' + res.status + ' ' + JSON.stringify(data, null, 2).substring(0, 1500), 'ok');
+
+        if (path.startsWith('/api/prospects') && Array.isArray(data)) {
+          renderGroups(data);
+        }
+
+        loadStats();
+      } catch(e) {
+        appendLog('← ERROR: ' + e.message, 'err');
+      }
+    }
+
+    function renderGroups(groups) {
+      const section = document.getElementById('groups-section');
+      const container = document.getElementById('groups-table');
+      if (!groups.length) { section.style.display = 'none'; return; }
+      section.style.display = 'block';
+      let html = '<table><tr><th>Batch</th><th>Unreplied</th><th>Replied</th><th>Total</th><th>Action</th></tr>';
+      for (const g of groups) {
+        html += '<tr><td>' + esc(g.label) + '</td><td>' + esc(String(g.unreplied)) + '</td><td>' + esc(String(g.replied)) + '</td><td>' + esc(String(g.total)) + '</td>';
+        html += '<td><button onclick="queueBatch(\'' + esc(g.vertical) + '\',\'' + esc(g.sent_date) + '\')">Queue stage 1</button></td></tr>';
+      }
+      html += '</table>';
+      container.innerHTML = html;
+    }
+
+    async function queueBatch(vertical, sentDate) {
+      appendLog('→ POST /api/queue-batch {vertical: "' + vertical + '", sent_date: "' + sentDate + '", stage: 1}', 'info');
+      try {
+        const res = await fetch('/api/queue-batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ vertical, sent_date: sentDate, stage: 1 }),
+        });
+        const data = await res.json();
+        appendLog('← ' + JSON.stringify(data), 'ok');
+        loadStats();
+      } catch(e) {
+        appendLog('← ERROR: ' + e.message, 'err');
+      }
+    }
+
+    loadStats();
+  </script>
+</body>
+</html>

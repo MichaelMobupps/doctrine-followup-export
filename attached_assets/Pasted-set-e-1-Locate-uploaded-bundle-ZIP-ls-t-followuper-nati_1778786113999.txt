@@ -1,0 +1,59 @@
+set -e
+
+# 1. Locate uploaded bundle
+ZIP=$(ls -t followuper-nativeness-v4*.zip 2>/dev/null | head -1)
+[[ -z "$ZIP" ]] && { echo "ERROR: upload followuper-nativeness-v4.zip to repl root first"; exit 1; }
+echo "Bundle: $ZIP"
+
+# 2. Extract
+rm -rf /tmp/followuper-nativeness-v4
+unzip -q "$ZIP" -d /tmp/
+
+# 3. Confirm live tree
+REPO_ROOT=$PWD
+LIVE_API="$REPO_ROOT/artifacts/api-server/src"
+[[ ! -d "$LIVE_API/lib" ]] && { echo "ERROR: $LIVE_API/lib not found — run from repo root"; exit 1; }
+echo "Live api-server tree: $LIVE_API"
+
+# 4. Symlink so patch's "api-server/{lib,services,tests}/..." paths resolve into the live tree
+rm -rf /tmp/v4-apply && mkdir -p /tmp/v4-apply
+ln -sfn "$LIVE_API" /tmp/v4-apply/api-server
+
+# 5. Apply 13 patches (idempotent, anchor-based)
+cd /tmp/v4-apply
+python3 /tmp/followuper-nativeness-v4/patches/apply_patches.py
+
+# 6. Confirm 4 things deterministically before tests:
+#    (a) v4 module present, (b) v4 forwarder wired, (c) v4.3 GREETING rule present 2x,
+#    (d) Thasawan→ทศวรรณ canonical example present
+echo "===== verifications ====="
+test -f "$LIVE_API/lib/nativenessV4.ts" && echo "OK  nativenessV4.ts installed"
+grep -q "buildNativenessBlockV4(languageTag)" "$LIVE_API/lib/languageNativeness.ts" && echo "OK  v4 forwarder wired"
+echo "GREETING NAME SCRIPT (CRITICAL count, must be 2): $(grep -c 'GREETING NAME SCRIPT (CRITICAL' "$LIVE_API/services/followupPrompts.ts")"
+grep -q "Thasawan" "$LIVE_API/services/followupPrompts.ts" && grep -q "ทศวรรณ" "$LIVE_API/services/followupPrompts.ts" && echo "OK  Thasawan → ทศวรรณ canonical example present"
+
+# 7. Run v3 + v4 test suites from live tree
+cd "$LIVE_API"
+echo "===== v3 tests (expect 67/67) ====="
+npx tsx tests/test-nativeness-v3.ts 2>&1 | grep -E "^# (tests|pass|fail|duration)" | head -4
+echo "===== v4 tests (expect 46/46) ====="
+npx tsx tests/test-nativeness-v4.ts 2>&1 | grep -E "^# (tests|pass|fail|duration)" | head -4
+
+# 8. Build api-server
+cd "$REPO_ROOT"
+pnpm --filter @workspace/api-server run build
+
+# 9. Mirror artifacts/ → source-code/
+if [[ -f source-code/sync.sh ]]; then
+    bash source-code/sync.sh && echo "Mirrored artifacts/ → source-code/"
+else
+    echo "NOTE: source-code/sync.sh not found — mirror manually if needed"
+fi
+
+# 10. Cleanup
+rm -rf /tmp/v4-apply
+
+echo
+echo "===== DEPLOY COMPLETE ====="
+echo "13 ops applied. Backups: $LIVE_API/{lib,services,tests}/*.v3_backup"
+echo "Rollback: find $LIVE_API -name '*.v3_backup' | while read b; do cp \"\$b\" \"\${b%.v3_backup}\" && rm \"\$b\"; done && rm -f $LIVE_API/lib/nativenessV4.ts $LIVE_API/tests/test-nativeness-v4.ts"

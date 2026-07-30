@@ -1,0 +1,72 @@
+# ===== VERIFY PATHS =====
+ls -l \
+  api-server/services/gmailSync.ts \
+  api-server/services/scheduler.ts \
+  api-server/routes/doctrine.ts \
+  api-server/routes/gmail-auth.ts \
+  api-server/index.ts \
+  api-server/lib/constants.ts \
+  dashboard/pages/prospects.tsx \
+  api-server/scripts/createLabels.ts || true
+
+# ===== ENSURE DIRECTORIES EXIST =====
+mkdir -p api-server/services api-server/routes api-server/lib api-server/scripts dashboard/pages
+
+# ===== BACKUPS =====
+cp api-server/services/gmailSync.ts api-server/services/gmailSync_backup.ts 2>/dev/null || true
+cp api-server/services/scheduler.ts api-server/services/scheduler_backup.ts 2>/dev/null || true
+cp api-server/routes/doctrine.ts api-server/routes/doctrine_backup.ts 2>/dev/null || true
+cp api-server/routes/gmail-auth.ts api-server/routes/gmail-auth_backup.ts 2>/dev/null || true
+cp api-server/index.ts api-server/index_backup.ts 2>/dev/null || true
+cp api-server/lib/constants.ts api-server/lib/constants_backup.ts 2>/dev/null || true
+cp dashboard/pages/prospects.tsx dashboard/pages/prospects_backup.tsx 2>/dev/null || true
+cp api-server/scripts/createLabels.ts api-server/scripts/createLabels_backup.ts 2>/dev/null || true
+
+echo "Backups created"
+
+# ===== OVERWRITE REQUIRED FILES =====
+
+cat > api-server/services/gmailSync.ts << 'EOF'
+# PASTE CONTENT FROM CURSOR: api-server/services/gmailSync.ts
+EOF
+
+cat > api-server/services/scheduler.ts << 'EOF'
+# PASTE CLEAN CONTENT FROM CURSOR: api-server/services/scheduler.ts
+EOF
+
+cat > api-server/routes/doctrine.ts << 'EOF'
+# PASTE CONTENT FROM CURSOR: api-server/routes/doctrine.ts
+EOF
+
+cat > api-server/routes/gmail-auth.ts << 'EOF'
+# PASTE CONTENT FROM CURSOR: api-server/routes/gmail-auth.ts
+EOF
+
+cat > api-server/index.ts << 'EOF'
+# PASTE CONTENT FROM CURSOR: api-server/index.ts
+EOF
+
+cat > api-server/lib/constants.ts << 'EOF'
+# PASTE CONTENT FROM CURSOR: api-server/lib/constants.ts
+EOF
+
+cat > dashboard/pages/prospects.tsx << 'EOF'
+# PASTE CONTENT FROM CURSOR: dashboard/pages/prospects.tsx
+EOF
+
+# ===== OVERWRITE OPTIONAL FILE =====
+
+cat > api-server/scripts/createLabels.ts << 'EOF'
+# PASTE CONTENT FROM CURSOR: api-server/scripts/createLabels.ts
+EOF
+
+echo "Files updated"
+
+# ===== INSTALL =====
+npm install
+
+# ===== BUILD / TYPECHECK =====
+npm run build || true
+
+# ===== RESTART =====
+kill 1

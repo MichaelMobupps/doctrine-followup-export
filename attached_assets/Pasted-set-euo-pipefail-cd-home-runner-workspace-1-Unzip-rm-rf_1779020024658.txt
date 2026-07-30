@@ -1,0 +1,84 @@
+set -euo pipefail
+cd /home/runner/workspace
+
+# 1. Unzip
+rm -rf /tmp/batch-b8c && mkdir -p /tmp/batch-b8c
+unzip -q ~/batch-b8c-typecheck-residuals.zip -d /tmp/batch-b8c
+
+# 2. Apply Category 3: thread-messages.ts (drizzle-native InsertThreadMessage)
+cp /tmp/batch-b8c/batch-b8c-typecheck-residuals/db/schema/thread-messages.ts lib/db/src/schema/thread-messages.ts
+
+# 3. Apply Categories 1 & 2: surgical Python regex on the 5 specific error lines.
+#    Idempotent (negative lookahead skips already-cast sites), self-reporting.
+python3 << 'PYEOF'
+import re
+import sys
+
+targets = [
+    ('artifacts/api-server/src/routes/doctrine.ts',       [(1210, 'string'),              (1282, 'string')]),
+    ('artifacts/api-server/src/routes/gmail-auth.ts',     [(204,  'string'),              (228,  'string')]),
+    ('artifacts/api-server/src/routes/email-inspector.ts',[(370,  'string | undefined')]),
+]
+
+# Match a bare req.query.<identifier> NOT already followed by ' as <word>'
+# and NOT preceded by 'String(' — both guards make this idempotent.
+pattern = re.compile(r'(?<!String\()\b(req\.query\.[a-zA-Z_][a-zA-Z0-9_]*)\b(?!\s+as\s+\w)')
+
+errors = []
+for fp, line_specs in targets:
+    print(f"\n--- {fp} ---")
+    try:
+        with open(fp) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        print(f"  ERROR: file not found")
+        errors.append(fp)
+        continue
+
+    changed = False
+    for ln, target_type in line_specs:
+        idx = ln - 1
+        if idx >= len(lines):
+            print(f"  WARN line {ln} beyond file end ({len(lines)} lines)")
+            continue
+        original = lines[idx]
+        cast = ' as string' if target_type == 'string' else ' as string | undefined'
+        new = pattern.sub(lambda m: f"({m.group(1)}{cast})", original)
+        if new != original:
+            print(f"  Line {ln}:")
+            print(f"    OLD: {original.rstrip()}")
+            print(f"    NEW: {new.rstrip()}")
+            lines[idx] = new
+            changed = True
+        else:
+            print(f"  NOOP line {ln} — pattern did not match (already cast, or different shape)")
+            print(f"    Content: {original.rstrip()}")
+    if changed:
+        with open(fp, 'w') as f:
+            f.writelines(lines)
+        print(f"  Wrote {fp}")
+PYEOF
+
+# 4. Rebuild lib/db .d.ts since thread-messages.ts schema changed.
+#    tsc -b is incremental — only the changed file gets re-emitted.
+rm -f lib/db/tsconfig.tsbuildinfo  # safer: force fresh check after schema edit
+
+# 5. Run typecheck — should now exit 0
+pnpm --filter @workspace/api-server run typecheck
+
+# 6. Verify the regenerated thread-messages.d.ts contains the narrowed direction type
+echo
+echo "=== regenerated thread-messages.d.ts (look for ThreadMessageDirection in InsertThreadMessage) ==="
+cat lib/db/dist/schema/thread-messages.d.ts 2>/dev/null | grep -A3 "InsertThreadMessage" | head -10
+
+# 7. Sanity: esbuild build still works
+pnpm --filter @workspace/api-server run build
+
+# 8. B9a unit test still passes
+pnpm --filter @workspace/api-server exec tsx --test artifacts/api-server/src/tests/test-thread-reader-b9a.ts
+
+# 9. Smoke probe
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:80/api || true
+
+# 10. Sync source-code mirror (source files DID change this batch)
+bash source-code/sync.sh

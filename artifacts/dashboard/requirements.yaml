@@ -1,0 +1,15 @@
+packages:
+  "framer-motion": "Smooth layout animations, page transitions, and micro-interactions"
+  "date-fns": "Easy date formatting for prospects and follow-ups"
+  "clsx": "Utility for constructing className strings conditionally"
+  "tailwind-merge": "Utility function to efficiently merge Tailwind CSS classes"
+  "lucide-react": "Beautiful, consistent icons for the dashboard"
+
+images:
+  - path: "artifacts/dashboard/public/images/login-bg.png"
+    description: "Dark mode abstract geometric gradient mesh background in deep black, charcoal, and subtle indigo hues. Highly professional, minimal, and sleek luxury tech aesthetic."
+    aspect_ratio: "16:9"
+
+notes:
+  - "Assuming @workspace/api-client-react exports the generated Orval hooks directly."
+  - "The API requires 'x-api-key' header which is managed via local storage and injected into the hook options."

@@ -1,0 +1,82 @@
+I'm deploying 8 patched source files + 1 one-off SQL migration that improve follow-up email quality substantially.
+
+The core architectural change: the follow-up LLM now receives the FULL original email body (not just a 5-12 word summary) so it can reference specific facts. This requires adding one new column to the prospects table.
+
+Secondary fixes in this bundle: prospect name is now parsed from the email's opening greeting ("Hi Jesaja," → Jesaja) instead of the Gmail header (which often contained the recipient's email local-part). Free-mail domains (gmail.com, yahoo.com, etc.) no longer become fake company names. And the Follow-ups page now has a 3-dots menu → modal that shows the original email each follow-up chain is based on.
+
+Files uploaded (the ones below are paths in this monorepo; in our layout they live under artifacts/ or similar prefix — locate by searching for a file named followups.tsx and use whatever prefix appears):
+
+   api-server/services/gmailClient.ts
+   api-server/services/gmailSync.ts
+   api-server/services/emailSummarizer.ts
+   api-server/services/followupPrompts.ts
+   api-server/services/scheduler.ts
+   api-server/routes/doctrine.ts
+   db/schema/prospects.ts
+   dashboard/pages/followups.tsx
+
+Plus one SQL file (NOT a source file — you run this manually against the production DB, don't commit it):
+   migration_add_original_body.sql
+
+Do all of the following in order. Do NOT skip.
+
+STEP 1 — Apply the migration FIRST, before redeploying any code.
+
+   psql "$PROD_DATABASE_URL" -f migration_add_original_body.sql
+
+   Then verify the column exists:
+
+   psql "$PROD_DATABASE_URL" -c "\d prospects" | grep original_body
+
+   Expected: TWO rows - original_body_summary (existing) and original_body (new).
+   If only the old one shows up, the migration failed — STOP and report.
+
+STEP 2 — Verify the 8 source files are present at their resolved paths.
+   If any is missing, STOP and tell me which.
+
+STEP 3 — Search for stale references to the old FollowupContext shape and the old field names:
+
+      "original_body_summary:" in the api-server codebase
+      "original_body:" in the api-server codebase
+
+   Expected hits for original_body_summary: followupPrompts.ts (interface field, prompt template, critic prompt, rewriter prompt), followupGenerator.ts (self-heal logic), scheduler.ts (context construction), gmailSync.ts (insert sites), doctrine.ts (select + response). That's ~8-12 legitimate hits.
+
+   Expected hits for original_body: followupPrompts.ts (interface, prompt, critic, rewriter), scheduler.ts (select + context), gmailSync.ts (insert sites x 2), doctrine.ts (select + response), prospects.ts schema. If anywhere else references these fields, check whether it needs updating.
+
+STEP 4 — Typecheck both workspaces (api-server and dashboard). Report any errors verbatim; do NOT make workaround changes without reporting first.
+
+   Likely friction point: the generated API client type for followups may not include the new fields until regenerated. If a type error complains about that, regenerate the client from openapi.yaml (if that's how your toolchain works) or add the fields manually to the generated types file. Do NOT change followups.tsx's local FollowupRow interface.
+
+STEP 5 — Do NOT run any automatic drizzle migration. The ALTER TABLE we ran in step 1 IS the migration. If drizzle-kit wants to run additional migrations, decline.
+
+STEP 6 — Republish to the ACTIVE production deployment at https://doctrine-followupv-2.replit.app.
+
+STEP 7 — Smoke test against production. Use a real API key.
+
+   7a) Verify the /followups response now includes the new fields:
+
+       curl -s -H "x-api-key: <APIKEY>" "https://doctrine-followupv-2.replit.app/api/followups?userId=1" | head -c 2000
+
+       Expected: each object has keys: original_body_summary, original_body, original_sent_at, gmail_thread_id, original_language. Legacy prospects will have original_body = "" (empty string) — that's expected, the new column defaults to empty for historical rows.
+
+   7b) Verify a sync writes the original body. Trigger a sync (however Michael normally does — run /api/sync or equivalent), then:
+
+       psql "$PROD_DATABASE_URL" -c "SELECT id, LENGTH(original_body) AS body_len, LENGTH(original_body_summary) AS summary_len FROM prospects ORDER BY id DESC LIMIT 5;"
+
+       Expected: newly-synced rows have body_len > 0 (typically 200-3000). Historical rows still have body_len = 0.
+
+   7c) Log in to the dashboard, open Follow-ups tab, click the 3-dots button on any thread. Expected: a modal opens showing recipient, company, subject, sent date, original email body (or a "not captured" note for legacy rows), and an "Open in Gmail" link.
+
+STEP 8 — Report back:
+   - Migration output (step 1)
+   - Paths found for the 8 files (step 2)
+   - Leftover-search output (step 3)
+   - Build result (step 4)
+   - /followups response shape — paste first 1 object verbatim (step 7a)
+   - Body/summary length query output (step 7b)
+   - Confirmation the modal renders correctly for at least one thread (step 7c)
+
+Do NOT:
+- Commit the SQL file to the repo
+- Reintroduce the removed "summarize body into 5-12 word noun phrase and throw body away" behavior — the new architecture keeps the summary AND the body, both have distinct purposes
+- Modify .replit or other infra files I didn't upload

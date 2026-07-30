@@ -1,0 +1,539 @@
+/**
+ * doctrineLint.ts
+ *
+ * Deterministic pre-flight checks that run BEFORE the LLM critic, producing
+ * issues + suggestions that get merged into the critique. Follows the same
+ * pattern as the existing `detectMetaLanguage` helper in followupGenerator.ts.
+ *
+ * Two detectors:
+ *   detectDoctrineViolations(body, lang) \u2014 runs the subset of Michael SDR
+ *     Formula rules that apply to follow-up emails (hedge on numbers, hype
+ *     adjectives, CPA-collapse pattern, multi-event optimization claims).
+ *
+ *   detectNativenessViolations(body, lang) \u2014 catches the Zekri-class
+ *     failure where multi-word English phrases (lowercase, 2+ consecutive
+ *     content words) appear inside non-Latin-script prose. This is the
+ *     deterministic side of the v2 language-nativeness work that the
+ *     existing `lib/languageNativeness.ts` did not ship.
+ *
+ * Both detectors return:
+ *   { found: boolean; issues: string[]; suggestions: string[]; matches: string[] }
+ */
+
+import {
+  findHedgesInBody,
+  findHypeAdjectivesInBody,
+  findForbiddenDiffPatterns,
+  findMultiEventPatterns,
+} from "./doctrineRules";
+import { normalizeLanguageCode } from "./languageNativeness";
+// v4: aggregator extended to include translationese patterns (literal
+// English-idiom translations) and universal greeting-name adaptation.
+// v3 keys are preserved exactly; v4 adds translationese and
+// greeting_name_adaptation, plus filters forbidden_singletons by the
+// per-language NATIVE_ENGLISH_LOANWORDS exemption set.
+import { findAllNativenessViolationsV4 } from "./nativenessV4";
+import { findAllNativenessViolations } from "./nativenessV3";
+
+export interface ViolationReport {
+  found: boolean;
+  issues: string[];
+  suggestions: string[];
+  matches: string[];
+}
+
+const EMPTY_REPORT: ViolationReport = {
+  found: false,
+  issues: [],
+  suggestions: [],
+  matches: [],
+};
+
+// =============================================================================
+// Doctrine violations applicable to follow-up emails
+// =============================================================================
+
+/**
+ * Run the deterministic doctrine checks that apply to follow-up emails.
+ * This is a SUBSET of the full Prospector cold-outbound doctrine \u2014
+ * follow-ups don't have a WHAT/DIFFERENTIATOR section per se, but if a
+ * follow-up makes a value claim that collapses onto CPA, that's still
+ * worth catching. Hedge + hype + multi-event apply universally.
+ */
+export function detectDoctrineViolations(body: string, languageTag: string): ViolationReport {
+  const lang = normalizeLanguageCode(languageTag) || "en";
+  const issues: string[] = [];
+  const suggestions: string[] = [];
+  const matches: string[] = [];
+
+  // 1. Hedge on number
+  const hedges = findHedgesInBody(body, lang);
+  if (hedges.length > 0) {
+    matches.push(...hedges);
+    issues.push(
+      `HEDGED NUMBER DETECTED \u2014 the email uses hedge words before a number ` +
+      `(${hedges.slice(0, 3).map((h) => `"${h}"`).join(", ")}). ` +
+      `Volume and metric claims must be decisive. Write "250" or "250+", ` +
+      `not "around 250" or "approximately 250" or the target-language equivalent.`,
+    );
+    suggestions.push(
+      "Replace every hedge-plus-number phrase with a single decisive number " +
+      "(\"250\" or \"250+\"). Numbers carry credibility; hedges undercut it.",
+    );
+  }
+
+  // 2. Hype adjectives
+  const hype = findHypeAdjectivesInBody(body, lang);
+  if (hype.length > 0) {
+    matches.push(...hype);
+    issues.push(
+      `HYPE ADJECTIVES IN BODY \u2014 marketing-deck adjectives detected ` +
+      `(${hype.slice(0, 4).map((h) => `"${h}"`).join(", ")}). ` +
+      `These read as filler. Numbers, mechanics, and named competitors ` +
+      `carry the claim, not adjectives.`,
+    );
+    suggestions.push(
+      "Cut every hype adjective from the body. If a sentence loses its " +
+      "punch without the adjective, the sentence was leaning on the " +
+      "adjective instead of on a real fact \u2014 replace it with a number, a " +
+      "mechanism, or a named entity.",
+    );
+  }
+
+  // 3. Multi-event optimization claim
+  const multiEvent = findMultiEventPatterns(body, lang);
+  if (multiEvent.length > 0) {
+    matches.push(...multiEvent);
+    issues.push(
+      `MULTI-EVENT OPTIMIZATION CLAIM \u2014 the email lists two or more event ` +
+      `types as the optimization target (${multiEvent.slice(0, 2).map((m) => `"${m}"`).join(", ")}). ` +
+      `Optimization claims must anchor on EXACTLY ONE primary event. ` +
+      `Other related events may appear as adjacent context but not as the anchor.`,
+    );
+    suggestions.push(
+      "Pick the single dominant revenue event by volume for the prospect's " +
+      "business and use that one. Drop the \"or X or Y\" tail.",
+    );
+  }
+
+  // 4. CPA-collapse pattern in any paragraph (follow-ups have no fixed
+  // DIFFERENTIATOR section, so scan the whole body).
+  const forbidden = findForbiddenDiffPatterns(body, lang);
+  if (forbidden.length > 0) {
+    matches.push(...forbidden);
+    issues.push(
+      `CPA-AS-DIFFERENTIATOR COLLAPSE \u2014 the email claims a differentiator ` +
+      `that is actually just CPA (${forbidden.slice(0, 2).map((f) => `"${f}"`).join(", ")}). ` +
+      `Every ad network can offer "we pay only for approved events"; it is ` +
+      `not a real differentiator. Approved anchors are renewals/persistence, ` +
+      `incrementality, or semi-exclusive supply.`,
+    );
+    suggestions.push(
+      "If the follow-up needs a differentiating claim, anchor it on one of: " +
+      "renewals/persistence (durable revenue past the first conversion cycle), " +
+      "incrementality (incremental users vs cannibalized), or semi-exclusive " +
+      "supply (publishers not shared with named competitors). Avoid \"we pay " +
+      "for X, not Y\" framing entirely.",
+    );
+  }
+
+  return {
+    found: issues.length > 0,
+    issues,
+    suggestions,
+    matches,
+  };
+}
+
+// =============================================================================
+// Language nativeness: Latin-token-leak detection
+// =============================================================================
+
+/**
+ * Set of language codes whose script is NOT Latin and therefore should be
+ * checked for multi-word English phrase leaks. For Latin-script languages
+ * (en, es, pt, it, fr, de, nl, sv, etc.), this detector is a no-op.
+ */
+const NON_LATIN_LANGUAGES = new Set([
+  // Cyrillic
+  "ru", "uk", "bg", "be", "sr", "mk",
+  // Greek
+  "el",
+  // East Asian
+  "zh", "ja", "ko",
+  // Middle Eastern
+  "ar", "he", "fa", "ur",
+  // South Asian
+  "hi", "bn", "ta", "te", "mr", "gu", "kn", "ml", "pa",
+  // Southeast Asian
+  "th", "lo", "km", "my",
+  // Other
+  "am", "ka", "hy",
+]);
+
+/**
+ * Industry-standard acronyms that are always permitted as standalone Latin
+ * tokens inside non-Latin prose, even when they appear in a multi-word run.
+ * Comparison is case-insensitive but original casing is preserved for output.
+ */
+const PERMITTED_ACRONYMS = new Set([
+  // Adtech
+  "UA", "LTV", "ROAS", "CPI", "CPA", "CPM", "CPC", "CTR", "CVR",
+  "MMP", "DSP", "SSP", "RTB", "PMP", "SDK", "IAP", "KPI",
+  "MAU", "DAU", "ARPU", "ARPDAU", "AOV", "ROI", "OEM", "API",
+  "B2B", "B2C", "D7", "D30", "D90",
+  // General
+  "USD", "EUR", "GBP", "JPY", "CNY", "INR", "THB", "MYR", "SGD",
+  "AI", "ML", "SaaS", "PaaS", "IaaS", "iOS", "URL", "HTTP", "JSON",
+  "Q1", "Q2", "Q3", "Q4", "YoY", "MoM", "QoQ",
+]);
+
+/**
+ * Internal: split a paragraph into runs of consecutive Latin words.
+ * Words are A-Z/a-z plus hyphens/apostrophes; runs are separated by any
+ * non-Latin character (including whitespace embedded in non-Latin context
+ * is handled via the paragraph segmentation step \u2014 here we only split
+ * on characters that break a run).
+ *
+ * Returns array of {phrase, startIdx, endIdx, words}.
+ */
+function extractLatinRuns(paragraph: string): Array<{ phrase: string; words: string[] }> {
+  // Match runs of: Latin word, then 1+ (whitespace/comma/period + Latin word).
+  // A Latin word: starts with a letter, contains letters/digits/hyphens/apostrophes,
+  // minimum 2 characters to avoid matching single letters.
+  const RUN_RE = /[A-Za-z][A-Za-z\d'-]+(?:[ \t,.](?:[ \t,.])*[A-Za-z][A-Za-z\d'-]+)+/g;
+  const runs: Array<{ phrase: string; words: string[] }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = RUN_RE.exec(paragraph)) !== null) {
+    const phrase = m[0].trim();
+    const words = phrase.split(/[\s,.]+/).filter((w) => w.length > 0);
+    if (words.length >= 2) {
+      runs.push({ phrase, words });
+    }
+  }
+  return runs;
+}
+
+/**
+ * Internal: estimate whether a paragraph is "primarily non-Latin script"
+ * (so Latin tokens in it count as foreign-language leaks). Threshold: 15%
+ * of non-whitespace characters must be non-Latin. CJK scripts pack a lot
+ * of semantic content into few characters, so a short Chinese sentence
+ * with a 3-word English phrase pasted in may show only ~20% non-Latin
+ * even though it is unambiguously a Chinese-target paragraph. We lean
+ * toward catching the violation; the cost of a false positive in a
+ * primarily-English paragraph is low (target language must also be
+ * non-Latin for this detector to fire at all).
+ */
+function isPrimarilyNonLatin(paragraph: string): boolean {
+  let latin = 0;
+  let nonLatin = 0;
+  for (const ch of paragraph) {
+    if (/\s/.test(ch)) continue;
+    const code = ch.codePointAt(0)!;
+    // Latin block + Latin-1 Supplement = 0x0000..0x024F (broad)
+    if ((code >= 0x0020 && code <= 0x024F) || /[\x20-\x7e]/.test(ch)) {
+      latin++;
+    } else {
+      nonLatin++;
+    }
+  }
+  const total = latin + nonLatin;
+  if (total === 0) return false;
+  // Require at least 3 non-Latin chars AND at least 15% non-Latin ratio so
+  // that a single foreign name like "François" in an English paragraph
+  // doesn't flip the paragraph into "target-language mode".
+  return nonLatin >= 3 && nonLatin / total >= 0.15;
+}
+
+/**
+ * Internal: classify a Latin run as a violation or not.
+ *
+ * Rules:
+ *   * All-acronyms run (e.g. "ROAS CPI") \u2192 not a violation.
+ *   * Proper-noun run (all words start with a capital letter) \u2192 not a
+ *     violation, even though it's Latin.
+ *   * Mixed (some capitals, some lowercase) \u2014 typically a proper noun
+ *     plus an adjective ("Brand Day cohort") \u2014 not a violation.
+ *   * All-lowercase run with 2+ words \u2192 VIOLATION (the Zekri pattern).
+ *   * Run with 2+ consecutive lowercase content words anywhere \u2192 VIOLATION.
+ *
+ * Returns null if not a violation, or the violating phrase if it is.
+ */
+function classifyLatinRun(run: { phrase: string; words: string[] }): string | null {
+  const { words } = run;
+  // Strip acronyms; if everything that's left is empty or a single word, no violation
+  const remaining = words.filter((w) => !PERMITTED_ACRONYMS.has(w));
+  if (remaining.length < 2) return null;
+
+  // Are all remaining words capitalized? Proper-noun-style runs are allowed.
+  const allCapitalized = remaining.every((w) => /^[A-Z]/.test(w));
+  if (allCapitalized) return null;
+
+  // Are there 2+ consecutive lowercase content words anywhere in the run?
+  let consecutiveLowercase = 0;
+  let maxConsecutive = 0;
+  for (const w of remaining) {
+    if (/^[a-z]/.test(w) && w.length >= 3) {
+      consecutiveLowercase++;
+      maxConsecutive = Math.max(maxConsecutive, consecutiveLowercase);
+    } else {
+      consecutiveLowercase = 0;
+    }
+  }
+
+  if (maxConsecutive >= 2) {
+    return run.phrase;
+  }
+
+  return null;
+}
+
+/**
+ * detectNativenessViolations: v3 aggregator.
+ *
+ * Reading-A++ policy enforcement at the deterministic-lint layer. Runs
+ * every v3 detector (multi-word forbidden phrases, Latin-token runs in
+ * non-Latin prose, English content singletons, X-not-Y comma-negation,
+ * untransliterated greeting names) and folds all hits into the existing
+ * ViolationReport shape so callers in followupGenerator / contextFollowup
+ * keep working with no changes.
+ */
+export function detectNativenessViolations(body: string, languageTag: string): ViolationReport {
+  // v4: use the v4 aggregator which extends v3 with translationese
+  // patterns + greeting-name-adaptation, and filters v3's singleton
+  // flag by the NATIVE_ENGLISH_LOANWORDS exemption set per language.
+  const report = findAllNativenessViolationsV4(body, languageTag);
+  const issues: string[] = [];
+  const suggestions: string[] = [];
+  const matches: string[] = [];
+
+  if (report.forbidden_phrases.length > 0) {
+    const sample = report.forbidden_phrases.slice(0, 4).map(p => `"${p}"`).join(", ");
+    issues.push(
+      `FORBIDDEN-ENGLISH-PHRASE \u2014 multi-word English adtech phrase(s) ` +
+      `inside ${languageTag} prose (${sample}). v3 Reading-A++ requires ` +
+      `every multi-word English phrase to be translated entirely; splitting ` +
+      `the phrase (translating one word and leaving another in English) is ` +
+      `also a violation.`
+    );
+    suggestions.push(
+      "Rewrite every flagged multi-word phrase into the target language. " +
+      "Use the per-language TRANSLATION REFERENCE in the nativeness block " +
+      "if one is provided for this language."
+    );
+    matches.push(...report.forbidden_phrases);
+  }
+
+  if (report.latin_token_runs.length > 0) {
+    const sample = report.latin_token_runs.slice(0, 4).map(r => `"${r}"`).join(", ");
+    issues.push(
+      `LATIN-TOKEN-RUN \u2014 2+ consecutive non-allowlist Latin words ` +
+      `inside non-Latin-script ${languageTag} prose (${sample}). Every ` +
+      `multi-word Latin run inside non-Latin prose must be translated or ` +
+      `transliterated. Only curated acronyms (CPI, ROAS, LTV, etc.) and ` +
+      `proper nouns may remain in Latin script.`
+    );
+    suggestions.push(
+      "Translate or transliterate every flagged Latin run. If the run is " +
+      "genuinely a proper noun (brand name, product name, person name), " +
+      "it stays as is; otherwise it is rewritten in the target language."
+    );
+    matches.push(...report.latin_token_runs);
+  }
+
+  if (report.forbidden_singletons.length > 0) {
+    const sample = report.forbidden_singletons.slice(0, 6).map(s => `"${s}"`).join(", ");
+    issues.push(
+      `FORBIDDEN-ENGLISH-SINGLETON \u2014 English content word(s) inside ` +
+      `${languageTag} prose (${sample}). v3 Reading-A++ permits ONLY ` +
+      `curated acronyms and proper nouns in Latin script. Every other ` +
+      `English content word \u2014 including capitalized loan-nouns like ` +
+      `German "Conversion" or "Performance" \u2014 must be translated.`
+    );
+    suggestions.push(
+      "Translate every flagged English content word into the target " +
+      "language. The historical ENGLISH-TOLERANT / ENGLISH-HEAVY carve-outs " +
+      "for German, Dutch, Nordics, Vietnamese, Thai, Indonesian, etc. are " +
+      "removed in v3."
+    );
+    matches.push(...report.forbidden_singletons);
+  }
+
+  if (report.x_not_y.length > 0) {
+    const sample = report.x_not_y.slice(0, 3).map(x => `"${x}"`).join(", ");
+    issues.push(
+      `X-NOT-Y \u2014 comma-plus-negation contrast pattern (${sample}). ` +
+      `This cadence reads as classic LLM output and humans detect it ` +
+      `instantly as AI writing. Applies in every language including English.`
+    );
+    suggestions.push(
+      "Rewrite each flagged X-not-Y phrase using \"rather than\" or " +
+      "\"instead of\" (or the target-language equivalent), or rephrase " +
+      "to drop the contrast entirely."
+    );
+    matches.push(...report.x_not_y);
+  }
+
+  if (report.untransliterated_greeting_name.length > 0) {
+    const sample = report.untransliterated_greeting_name.map(n => `"${n}"`).join(", ");
+    issues.push(
+      `UNTRANSLITERATED-GREETING-NAME \u2014 Latin-script name in greeting ` +
+      `line of non-Latin ${languageTag} email (${sample}). Native speakers ` +
+      `write names in the local script; "เรียน Songsitt" should be ` +
+      `"เรียน ทรงสิทธิ์".`
+    );
+    suggestions.push(
+      "Transliterate the prospect's first name into the target script " +
+      "in the greeting line. The sender's signature at the bottom stays " +
+      "in Latin."
+    );
+    matches.push(...report.untransliterated_greeting_name);
+  }
+
+  // v4: translationese lint emission. Flags literal-translated English
+  // idioms (evento norte, gancho de, mistura de editores, contra o
+  // CPA, etc.) — patterns whose individual words are correct local-
+  // language tokens but whose combination reads as translated-from-
+  // English. Full per-language reference in nativenessV4.ts.
+  if (report.translationese.length > 0) {
+    const sample = report.translationese.slice(0, 5).map(t => `"${t}"`).join(", ");
+    issues.push(
+      `TRANSLATIONESE-PATTERN \u2014 literal-translated English idiom(s) ` +
+      `inside ${languageTag} prose (${sample}). v4 native-style rule: ` +
+      `native speakers do not use these constructions even though the ` +
+      `individual words are correct local-language tokens.`
+    );
+    suggestions.push(
+      "Rewrite each flagged phrase using native alternatives from the " +
+      "v4 NATIVE STYLE GUIDE for this language."
+    );
+    matches.push(...report.translationese);
+  }
+
+  // v4 Round-2: REPEATING-DISCOURSE-MARKER
+  if (report.repeating_discourse_markers.length > 0) {
+    const markerList = report.repeating_discourse_markers
+      .slice(0, 5)
+      .map(h => `"${h.marker}" (${h.count}x)`)
+      .join(", ");
+    issues.push(
+      `REPEATING-DISCOURSE-MARKER \u2014 sentence-starter discourse ` +
+      `marker(s) used 2+ times inside ${languageTag} prose (${markerList}). ` +
+      `Native business style varies phrasing rather than reusing the same ` +
+      `"worth mentioning"-class sentence-starter.`
+    );
+    suggestions.push(
+      "Replace the second (and later) occurrences with a different " +
+      "connector or rephrase the sentence to avoid the marker entirely."
+    );
+    matches.push(...report.repeating_discourse_markers.map(h => h.marker));
+  }
+
+  // v4 Round-2: SEMICOLON-NO-CONNECTOR
+  if (report.semicolon_no_connector.length > 0) {
+    const first = report.semicolon_no_connector[0];
+    const sugg = first.suggestions.slice(0, 3).map(s => `"${s}"`).join(", ");
+    issues.push(
+      `SEMICOLON-NO-CONNECTOR \u2014 semicolon followed by ` +
+      `"${first.followedBy}" instead of a connector word in ` +
+      `${languageTag} prose. Native style anchors the post-semicolon ` +
+      `clause with a connector.`
+    );
+    suggestions.push(
+      `Add one of: ${sugg} after the semicolon, or replace the semicolon ` +
+      `with a period and start the next sentence with a connector.`
+    );
+    matches.push(...report.semicolon_no_connector.map(h => h.followedBy));
+  }
+
+  // v4 Round-2: NON-REFLEXIVE-ROMANCE-VERB
+  if (report.non_reflexive_romance_verbs.length > 0) {
+    const verbList = report.non_reflexive_romance_verbs
+      .slice(0, 5)
+      .map(h => `"${h.verb}" -> "${h.expected}"`)
+      .join(", ");
+    issues.push(
+      `NON-REFLEXIVE-ROMANCE-VERB \u2014 Romance verb(s) used in bare ` +
+      `form where the reflexive is canonical for business prose in ` +
+      `${languageTag} (${verbList}).`
+    );
+    suggestions.push(
+      "Add the reflexive pronoun before the verb when the subject is the " +
+      "offering/structure/integration itself (most business contexts)."
+    );
+    matches.push(...report.non_reflexive_romance_verbs.map(h => h.verb));
+  }
+
+  if (issues.length === 0) return EMPTY_REPORT;
+  return { found: true, issues, suggestions, matches };
+}
+
+/** Legacy v1 body, retained for audit only. Not called. */
+function _detectNativenessViolations_v1_LEGACY_REMOVED(body: string, languageTag: string): ViolationReport {
+  const lang = normalizeLanguageCode(languageTag);
+  if (!lang || !NON_LATIN_LANGUAGES.has(lang)) {
+    return EMPTY_REPORT;
+  }
+
+  // Split into paragraphs. Use newline-based segmentation; the Followuper
+  // produces \n\n-separated paragraphs in body text.
+  const paragraphs = body.split(/\n\n+/).map((p) => p.trim()).filter((p) => p.length > 0);
+
+  const violations: string[] = [];
+
+  for (const para of paragraphs) {
+    if (!isPrimarilyNonLatin(para)) continue;
+
+    const runs = extractLatinRuns(para);
+    for (const run of runs) {
+      const viol = classifyLatinRun(run);
+      if (viol) violations.push(viol);
+    }
+  }
+
+  if (violations.length === 0) return EMPTY_REPORT;
+
+  const sample = violations.slice(0, 4).map((v) => `"${v}"`).join(", ");
+  return {
+    found: true,
+    issues: [
+      `LATIN-TOKEN-LEAK \u2014 multi-word English phrases detected inside ` +
+      `non-Latin-script prose (${sample}). This is the most common signal ` +
+      `that the writer pasted English chunks from the original brief ` +
+      `instead of expressing the concept natively in ${languageTag}. ` +
+      `Each flagged phrase must be rewritten as a native phrase in the ` +
+      `target language, unless it is an industry-standard acronym ` +
+      `(UA, LTV, ROAS, CPI, CPA, MMP, DSP, SDK, IAP, KPI) or a proper noun ` +
+      `(company name, product name, branded event name).`,
+    ],
+    suggestions: [
+      "Rewrite every flagged Latin run in the target language. Single " +
+      "industry-standard adtech tokens (cohort, retention, event) that " +
+      "the language's guide explicitly permits MAY stay in English as " +
+      "isolated single words, but never as multi-word sequences like " +
+      "\"quality user acquisition\" or \"approved revenue events\". " +
+      "Multi-word English phrases are always a violation in non-Latin scripts.",
+      "If a Latin phrase is genuinely a proper noun (e.g., \"Brand Day\", " +
+      "\"King Power Online\"), keep it. The detector only flags lowercase " +
+      "multi-word runs, but if you produced an all-capitalized phrase that " +
+      "is not actually a proper noun, treat it the same way \u2014 rewrite it " +
+      "natively.",
+    ],
+    matches: violations,
+  };
+}
+
+/**
+ * Convenience: run both detectors and merge their reports.
+ */
+export function detectAllDeterministicViolations(body: string, languageTag: string): ViolationReport {
+  const doc = detectDoctrineViolations(body, languageTag);
+  const nat = detectNativenessViolations(body, languageTag);
+  return {
+    found: doc.found || nat.found,
+    issues: [...doc.issues, ...nat.issues],
+    suggestions: [...doc.suggestions, ...nat.suggestions],
+    matches: [...doc.matches, ...nat.matches],
+  };
+}

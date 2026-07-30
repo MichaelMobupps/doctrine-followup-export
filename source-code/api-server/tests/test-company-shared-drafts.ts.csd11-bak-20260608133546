@@ -1,0 +1,265 @@
+/**
+ * test-company-shared-drafts.ts
+ *
+ * Unit tests for the pure helpers in companyDraftCache (CSD v1). The
+ * db-backed functions (lookup/store/count/prune) are integration-tested
+ * against the live database; here we lock the cohort-identity contract that
+ * decides when two contacts may legally share one generated draft.
+ *
+ * The two invariants that matter most commercially and reputationally:
+ *   1. LANGUAGE ISOLATION — an English-thread contact must never be served
+ *      a Spanish shared draft, and vice versa.
+ *   2. HISTORY ISOLATION — a shared draft is only reused across contacts
+ *      whose prior sent follow-ups are byte-identical.
+ *
+ * Run: pnpm --filter @workspace/api-server exec tsx --test src/tests/test-company-shared-drafts.ts
+ */
+
+import * as test from "node:test";
+import * as assert from "node:assert/strict";
+
+import {
+  normalizeCompanyKey,
+  normalizeLanguage,
+  buildBatchKey,
+  buildContextHash,
+  buildHistoryHash,
+  buildCohortDescriptor,
+  buildAlignmentKey,
+  pickCohortAnchors,
+  isSharedDraftFresh,
+  SHARED_DRAFT_TTL_HOURS,
+} from "../services/companyDraftCache";
+
+const SENT_AT = new Date("2026-06-01T09:30:00Z");
+
+function baseDescriptorArgs() {
+  return {
+    userId: 7,
+    app: "doctrine",
+    company: "Acme Mobile GmbH",
+    originalLanguage: "en",
+    stage: 2,
+    cycle: 1,
+    vertical: "gaming_ua",
+    subVertical: null as string | null,
+    product: "ua",
+    originalSubject: "MobUpps x Acme — gaming UA in DACH",
+    batchLabel: "dach-wave-3",
+    sentAt: SENT_AT,
+    previousFollowups: [{ stage: 1, subject: "Re: MobUpps x Acme", body: "Following up on my note." }],
+  };
+}
+
+test.describe("normalizeCompanyKey", () => {
+  test.it("lowercases, trims, collapses whitespace", () => {
+    assert.equal(normalizeCompanyKey("  Acme   Mobile  GmbH "), "acme mobile gmbh");
+  });
+  test.it("empty and null-ish are empty", () => {
+    assert.equal(normalizeCompanyKey(""), "");
+    assert.equal(normalizeCompanyKey("   "), "");
+    assert.equal(normalizeCompanyKey(null), "");
+    assert.equal(normalizeCompanyKey(undefined), "");
+  });
+});
+
+test.describe("normalizeLanguage", () => {
+  test.it("defaults to en", () => {
+    assert.equal(normalizeLanguage(""), "en");
+    assert.equal(normalizeLanguage(null), "en");
+  });
+  test.it("trims and lowercases", () => {
+    assert.equal(normalizeLanguage(" ES "), "es");
+  });
+});
+
+test.describe("buildBatchKey", () => {
+  test.it("uses the label when present", () => {
+    assert.equal(buildBatchKey("dach-wave-3", SENT_AT), "label:dach-wave-3");
+  });
+  test.it("falls back to the UTC send date when label is empty", () => {
+    assert.equal(buildBatchKey("", SENT_AT), "sentdate:2026-06-01");
+    assert.equal(buildBatchKey("   ", SENT_AT), "sentdate:2026-06-01");
+  });
+  test.it("different unlabeled send dates never cohort together", () => {
+    assert.notEqual(
+      buildBatchKey("", new Date("2026-06-01T23:59:00Z")),
+      buildBatchKey("", new Date("2026-06-02T00:01:00Z")),
+    );
+  });
+});
+
+test.describe("buildContextHash", () => {
+  const base = {
+    vertical: "gaming_ua",
+    subVertical: null,
+    product: "ua",
+    originalSubject: "MobUpps x Acme",
+    batchKey: "label:w3",
+  };
+  test.it("is stable for identical inputs", () => {
+    assert.equal(buildContextHash({ ...base }), buildContextHash({ ...base }));
+  });
+  test.it("changes when the original subject changes (threading guard)", () => {
+    assert.notEqual(buildContextHash({ ...base }), buildContextHash({ ...base, originalSubject: "Different subject" }));
+  });
+  test.it("changes when the batch key changes", () => {
+    assert.notEqual(buildContextHash({ ...base }), buildContextHash({ ...base, batchKey: "label:w4" }));
+  });
+  test.it("length-prefixing prevents concatenation collisions", () => {
+    assert.notEqual(
+      buildContextHash({ ...base, vertical: "ab", subVertical: "c" }),
+      buildContextHash({ ...base, vertical: "a", subVertical: "bc" }),
+    );
+  });
+});
+
+test.describe("buildHistoryHash", () => {
+  test.it("empty history is a stable constant (stage-1 cohorts share)", () => {
+    assert.equal(buildHistoryHash(undefined), buildHistoryHash([]));
+    assert.equal(buildHistoryHash([]), buildHistoryHash([]));
+  });
+  test.it("identical histories hash identically", () => {
+    const h = [{ stage: 1, subject: "s", body: "b" }];
+    assert.equal(buildHistoryHash(h), buildHistoryHash([...h]));
+  });
+  test.it("divergent body means divergent hash (history isolation)", () => {
+    assert.notEqual(
+      buildHistoryHash([{ stage: 1, subject: "s", body: "angle A" }]),
+      buildHistoryHash([{ stage: 1, subject: "s", body: "angle B" }]),
+    );
+  });
+});
+
+test.describe("buildCohortDescriptor eligibility", () => {
+  test.it("doctrine row with company is eligible", () => {
+    const d = buildCohortDescriptor(baseDescriptorArgs());
+    assert.ok(d);
+    assert.equal(d!.companyKey, "acme mobile gmbh");
+    assert.equal(d!.language, "en");
+  });
+  test.it("anti_ghosting is NEVER eligible", () => {
+    assert.equal(buildCohortDescriptor({ ...baseDescriptorArgs(), app: "anti_ghosting" }), null);
+  });
+  test.it("context is not eligible in v1", () => {
+    assert.equal(buildCohortDescriptor({ ...baseDescriptorArgs(), app: "context" }), null);
+  });
+  test.it("empty company is never eligible", () => {
+    assert.equal(buildCohortDescriptor({ ...baseDescriptorArgs(), company: "  " }), null);
+  });
+  test.it("missing userId is never eligible", () => {
+    assert.equal(buildCohortDescriptor({ ...baseDescriptorArgs(), userId: null }), null);
+  });
+});
+
+test.describe("language isolation (hard product requirement)", () => {
+  test.it("same company, different original language → different cohorts", () => {
+    const en = buildCohortDescriptor({ ...baseDescriptorArgs(), originalLanguage: "en" })!;
+    const es = buildCohortDescriptor({ ...baseDescriptorArgs(), originalLanguage: "es" })!;
+    assert.equal(en.companyKey, es.companyKey);
+    assert.notEqual(en.language, es.language);
+  });
+  test.it("alignment keys also separate by language (no same-time grouping across languages)", () => {
+    const args = {
+      userId: 7,
+      app: "doctrine",
+      company: "Acme",
+      vertical: "gaming_ua",
+      subVertical: null,
+      product: "ua",
+      batchLabel: "w3",
+      sentAt: SENT_AT,
+      nextStage: 2,
+    };
+    assert.notEqual(
+      buildAlignmentKey({ ...args, originalLanguage: "en" }),
+      buildAlignmentKey({ ...args, originalLanguage: "es" }),
+    );
+  });
+});
+
+test.describe("cohort identity sensitivity", () => {
+  test.it("different stage → different cohort", () => {
+    const a = buildCohortDescriptor(baseDescriptorArgs())!;
+    const b = buildCohortDescriptor({ ...baseDescriptorArgs(), stage: 3 })!;
+    assert.notEqual(a.stage, b.stage);
+  });
+  test.it("different user → different cohort", () => {
+    const a = buildCohortDescriptor(baseDescriptorArgs())!;
+    const b = buildCohortDescriptor({ ...baseDescriptorArgs(), userId: 8 })!;
+    assert.notEqual(a.userId, b.userId);
+  });
+  test.it("divergent prior follow-ups → different historyHash", () => {
+    const a = buildCohortDescriptor(baseDescriptorArgs())!;
+    const b = buildCohortDescriptor({
+      ...baseDescriptorArgs(),
+      previousFollowups: [{ stage: 1, subject: "Re: MobUpps x Acme", body: "A different stage-1 angle." }],
+    })!;
+    assert.notEqual(a.historyHash, b.historyHash);
+  });
+  test.it("company normalization unifies cosmetic variants", () => {
+    const a = buildCohortDescriptor(baseDescriptorArgs())!;
+    const b = buildCohortDescriptor({ ...baseDescriptorArgs(), company: " ACME  Mobile gmbh " })!;
+    assert.equal(a.companyKey, b.companyKey);
+    assert.equal(a.contextHash, b.contextHash);
+    assert.equal(a.historyHash, b.historyHash);
+  });
+});
+
+test.describe("buildAlignmentKey", () => {
+  const args = {
+    userId: 7,
+    app: "doctrine",
+    company: "Acme",
+    originalLanguage: "en",
+    vertical: "gaming_ua",
+    subVertical: null,
+    product: "ua",
+    batchLabel: "w3",
+    sentAt: SENT_AT,
+    nextStage: 2,
+  };
+  test.it("identical cohort members share the key", () => {
+    assert.equal(buildAlignmentKey({ ...args }), buildAlignmentKey({ ...args }));
+  });
+  test.it("different next stage never aligns", () => {
+    assert.notEqual(buildAlignmentKey({ ...args }), buildAlignmentKey({ ...args, nextStage: 3 }));
+  });
+  test.it("null for anti_ghosting, context, empty company, missing user", () => {
+    assert.equal(buildAlignmentKey({ ...args, app: "anti_ghosting" }), null);
+    assert.equal(buildAlignmentKey({ ...args, app: "context" }), null);
+    assert.equal(buildAlignmentKey({ ...args, company: "" }), null);
+    assert.equal(buildAlignmentKey({ ...args, userId: null }), null);
+  });
+});
+
+test.describe("pickCohortAnchors", () => {
+  test.it("takes the LATEST initial send and LATEST previous-stage send", () => {
+    const anchors = pickCohortAnchors([
+      { sentAt: new Date("2026-06-01T09:00:00Z"), lastFollowupSentAt: new Date("2026-06-05T09:00:00Z") },
+      { sentAt: new Date("2026-06-01T11:00:00Z"), lastFollowupSentAt: null },
+      { sentAt: new Date("2026-06-01T10:00:00Z"), lastFollowupSentAt: new Date("2026-06-06T09:00:00Z") },
+    ]);
+    assert.equal(anchors.initialSentAt.toISOString(), "2026-06-01T11:00:00.000Z");
+    assert.equal(anchors.lastFollowupSentAt?.toISOString(), "2026-06-06T09:00:00.000Z");
+  });
+  test.it("all-null previous sends stay null", () => {
+    const anchors = pickCohortAnchors([
+      { sentAt: SENT_AT, lastFollowupSentAt: null },
+      { sentAt: SENT_AT, lastFollowupSentAt: null },
+    ]);
+    assert.equal(anchors.lastFollowupSentAt, null);
+  });
+});
+
+test.describe("isSharedDraftFresh", () => {
+  const generatedAt = new Date("2026-06-01T00:00:00Z");
+  test.it("fresh within the TTL", () => {
+    const justInside = new Date(generatedAt.getTime() + (SHARED_DRAFT_TTL_HOURS * 60 - 1) * 60 * 1000);
+    assert.equal(isSharedDraftFresh(generatedAt, justInside), true);
+  });
+  test.it("stale past the TTL", () => {
+    const justPast = new Date(generatedAt.getTime() + (SHARED_DRAFT_TTL_HOURS * 60 + 1) * 60 * 1000);
+    assert.equal(isSharedDraftFresh(generatedAt, justPast), false);
+  });
+});

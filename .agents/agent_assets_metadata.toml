@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "M6m4mUjGQ0KkHL4N6-Pxc"
+uri = "file://production-logs-summary.md"
+type = "text"
+title = "Production Logs Summary (2026-03-25 to 2026-03-26)"

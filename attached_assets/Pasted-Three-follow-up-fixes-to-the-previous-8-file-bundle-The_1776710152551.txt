@@ -1,0 +1,35 @@
+Three follow-up fixes to the previous 8-file bundle. The previous deploy is running but has the issues you flagged.
+
+Files uploaded:
+
+   api-server/services/gmailClient.ts   (fixes the 500-char truncation — critical)
+   api-server/services/followupPrompts.ts (rewriter greeting rule aligned)
+   openapi.yaml                          (Followup schema resync)
+
+Do the following in order:
+
+1. Verify all three files present at their paths in this monorepo (artifacts/ prefix if your layout uses it, root for openapi.yaml).
+
+2. Confirm the critical fix landed. After copying gmailClient.ts, run:
+
+      grep -n "body.slice(0, 500)" artifacts/api-server/src/services/gmailClient.ts
+
+   Expected: no hits. If it still matches, the copy didn't apply — STOP.
+
+3. Regenerate the API client types from the updated openapi.yaml. Use whatever command this project normally uses (likely pnpm --filter ./lib/api-zod generate or similar). After regeneration, verify that the generated Followup type now includes original_body, original_body_summary, original_language, original_sent_at, gmail_thread_id. If the regeneration tooling isn't wired up, manually edit the generated followup.ts file to add those five fields with the same types as openapi.yaml specifies, and document in your report what you did.
+
+4. Typecheck both workspaces. Report any errors.
+
+5. Restart / republish to production. Same target as before: https://doctrine-followupv-2.replit.app.
+
+6. Run smoke tests (now that you have the corrected build). Use the API key from env:
+
+   6a) curl /api/followups and verify original_body field is present in response (will be "" for legacy rows).
+
+   6b) Trigger a sync. Immediately after, query production DB:
+       psql "$PROD_DATABASE_URL" -c "SELECT id, LENGTH(original_body) AS body_len, LENGTH(original_body_summary) AS sum_len FROM prospects ORDER BY id DESC LIMIT 5;"
+       Expected: NEW rows have body_len > 500 (and usually > 1000). If body_len <= 500 on new rows, the gmailClient fix didn't stick.
+
+   6c) Log into dashboard, click 3-dots on a thread, confirm modal renders.
+
+7. Report back: the grep from step 2, the regenerated type file location (or your manual edit), build output, curl snippet, the LENGTH query output, and modal confirmation.

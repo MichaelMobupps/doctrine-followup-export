@@ -1,0 +1,33 @@
+Apply Batch 3a (DB migration + schema/plumbing updates for follow-up mode enum). This batch is invisible to users — same UI, same behavior, just new columns in the DB and updated readers.
+
+Place the uploaded batch3a-mode-plumbing.zip somewhere accessible (project root or /tmp) and extract it. Two scripts inside: migrate-batch3a.mjs (DB migration) and apply-batch3a.mjs (code patches).
+Run the DB migration FIRST, before touching any source files. The migration must succeed before code patches go in, otherwise you'll have code that references columns that don't exist. The script needs pg available — run it from inside artifacts/api-server where pg is installed:
+
+cd artifacts/api-server
+node /path/to/extracted/migrate-batch3a.mjs
+The script reads DATABASE_URL from env (it's already set in the api-server workspace).
+The script is idempotent and transactional — re-running is safe; if anything fails the whole transaction rolls back and the DB stays on the old schema.
+Report the verbatim output, including the verify section and the per-mode user count distribution at the bottom.
+If the migration fails for any reason, STOP. Do not run the code patches. Report the exact error.
+
+
+Run the code patch script: node /path/to/extracted/apply-batch3a.mjs. Targets artifacts/db/src/ and artifacts/api-server/src/ by default — set DB_BASE and/or API_BASE env vars if your live trees differ. The script is idempotent. Report the verbatim verify output.
+Build the api-server: pnpm --filter @workspace/api-server run build from the repo root, or pnpm run build from inside artifacts/api-server. The db package has no build step (consumed at source level), so no build needed for it. Report build output verbatim, including any warnings. Watch specifically for any TypeScript errors referencing requireApproval — those would mean a reader I missed.
+Restart the api-server workflow with restart_workflow. Do NOT use kill 1.
+After restart, fetch boot logs and confirm the api-server is listening with no errors.
+Smoke-test the back-compat translation layer:
+
+curl -i http://localhost:<port>/api/gmail/accounts -H "x-api-key: <key>"
+The response should contain requireApproval boolean for each account (derived from the new followupMode field). Verify at least one account is returned and that it has both requireApproval and followupMode fields. Report the JSON response verbatim.
+
+
+Sync changed files into source-code mirror:
+
+artifacts/db/src/schema/users.ts → source-code/db/schema/users.ts
+artifacts/db/src/schema/followups.ts → source-code/db/schema/followups.ts
+artifacts/api-server/src/services/scheduler.ts → source-code/api-server/services/scheduler.ts
+artifacts/api-server/src/routes/gmail-auth.ts → source-code/api-server/routes/gmail-auth.ts
+
+
+
+If any step fails, stop and report the exact error verbatim. Do not improvise fixes.

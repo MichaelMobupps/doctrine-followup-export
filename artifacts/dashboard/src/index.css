@@ -1,0 +1,286 @@
+@import url('https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css');
+@import url('https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-mono/style.css');
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-display: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'Geist Mono', 'JetBrains Mono', monospace;
+
+  --color-background: #0a0b0d;
+  --color-foreground: #e8e9ed;
+
+  --color-card: #111318;
+  --color-card-foreground: #e8e9ed;
+
+  --color-popover: #1e2028;
+  --color-popover-foreground: #e8e9ed;
+
+  --color-border: #1f2129;
+  --color-input: #1f2129;
+  --color-ring: #3b82f6;
+
+  --color-primary: #3b82f6;
+  --color-primary-foreground: #ffffff;
+
+  --color-secondary: #181a20;
+  --color-secondary-foreground: #8b8e9a;
+
+  --color-muted: #181a20;
+  --color-muted-foreground: #8b8e9a;
+
+  --color-accent: #181a20;
+  --color-accent-foreground: #e8e9ed;
+
+  --color-destructive: #ef4444;
+  --color-destructive-foreground: #ffffff;
+
+  --color-success: #22c55e;
+  --color-success-foreground: #ffffff;
+
+  --color-warning: #eab308;
+  --color-warning-foreground: #ffffff;
+
+  --color-info: #6366f1;
+  --color-info-foreground: #ffffff;
+
+  --color-tertiary: #555867;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 8px;
+  --radius-2xl: 8px;
+}
+
+:root {
+  color-scheme: dark;
+  --bg-primary: #0a0b0d;
+  --bg-secondary: #111318;
+  --bg-tertiary: #181a20;
+  --bg-elevated: #1e2028;
+  --border-default: #1f2129;
+  --border-hover: #2a2d38;
+  --border-active: #3d4150;
+  --text-primary: #e8e9ed;
+  --text-secondary: #8b8e9a;
+  --text-tertiary: #555867;
+  --accent: #3b82f6;
+  --accent-hover: #2563eb;
+  --accent-muted: rgba(59,130,246,0.10);
+  --accent-border: rgba(59,130,246,0.25);
+  --accent-foreground: #ffffff; /* B9d.4: text color for elements with accent bg */
+  --accent-glow: rgba(59,130,246,0.25); /* B9d.5: accent halo for hover/focus on primary CTAs */
+  --success-muted: rgba(34,197,94,0.10);
+  --success-border: rgba(34,197,94,0.20);
+  --warning-muted: rgba(234,179,8,0.10);
+  --warning-border: rgba(234,179,8,0.20);
+  --danger-muted: rgba(239,68,68,0.10);
+  --danger-border: rgba(239,68,68,0.20);
+  --info-muted: rgba(99,102,241,0.10);
+  --info-border: rgba(99,102,241,0.20);
+  --success: #22c55e;
+  --warning: #eab308;
+  --danger: #ef4444;
+  --info: #6366f1;
+}
+
+/* ============================================================== */
+/* B9d.1: AntiGhosting whitish theme.                              */
+/* ============================================================== */
+/* Activated by the layout component setting data-product="anti_   */
+/* ghosting" on its wrapper div. Doctrine and Context retain the   */
+/* default dark theme (their data-product values don't match).     */
+/* Cascades to all descendants — sidebar, cards, panels, badges,  */
+/* form controls. Reversible: revert by deleting this block.       */
+[data-product="anti_ghosting"] {
+  color-scheme: light;
+
+  /* Surfaces */
+  /* B9d.5: page bg darkened so white cards visibly float. */
+  /* B9d.9: bumped page bg to slate-200 and hover to slate-300 for clearer separation. */
+  --bg-primary: #e2e8f0;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #cbd5e1;
+  --bg-elevated: #ffffff;
+
+  /* Borders */
+  --border-default: #e2e8f0;
+  --border-hover: #cbd5e1;
+  --border-active: #94a3b8;
+
+  /* Text */
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-tertiary: #94a3b8;
+
+  /* Accent */
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-muted: rgba(37,99,235,0.08);
+  --accent-border: rgba(37,99,235,0.25);
+  --accent-foreground: #ffffff; /* B9d.4 */
+  --accent-glow: rgba(37,99,235,0.22); /* B9d.5: subtler on white bg */
+
+  /* Status colors tuned for white background contrast */
+  --success: #16a34a;
+  --warning: #ca8a04;
+  --danger: #dc2626;
+  --info: #4f46e5;
+  --success-muted: rgba(22,163,74,0.08);
+  --success-border: rgba(22,163,74,0.25);
+  --warning-muted: rgba(234,179,8,0.12);
+  --warning-border: rgba(234,179,8,0.30);
+  --danger-muted: rgba(220,38,38,0.08);
+  --danger-border: rgba(220,38,38,0.25);
+  --info-muted: rgba(79,70,229,0.08);
+  --info-border: rgba(79,70,229,0.25);
+
+  /* Tailwind v4 @theme token mirrors. Utility classes (bg-card,    */
+  /* text-foreground, etc.) reference these. Keep aligned with the  */
+  /* semantic tokens above so direct and utility styling agree.     */
+  --color-background: #f8fafc;
+  --color-foreground: #0f172a;
+  --color-card: #ffffff;
+  --color-card-foreground: #0f172a;
+  --color-popover: #ffffff;
+  --color-popover-foreground: #0f172a;
+  --color-border: #e2e8f0;
+  --color-input: #ffffff;
+  --color-ring: #2563eb;
+  --color-primary: #2563eb;
+  --color-primary-foreground: #ffffff;
+  --color-secondary: #f1f5f9;
+  --color-secondary-foreground: #475569;
+  --color-muted: #f1f5f9;
+  --color-muted-foreground: #64748b;
+  --color-accent: #eff6ff;
+  --color-accent-foreground: #1e3a8a;
+  --color-destructive: #dc2626;
+  --color-destructive-foreground: #ffffff;
+  --color-success: #16a34a;
+  --color-success-foreground: #ffffff;
+  --color-warning: #ca8a04;
+  --color-warning-foreground: #ffffff;
+  --color-info: #4f46e5;
+  --color-info-foreground: #ffffff;
+  --color-tertiary: #94a3b8;
+}
+
+/* ============================================================== */
+/* B9d.4: Doctrine deep-blue refresh.                              */
+/* ============================================================== */
+/* Activated by layout setting data-product="doctrine" (the        */
+/* default product). Accent shifts from blue-500 to blue-600 for   */
+/* deeper authority. Surfaces stay neutral dark from :root.        */
+[data-product="doctrine"] {
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-muted: rgba(37,99,235,0.12);
+  --accent-border: rgba(37,99,235,0.28);
+  --accent-foreground: #ffffff;
+  --accent-glow: rgba(37,99,235,0.35); /* B9d.5: saturated blue halo on dark bg */
+
+  /* Tailwind v4 mirrors so utility classes pick up the new blue. */
+  --color-primary: #2563eb;
+  --color-primary-foreground: #ffffff;
+  --color-ring: #2563eb;
+}
+
+/* ============================================================== */
+/* B9d.4: Context warm/amber theme.                                */
+/* ============================================================== */
+/* Activated by data-product="context". Amber accent signals       */
+/* warmth + relationship orientation. White text fails WCAG on     */
+/* amber (~2.2:1), so --accent-foreground is dark (~7.5:1).        */
+/* --info also shifts to amber for visual consistency.             */
+[data-product="context"] {
+  --accent: #f59e0b;
+  --accent-hover: #d97706;
+  --accent-muted: rgba(245,158,11,0.12);
+  --accent-border: rgba(245,158,11,0.30);
+  --accent-foreground: #1a1208;
+  --accent-glow: rgba(245,158,11,0.40); /* B9d.5: warm amber halo */
+
+  --info: #f59e0b;
+  --info-muted: rgba(245,158,11,0.12);
+  --info-border: rgba(245,158,11,0.28);
+
+  /* Tailwind v4 mirrors so utility classes pick up amber. */
+  --color-primary: #f59e0b;
+  --color-primary-foreground: #1a1208;
+  --color-ring: #f59e0b;
+  --color-info: #f59e0b;
+  --color-info-foreground: #1a1208;
+}
+
+/* ============================================================== */
+/* B9d.12: Sidebar depth shadow                                    */
+/* ============================================================== */
+/* The sidebar (`<aside>`) is fixed-positioned left. A right-edge  */
+/* box-shadow gives the page visual hierarchy: sidebar floats      */
+/* above content. Per-theme alpha tuning - high on dark, subtle    */
+/* on light. The aside's inline border-right stays unaffected.     */
+[data-product="doctrine"] aside,
+[data-product="context"] aside {
+  box-shadow: 4px 0 24px rgba(0, 0, 0, 0.25);
+}
+
+[data-product="anti_ghosting"] aside {
+  box-shadow: 4px 0 16px rgba(15, 23, 42, 0.08);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    min-height: 100vh;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    color: var(--text-primary);
+  }
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-hover);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-active);
+}
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Phase 7d: Context Based Followuper theme override.
+   Applied via [data-product="context"] on the Layout root. Overrides the
+   accent palette only — bg, text, and border tokens stay shared. */
+[data-product="context"] {
+  --accent: #f59e0b;
+  --accent-hover: #d97706;
+  --accent-muted: rgba(245,158,11,0.10);
+  --accent-border: rgba(245,158,11,0.25);
+}

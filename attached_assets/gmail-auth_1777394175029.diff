@@ -1,0 +1,16 @@
+--- source-code/api-server/routes/gmail-auth.ts	2026-04-28 09:26:10.000000000 +0000
++++ fixed/gmail-auth.ts	2026-04-28 16:25:28.663658284 +0000
+@@ -134,7 +134,12 @@
+ 
+     const oauth2 = google.oauth2({ version: "v2", auth: oauth2Client });
+     const userInfo = await oauth2.userinfo.get();
+-    const email = userInfo.data.email || "";
++    // Normalize email at write time. Google occasionally returns
++    // mixed-case emails depending on the tenant, and downstream lookups
++    // (in particular the per-user /api/sync path) compare case-insensitively
++    // — but storing lowercase is cleaner and avoids cross-row inconsistency
++    // if the same address is reconnected later under a different case.
++    const email = (userInfo.data.email || "").trim().toLowerCase();
+     const name = userInfo.data.name || email.split("@")[0];
+ 
+     if (!email) {

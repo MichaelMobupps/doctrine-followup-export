@@ -1,0 +1,48 @@
+Apply B9b.12 from b9b12.zip at workspace root.
+
+1. Extract and apply:
+   rm -rf /tmp/b9b12 && unzip -q b9b12.zip -d /tmp/b9b12 && python3 /tmp/b9b12/apply-b9b12.py
+
+   Expect:
+   [ok]   googleapis import (google): updated
+   [ok]   B9b.12 helpers + handlers: inserted
+   [ok]   wrote artifacts/api-server/src/routes/anti-ghosting.ts
+   [ok]   created artifacts/dashboard/src/pages/anti-ghosting-inspector.tsx
+   [ok]   App.tsx import: updated
+   [ok]   App.tsx route: updated
+   [ok]   wrote artifacts/dashboard/src/App.tsx
+   [ok]   layout AG navItems: updated
+   [ok]   wrote artifacts/dashboard/src/components/layout.tsx
+   B9b.12 AntiGhosting Email Inspector applied.
+
+2. Typecheck api-server (gate before build):
+   cd artifacts/api-server && pnpm run typecheck && cd -
+
+   If TS error appears, paste it.
+
+3. Build both:
+   cd artifacts/api-server && pnpm run build && cd -
+   cd artifacts/dashboard && pnpm run build && cd -
+
+4. Restart both workflows.
+
+5. Smoke test backend:
+   a. curl -sS -H "x-api-key: $ADDON_API_KEY" "http://localhost:80/api/anti-ghosting/gmail/sent-emails?userId=1&limit=5"
+      Expect: HTTP 200 with JSON body containing {emails: [...], meta: {...}}.
+      The emails list may be empty if heliumdb-test-user has no Gmail. Either way, valid JSON.
+   b. curl -sS -X POST -H "x-api-key: $ADDON_API_KEY" -H "Content-Type: application/json" \
+        -d '{"email":"michael@mobupps.com"}' "http://localhost:80/api/anti-ghosting/sync"
+      Expect: HTTP 200 (or 500 if heliumdb-test environment can't reach Gmail).
+      Don't worry about empty errors — production has the real refresh tokens.
+
+6. Republish.
+
+7. Browser test on https://doctrine-followupv-2.replit.app/anti-ghosting/inspector:
+   a. Sidebar should now show three AG nav entries: Candidates, Pipeline, Email Inspector.
+   b. Page title "AntiGhosting Email Inspector" loads.
+   c. Stat cards: TOTAL FETCHED / AG LABELED / DETECTED / IN DATABASE.
+   d. Email list populates from your Gmail sent folder.
+   e. Magnit thread should show "AG LABELED" pill in the detection pipeline (SENT > LABEL > DB).
+   f. Click an email row → detection panel expands with all fields (Sent by me / AntiGhosting label / Would be picked up / 60-day window / Company / etc).
+   g. Click "View thread" → ThreadView renders messages.
+   h. If pending sync count > 0, the Sync Now button appears → click → confirms with banner.

@@ -1,0 +1,28 @@
+Apply B9b.9 v2 from b9b9.zip at workspace root. The v1 zip I sent earlier is DEPRECATED — use this one. If the v1 patcher was applied previously, the v2 patcher will detect that and refuse to run; in that case, paste the workspace state and we'll plan a clean revert.
+
+1. Extract and apply:
+   rm -rf /tmp/b9b9 && unzip -q b9b9.zip -d /tmp/b9b9 && python3 /tmp/b9b9/apply-b9b9.py
+
+   Expect:
+   [ok]   pause/resume handlers v2: inserted
+   [ok]   wrote artifacts/api-server/src/routes/anti-ghosting.ts
+   [ok]   overwrote artifacts/dashboard/src/pages/anti-ghosting-pipeline.tsx
+   B9b.9 v2 pause/resume applied.
+
+2. Build both packages:
+   cd artifacts/api-server && pnpm run build && cd -
+   cd artifacts/dashboard && pnpm run build && cd -
+
+3. Restart api-server AND dashboard workflows.
+
+4. Smoke test pause endpoint locally (heliumdb has no AG prospects so expect 404 — that proves the route exists with correct validation):
+   curl -sS -X POST -H "x-api-key: $ADDON_API_KEY" "http://localhost:80/api/anti-ghosting/prospect/99999/pause"
+
+   Expect: HTTP 404, body `{"error":"anti_ghosting prospect not found"}`. If you see 500 with a SQL error or "cancelActiveFollowupsForProspects is not a function", paste the full error — that means the helper signature differs from what I assumed and we adjust.
+
+5. Republish.
+
+6. Browser test on https://doctrine-followupv-2.replit.app/anti-ghosting/pipeline after the publish:
+   a. Click the Square icon on Magnit's row → expect banner "Stopped followups for this thread — cancelled 1 queued", row border turns warning, status pill becomes "Paused", icon becomes Play (▶).
+   b. Click the Play icon on Magnit's row → expect banner "Resumed followups for this thread" (note: no "— queued F2" because the cancelled F2 row blocks the immediate re-insert; this is the documented context-parity trade-off). The cron will re-queue within 15 min.
+   c. Refresh the page. The paused state should persist (flag is in DB). Click resume again to test idempotency — should be safe.

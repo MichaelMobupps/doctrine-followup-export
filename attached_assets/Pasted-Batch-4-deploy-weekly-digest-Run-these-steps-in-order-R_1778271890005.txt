@@ -1,0 +1,42 @@
+Batch 4 deploy: weekly digest
+Run these steps in order. Report verbatim output of each step.
+Step 1 — Unpack
+bashcd ~/workspace
+unzip -o /tmp/batch4-weekly-digest.zip -d /tmp/batch4/
+Step 2 — DB migration (must run from inside lib/db/ for pg resolution)
+bashcp /tmp/batch4/migrate-batch4.mjs lib/db/migrate-batch4.mjs
+cd lib/db && node migrate-batch4.mjs
+cd ~/workspace
+Expected output: [+] Added users.weekly_digest_enabled, [+] Added users.last_weekly_digest_at, [+] Seeded N review_in_app/draft_in_gmail users to weekly_digest_enabled=TRUE, [OK] Transaction committed, then a per-mode distribution table and a column-verification table.
+Step 3 — Code patch
+bashcd ~/workspace
+DB_BASE=lib/db/src API_BASE=artifacts/api-server/src DASH_BASE=artifacts/dashboard/src \
+  node /tmp/batch4/apply-batch4.mjs
+Expected: 10 patches applied with [+], 5 .bak files removed, 12 self-verifies pass.
+Step 4 — Audit
+bashcd ~/workspace
+DB_BASE=lib/db/src API_BASE=artifacts/api-server/src DASH_BASE=artifacts/dashboard/src \
+  node /tmp/batch4/audit-batch4.mjs
+Expected: Total: 120/120 passed across 3 rounds.
+Step 5 — Build
+bashpnpm --filter @workspace/db run build
+pnpm --filter @workspace/api-server run build
+pnpm --filter @workspace/dashboard run build
+Expected: 3 clean builds, zero TS errors.
+Step 6 — Restart
+Use restart_workflow (do NOT use kill 1). After restart, paste the first 30 lines of the api-server log so I can confirm:
+
+Cron jobs active: sync+auto-queue @*/15, process @5,20,35,50, draft-stall @00:30, weekly-digest @Tue 00:00 UTC, fast-tick @*/3
+
+Step 7 — Mirror sync
+bashrsync -a --delete artifacts/api-server/src/ source-code/api-server/
+rsync -a --delete artifacts/dashboard/src/ source-code/dashboard/
+rsync -a --delete lib/db/src/ source-code/db/
+Step 8 — Smoke test (one-liner via psql)
+bashpsql "$DATABASE_URL" -c "SELECT followup_mode, weekly_digest_enabled, COUNT(*) FROM users GROUP BY 1,2 ORDER BY 1,2;"
+Report the table verbatim.
+Step 9 — Optional: end-to-end test send to yourself
+If you want to verify the email lands without waiting for Tuesday:
+bashcd artifacts/api-server
+node -e "import('./dist/services/weeklyDigest.js').then(m => m.runWeeklyDigest({force:true})).then(r => console.log(r))"
+Expected: { considered: N, sent: N, skipped: 0, failed: 0 }. Then check your Gmail inbox.

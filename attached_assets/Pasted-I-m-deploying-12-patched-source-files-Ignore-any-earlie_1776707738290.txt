@@ -1,0 +1,45 @@
+I'm deploying 12 patched source files. Ignore any earlier analysis about login failures, missing redirect URIs, or orphaned prospects — those were resolved in a previous session. The production login flow works, the user row exists, and the 11 prospects are already attributed to user_id=1.
+
+Your only job right now is to apply the 12 uploaded files and redeploy to production. Do not diagnose anything unless a build error occurs.
+
+The files uploaded are:
+   api-server/routes/auth.ts
+   api-server/routes/doctrine.ts
+   api-server/routes/gmail-auth.ts
+   api-server/services/gmailSync.ts
+   api-server/services/timingEngine.ts
+   api-server/scripts/createLabels.ts
+   dashboard/components/api-key-provider.tsx
+   dashboard/pages/prospects.tsx
+   dashboard/pages/activity-log.tsx
+   dashboard/pages/dashboard.tsx
+   dashboard/pages/accounts.tsx
+   dashboard/pages/followups.tsx
+
+In this monorepo, api-server and dashboard may live under a prefix like artifacts/ or packages/ — locate by finding prospects.tsx and use whatever prefix is present.
+
+Do the following in order:
+
+1. Confirm all 12 files are in place at their resolved paths. If any is missing, stop and tell me.
+
+2. Search for leftover references to these tokens across the repo (excluding node_modules, dist, build, .next, .turbo, .git):
+      testMode
+      test_mode
+      TEST_MODE
+      is_test_campaign
+      generateTestModeSchedule
+   Expected surviving hits (leave alone):
+   - api-server/lib/constants.ts (TEST_MODE_LABEL const — dead but harmless)
+   - db/schema/users.ts (testMode column — we keep it to avoid a migration)
+   - Comments
+   Delete any OTHER hit by removing the reference.
+
+3. Run the TypeScript build for both workspaces. If it fails with "Property does not exist" for any removed field, find the reference and delete it (don't re-add removed fields). If any other error, report verbatim and stop.
+
+4. Do NOT run any database migration. If drizzle-kit wants to drop the test_mode column, decline.
+
+5. Republish to the ACTIVE production deployment (https://doctrine-followupv-2.replit.app). NOT the old doctrine-followup.replit.app.
+
+6. Report back: (a) paths found for the 12 files, (b) leftover-search output, (c) build result, (d) confirmation the republish succeeded.
+
+Do not analyze, diagnose, or suggest fixes to login/OAuth/DB state. Just apply and redeploy.

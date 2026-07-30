@@ -1,0 +1,36 @@
+set -euo pipefail
+cd /home/runner/workspace
+
+# 1. Unzip the batch into a staging dir
+rm -rf /tmp/batch-b9a && mkdir -p /tmp/batch-b9a
+unzip -q ~/batch-b9a-antighosting-data-layer.zip -d /tmp/batch-b9a
+
+# 2. Apply DB schema patches
+cp /tmp/batch-b9a/batch-b9a-antighosting-data-layer/db/schema/prospects.ts        lib/db/src/schema/prospects.ts
+cp /tmp/batch-b9a/batch-b9a-antighosting-data-layer/db/schema/followups.ts        lib/db/src/schema/followups.ts
+cp /tmp/batch-b9a/batch-b9a-antighosting-data-layer/db/schema/users.ts            lib/db/src/schema/users.ts
+cp /tmp/batch-b9a/batch-b9a-antighosting-data-layer/db/schema/thread-messages.ts  lib/db/src/schema/thread-messages.ts
+cp /tmp/batch-b9a/batch-b9a-antighosting-data-layer/db/schema/index.ts            lib/db/src/schema/index.ts
+
+# 3. Apply api-server patches
+cp /tmp/batch-b9a/batch-b9a-antighosting-data-layer/api-server/lib/startupMigrations.ts  artifacts/api-server/src/lib/startupMigrations.ts
+cp /tmp/batch-b9a/batch-b9a-antighosting-data-layer/api-server/services/gmailClient.ts   artifacts/api-server/src/services/gmailClient.ts
+cp /tmp/batch-b9a/batch-b9a-antighosting-data-layer/api-server/services/threadReader.ts  artifacts/api-server/src/services/threadReader.ts
+mkdir -p artifacts/api-server/src/tests
+cp /tmp/batch-b9a/batch-b9a-antighosting-data-layer/api-server/tests/test-thread-reader-b9a.ts  artifacts/api-server/src/tests/test-thread-reader-b9a.ts
+
+# 4. Typecheck (api-server only). Pre-existing schema drift on the
+#    service files will fail same as B8a — report verbatim, do not fix.
+pnpm --filter @workspace/api-server run typecheck || echo "[typecheck failures — same pre-existing drift documented in B8a; B9a content compiles in esbuild]"
+
+# 5. Run the new unit test
+pnpm --filter @workspace/api-server exec tsx --test artifacts/api-server/src/tests/test-thread-reader-b9a.ts
+
+# 6. Build api-server (skip @workspace/db which has no build script)
+pnpm --filter @workspace/api-server run build
+
+# 7. Smoke probe (expects 401 from unauthenticated GET /api)
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:80/api || true
+
+# 8. Refresh the read-only review mirror
+bash source-code/sync.sh

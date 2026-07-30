@@ -1,0 +1,1212 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: API specification
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: doctrine
+    description: Doctrine follow-up operations
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+  /stats:
+    get:
+      operationId: getStats
+      tags: [doctrine]
+      summary: Get dashboard statistics
+      parameters:
+        - name: x-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Stats"
+  /prospects:
+    get:
+      operationId: getProspects
+      tags: [doctrine]
+      summary: Get prospects grouped by vertical and date
+      parameters:
+        - name: x-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: vertical
+          in: query
+          schema:
+            type: string
+        - name: replied
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Prospect groups
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ProspectGroup"
+  /followups:
+    get:
+      operationId: getFollowups
+      tags: [doctrine]
+      summary: Get follow-ups with optional status filter
+      parameters:
+        - name: x-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Follow-ups
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Followup"
+  /sync:
+    post:
+      operationId: triggerSync
+      tags: [doctrine]
+      summary: Trigger Gmail sync
+      parameters:
+        - name: x-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Sync result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncResult"
+  /process:
+    post:
+      operationId: triggerProcess
+      tags: [doctrine]
+      summary: Process due follow-ups
+      parameters:
+        - name: x-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Process result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProcessResult"
+  /queue:
+    post:
+      operationId: queueFollowups
+      tags: [doctrine]
+      summary: Queue follow-ups for specific prospects
+      parameters:
+        - name: x-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueueRequest"
+      responses:
+        "200":
+          description: Queue result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueueResult"
+  /queue-batch:
+    post:
+      operationId: queueBatch
+      tags: [doctrine]
+      summary: Queue follow-ups for a batch of prospects
+      parameters:
+        - name: x-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueueBatchRequest"
+      responses:
+        "200":
+          description: Queue result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueueResult"
+  /gmail/sent-emails:
+    get:
+      operationId: getSentEmails
+      tags: [doctrine]
+      summary: Fetch recent sent emails from Gmail with detection analysis
+      parameters:
+        - name: x-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: search
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Sent emails with detection metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SentEmailsResponse"
+  /gmail/thread/{threadId}:
+    get:
+      operationId: getThread
+      tags: [doctrine]
+      summary: Fetch full thread details
+      parameters:
+        - name: x-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: threadId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Thread messages
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ThreadResponse"
+  /gmail/auth:
+    get:
+      operationId: startGmailAuth
+      tags: [doctrine]
+      summary: Get Google OAuth URL to connect a Gmail account
+      parameters:
+        - name: x-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OAuth authorization URL
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  authUrl:
+                    type: string
+                required:
+                  - authUrl
+  /gmail/accounts:
+    get:
+      operationId: getGmailAccounts
+      tags: [doctrine]
+      summary: List connected Gmail accounts
+      parameters:
+        - name: x-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Connected accounts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GmailAccountsResponse"
+  /gmail/accounts/{id}:
+    delete:
+      operationId: disconnectGmailAccount
+      tags: [doctrine]
+      summary: Disconnect a Gmail account
+      parameters:
+        - name: x-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Disconnect result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DisconnectResult"
+  /gmail/accounts/{id}/settings:
+    put:
+      operationId: updateAccountSettings
+      tags: [doctrine]
+      summary: Update follow-up settings for an account
+      parameters:
+        - name: x-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AccountSettingsUpdate"
+      responses:
+        "200":
+          description: Updated settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpdateSettingsResult"
+  /cancel:
+    post:
+      operationId: cancelFollowups
+      tags: [doctrine]
+      summary: Cancel queued follow-ups
+      parameters:
+        - name: x-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CancelRequest"
+      responses:
+        "200":
+          description: Cancel result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CancelResult"
+  /prospect/{id}/pause:
+    post:
+      operationId: pauseProspect
+      tags: [doctrine]
+      summary: Pause follow-ups for a specific prospect
+      parameters:
+        - name: x-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Prospect paused
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProspectPauseResult"
+  /prospect/{id}/resume:
+    post:
+      operationId: resumeProspect
+      tags: [doctrine]
+      summary: Resume follow-ups for a specific prospect
+      parameters:
+        - name: x-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Prospect resumed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProspectResumeResult"
+  /campaign/status:
+    get:
+      operationId: getCampaignStatus
+      tags: [doctrine]
+      summary: Get campaign status
+      parameters:
+        - name: x-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Campaign status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CampaignStatus"
+  /campaign/queue:
+    post:
+      operationId: queueCampaignFollowups
+      tags: [doctrine]
+      summary: Queue next follow-ups for a specific campaign type
+      parameters:
+        - name: x-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                user_id:
+                  type: string
+                campaign_type:
+                  type: string
+                  enum: [production, test]
+              required:
+                - campaign_type
+      responses:
+        "200":
+          description: Queue result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queued:
+                    type: integer
+                  campaign_type:
+                    type: string
+                  test_mode_enabled:
+                    type: boolean
+                  message:
+                    type: string
+                required:
+                  - queued
+                  - message
+  /campaign/launch:
+    post:
+      operationId: launchCampaign
+      tags: [doctrine]
+      summary: Launch test follow-up campaign
+      parameters:
+        - name: x-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CampaignLaunchRequest"
+      responses:
+        "200":
+          description: Campaign launch result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CampaignLaunchResult"
+  /campaign/stop:
+    post:
+      operationId: stopCampaign
+      tags: [doctrine]
+      summary: Stop follow-up campaign
+      parameters:
+        - name: x-api-key
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Campaign stop result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CampaignStopResult"
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+    Stats:
+      type: object
+      properties:
+        total_sent:
+          type: integer
+        unreplied:
+          type: integer
+        replied:
+          type: integer
+        queued_followups:
+          type: integer
+        sent_followups:
+          type: integer
+      required:
+        - total_sent
+        - unreplied
+        - replied
+        - queued_followups
+        - sent_followups
+    Prospect:
+      type: object
+      properties:
+        id:
+          type: integer
+        gmail_message_id:
+          type: string
+        gmail_thread_id:
+          type: string
+        prospect_name:
+          type: string
+        company:
+          type: string
+        email:
+          type: string
+        vertical:
+          type: string
+        product:
+          type: string
+        subject:
+          type: string
+        original_body_summary:
+          type: string
+        batch_label:
+          type: string
+        sent_at:
+          type: string
+        replied:
+          type: integer
+        replied_at:
+          type: string
+          nullable: true
+        followup_paused:
+          type: boolean
+        is_test_campaign:
+          type: boolean
+        max_followups:
+          type: integer
+        followup_1_status:
+          type: string
+          nullable: true
+        followup_1_scheduled:
+          type: string
+          nullable: true
+        followup_2_status:
+          type: string
+          nullable: true
+        followup_2_scheduled:
+          type: string
+          nullable: true
+        followup_3_status:
+          type: string
+          nullable: true
+        followup_3_scheduled:
+          type: string
+          nullable: true
+      required:
+        - id
+        - gmail_message_id
+        - gmail_thread_id
+        - prospect_name
+        - company
+        - email
+        - vertical
+        - product
+        - subject
+        - original_body_summary
+        - batch_label
+        - sent_at
+        - replied
+    ProspectGroup:
+      type: object
+      properties:
+        label:
+          type: string
+        vertical:
+          type: string
+        sent_date:
+          type: string
+        prospects:
+          type: array
+          items:
+            $ref: "#/components/schemas/Prospect"
+        total:
+          type: integer
+        unreplied:
+          type: integer
+        replied:
+          type: integer
+      required:
+        - label
+        - vertical
+        - sent_date
+        - prospects
+        - total
+        - unreplied
+        - replied
+    Followup:
+      type: object
+      properties:
+        id:
+          type: integer
+        prospect_id:
+          type: integer
+        stage:
+          type: integer
+        status:
+          type: string
+        scheduled_at:
+          type: string
+        generated_body:
+          type: string
+          nullable: true
+        generated_subject:
+          type: string
+          nullable: true
+        sent_at:
+          type: string
+          nullable: true
+        gmail_message_id:
+          type: string
+          nullable: true
+        error_message:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+        prospect_name:
+          type: string
+        company:
+          type: string
+        email:
+          type: string
+        vertical:
+          type: string
+        original_subject:
+          type: string
+        original_body_summary:
+          type: string
+        original_body:
+          type: string
+        original_language:
+          type: string
+        original_sent_at:
+          type: string
+          nullable: true
+        gmail_thread_id:
+          type: string
+          nullable: true
+        followup_paused:
+          type: boolean
+        replied:
+          type: integer
+        max_followups:
+          type: integer
+      required:
+        - id
+        - prospect_id
+        - stage
+        - status
+        - scheduled_at
+        - created_at
+        - prospect_name
+        - company
+        - email
+        - vertical
+        - original_subject
+        - original_body_summary
+        - original_body
+        - original_language
+    SyncResult:
+      type: object
+      properties:
+        synced:
+          type: integer
+        repliesDetected:
+          type: integer
+      required:
+        - synced
+        - repliesDetected
+    ProcessResult:
+      type: object
+      properties:
+        processed:
+          type: integer
+        sent:
+          type: integer
+        failed:
+          type: integer
+      required:
+        - processed
+        - sent
+        - failed
+    QueueRequest:
+      type: object
+      properties:
+        prospect_ids:
+          type: array
+          items:
+            type: integer
+        stage:
+          type: integer
+      required:
+        - prospect_ids
+        - stage
+    QueueBatchRequest:
+      type: object
+      properties:
+        vertical:
+          type: string
+        sent_date:
+          type: string
+        stage:
+          type: integer
+        exclude_ids:
+          type: array
+          items:
+            type: integer
+      required:
+        - stage
+    CancelRequest:
+      type: object
+      properties:
+        followup_ids:
+          type: array
+          items:
+            type: integer
+      required:
+        - followup_ids
+    QueueResult:
+      type: object
+      properties:
+        queued:
+          type: integer
+        scheduled_range:
+          type: object
+          properties:
+            earliest:
+              type: string
+            latest:
+              type: string
+      required:
+        - queued
+        - scheduled_range
+    SentEmailDetection:
+      type: object
+      properties:
+        wouldBePickedUp:
+          type: boolean
+        vertical:
+          type: string
+        verticalReason:
+          type: string
+        company:
+          type: string
+      required:
+        - wouldBePickedUp
+        - vertical
+        - verticalReason
+        - company
+    SentEmailDbRecord:
+      type: object
+      properties:
+        gmailMessageId:
+          type: string
+        id:
+          type: integer
+        replied:
+          type: integer
+        vertical:
+          type: string
+      required:
+        - gmailMessageId
+        - id
+        - replied
+        - vertical
+    SentEmail:
+      type: object
+      properties:
+        id:
+          type: string
+        threadId:
+          type: string
+        from:
+          type: string
+        to:
+          type: string
+        recipientEmail:
+          type: string
+        recipientName:
+          type: string
+        subject:
+          type: string
+        snippet:
+          type: string
+        bodyPreview:
+          type: string
+        date:
+          type: string
+        timestamp:
+          type: integer
+        labelIds:
+          type: array
+          items:
+            type: string
+        labelNames:
+          type: array
+          items:
+            type: string
+        hasDoctrineLabel:
+          type: boolean
+        matchedDoctrineLabels:
+          type: array
+          items:
+            type: string
+        isSentByMe:
+          type: boolean
+        detection:
+          $ref: "#/components/schemas/SentEmailDetection"
+        inDatabase:
+          type: boolean
+        dbRecord:
+          $ref: "#/components/schemas/SentEmailDbRecord"
+      required:
+        - id
+        - threadId
+        - from
+        - to
+        - recipientEmail
+        - recipientName
+        - subject
+        - snippet
+        - bodyPreview
+        - date
+        - timestamp
+        - labelIds
+        - labelNames
+        - hasDoctrineLabel
+        - matchedDoctrineLabels
+        - isSentByMe
+        - detection
+        - inDatabase
+    SentEmailsMeta:
+      type: object
+      properties:
+        total:
+          type: integer
+        withDoctrineLabel:
+          type: integer
+        inDatabase:
+          type: integer
+        wouldBePickedUp:
+          type: integer
+        doctrineLabelIds:
+          type: array
+          items:
+            type: string
+        doctrineLabels:
+          type: array
+          items:
+            type: string
+      required:
+        - total
+        - withDoctrineLabel
+        - inDatabase
+        - wouldBePickedUp
+    SentEmailsResponse:
+      type: object
+      properties:
+        emails:
+          type: array
+          items:
+            $ref: "#/components/schemas/SentEmail"
+        meta:
+          $ref: "#/components/schemas/SentEmailsMeta"
+      required:
+        - emails
+        - meta
+    ThreadMessage:
+      type: object
+      properties:
+        id:
+          type: string
+        from:
+          type: string
+        to:
+          type: string
+        subject:
+          type: string
+        date:
+          type: string
+        timestamp:
+          type: integer
+        body:
+          type: string
+        snippet:
+          type: string
+        isFromMe:
+          type: boolean
+        labelNames:
+          type: array
+          items:
+            type: string
+      required:
+        - id
+        - from
+        - to
+        - subject
+        - date
+        - timestamp
+        - body
+        - snippet
+        - isFromMe
+    ThreadResponse:
+      type: object
+      properties:
+        threadId:
+          type: string
+        messageCount:
+          type: integer
+        hasExternalReply:
+          type: boolean
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/ThreadMessage"
+      required:
+        - threadId
+        - messageCount
+        - hasExternalReply
+        - messages
+    CancelResult:
+      type: object
+      properties:
+        cancelled:
+          type: integer
+      required:
+        - cancelled
+    StageTiming:
+      type: object
+      properties:
+        minDays:
+          type: integer
+        maxDays:
+          type: integer
+      required:
+        - minDays
+        - maxDays
+    GmailAccount:
+      type: object
+      properties:
+        id:
+          type: integer
+        email:
+          type: string
+        name:
+          type: string
+        isConnected:
+          type: boolean
+        stageTiming:
+          type: array
+          items:
+            $ref: "#/components/schemas/StageTiming"
+        sendDays:
+          type: array
+          items:
+            type: integer
+        sendHourStart:
+          type: integer
+        sendHourEnd:
+          type: integer
+        maxFollowups:
+          type: integer
+        doctrineLabel:
+          type: string
+        testMode:
+          type: boolean
+        requireApproval:
+          type: boolean
+        createdAt:
+          type: string
+      required:
+        - id
+        - email
+        - name
+        - isConnected
+        - stageTiming
+        - sendDays
+        - sendHourStart
+        - sendHourEnd
+        - maxFollowups
+        - doctrineLabel
+        - testMode
+        - requireApproval
+    GmailAccountsResponse:
+      type: object
+      properties:
+        accounts:
+          type: array
+          items:
+            $ref: "#/components/schemas/GmailAccount"
+      required:
+        - accounts
+    DisconnectResult:
+      type: object
+      properties:
+        success:
+          type: boolean
+        email:
+          type: string
+      required:
+        - success
+        - email
+    AccountSettingsUpdate:
+      type: object
+      properties:
+        stageTiming:
+          type: array
+          items:
+            $ref: "#/components/schemas/StageTiming"
+        sendDays:
+          type: array
+          items:
+            type: integer
+        sendHourStart:
+          type: integer
+        sendHourEnd:
+          type: integer
+        maxFollowups:
+          type: integer
+        doctrineLabel:
+          type: string
+        testMode:
+          type: boolean
+        requireApproval:
+          type: boolean
+    UpdateSettingsResult:
+      type: object
+      properties:
+        success:
+          type: boolean
+        account:
+          $ref: "#/components/schemas/GmailAccount"
+      required:
+        - success
+    CampaignStats:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [production, test]
+        label:
+          type: string
+        total:
+          type: integer
+        unreplied:
+          type: integer
+        paused:
+          type: integer
+        queued:
+          type: integer
+        sent:
+          type: integer
+        actionable:
+          type: integer
+      required:
+        - type
+        - label
+        - total
+        - unreplied
+        - paused
+        - queued
+        - sent
+        - actionable
+    CampaignUser:
+      type: object
+      properties:
+        id:
+          type: integer
+        email:
+          type: string
+        name:
+          type: string
+        test_mode:
+          type: boolean
+        max_followups:
+          type: integer
+        doctrine_label:
+          type: string
+        campaigns:
+          type: array
+          items:
+            $ref: "#/components/schemas/CampaignStats"
+      required:
+        - id
+        - email
+        - name
+        - test_mode
+        - max_followups
+        - doctrine_label
+        - campaigns
+    CampaignStatus:
+      type: object
+      properties:
+        active:
+          type: boolean
+        test_mode:
+          type: boolean
+        queued_count:
+          type: integer
+        sent_count:
+          type: integer
+        unreplied_prospects:
+          type: integer
+        users:
+          type: array
+          items:
+            $ref: "#/components/schemas/CampaignUser"
+      required:
+        - active
+        - test_mode
+        - queued_count
+        - sent_count
+        - unreplied_prospects
+    CampaignLaunchRequest:
+      type: object
+      properties:
+        user_id:
+          type: integer
+        max_stage:
+          type: integer
+    CampaignLaunchResult:
+      type: object
+      properties:
+        launched:
+          type: boolean
+        queued:
+          type: integer
+        test_mode_enabled:
+          type: boolean
+        message:
+          type: string
+      required:
+        - launched
+        - queued
+        - message
+    CampaignStopResult:
+      type: object
+      properties:
+        stopped:
+          type: boolean
+        cancelled_count:
+          type: integer
+        test_mode_disabled:
+          type: boolean
+        message:
+          type: string
+      required:
+        - stopped
+        - cancelled_count
+        - message
+    ProspectPauseResult:
+      type: object
+      properties:
+        success:
+          type: boolean
+        paused:
+          type: boolean
+        cancelled_queued:
+          type: integer
+      required:
+        - success
+        - paused
+    ProspectResumeResult:
+      type: object
+      properties:
+        success:
+          type: boolean
+        paused:
+          type: boolean
+        queued_stage:
+          type: integer
+          nullable: true
+        max_followups:
+          type: integer
+      required:
+        - success
+        - paused

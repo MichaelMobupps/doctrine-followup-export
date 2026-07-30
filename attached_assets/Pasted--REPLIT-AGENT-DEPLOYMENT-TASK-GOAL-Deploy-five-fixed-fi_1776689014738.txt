@@ -1,0 +1,162 @@
+# REPLIT AGENT DEPLOYMENT TASK
+
+## GOAL
+Deploy five fixed files from `source-code-fixed.zip` into the existing Doctrine Follow-up api-server. Rebuild. Restart. Verify.
+
+## WHAT YES
+- Replace exactly five files, all under `api-server/`.
+- Rebuild the api-server (`pnpm build`) and restart the running process.
+- Keep a timestamped backup of the five original files before overwriting.
+- Verify by grep and by log tailing after restart.
+
+## WHAT NOT
+- Do not modify `.replit`, `replit.nix`, `pnpm-workspace.yaml`, any `package.json`, or any `.env` file.
+- Do not touch the `dashboard/`, `db/`, `addon/`, `doctrine-integration/`, or `api-server-public/` directories.
+- Do not run any database migration. No schema changed.
+- Do not install, remove, or upgrade any npm/pnpm package. Dependency list is unchanged.
+- Do not reformat, lint-fix, or prettier-run the replaced files. Land them byte-for-byte as shipped.
+- Do not delete `source-code-fixed.zip` or the extraction directory until the user confirms the deploy worked.
+
+## CONTEXT
+Two fixes in this drop:
+1. Meta-language bleed into client emails ("Pitched X, citing Y as urgency") — self-healed at summarizer + generator + fallback layers.
+2. "Stage 2 already exists" error on the Send Now button — fixed by counting all stages (not just sent) and bumping on conflict with a 50-attempt ceiling.
+
+No DB migration. No UI change. No dependency change. No config change. Pure source patch on the api-server.
+
+## THE FIVE FILES
+
+Paths are relative to repo root. All live under `api-server/`:
+
+```
+api-server/cron.ts
+api-server/routes/doctrine.ts
+api-server/services/emailSummarizer.ts
+api-server/services/followupGenerator.ts
+api-server/services/scheduler.ts
+```
+
+## STEP-BY-STEP
+
+### Step 1 — Confirm the upload
+Run `ls -la source-code-fixed.zip` from repo root. Expected: file exists, ~200KB. If missing, STOP and tell the user to re-upload — do not continue.
+
+### Step 2 — Create a timestamped backup of the five current files
+```bash
+STAMP=$(date +%Y%m%d_%H%M%S)
+mkdir -p .backups/$STAMP
+cp api-server/cron.ts .backups/$STAMP/cron.ts
+cp api-server/routes/doctrine.ts .backups/$STAMP/doctrine.ts
+cp api-server/services/emailSummarizer.ts .backups/$STAMP/emailSummarizer.ts
+cp api-server/services/followupGenerator.ts .backups/$STAMP/followupGenerator.ts
+cp api-server/services/scheduler.ts .backups/$STAMP/scheduler.ts
+echo "Backup at .backups/$STAMP"
+```
+Confirm all five files copied. If any `cp` errored, STOP.
+
+### Step 3 — Extract the zip into a temp directory
+```bash
+rm -rf /tmp/sc_fixed
+mkdir -p /tmp/sc_fixed
+unzip -q source-code-fixed.zip -d /tmp/sc_fixed
+ls /tmp/sc_fixed
+```
+Expected: one directory named `source-code-fixed`. If the extraction produced a different layout, STOP and report the listing — do not guess.
+
+### Step 4 — Verify the five source files exist inside the extract
+```bash
+for f in \
+  api-server/cron.ts \
+  api-server/routes/doctrine.ts \
+  api-server/services/emailSummarizer.ts \
+  api-server/services/followupGenerator.ts \
+  api-server/services/scheduler.ts; do
+  test -f "/tmp/sc_fixed/source-code-fixed/$f" && echo "OK  $f" || echo "MISSING  $f"
+done
+```
+All five must print `OK`. If any print `MISSING`, STOP.
+
+### Step 5 — Copy the five files into place (overwrite)
+```bash
+cp /tmp/sc_fixed/source-code-fixed/api-server/cron.ts                          api-server/cron.ts
+cp /tmp/sc_fixed/source-code-fixed/api-server/routes/doctrine.ts               api-server/routes/doctrine.ts
+cp /tmp/sc_fixed/source-code-fixed/api-server/services/emailSummarizer.ts      api-server/services/emailSummarizer.ts
+cp /tmp/sc_fixed/source-code-fixed/api-server/services/followupGenerator.ts    api-server/services/followupGenerator.ts
+cp /tmp/sc_fixed/source-code-fixed/api-server/services/scheduler.ts            api-server/services/scheduler.ts
+```
+
+### Step 6 — Sanity-check the patches landed
+```bash
+grep -n "summaryLooksMeta"   api-server/services/emailSummarizer.ts       # expect 2+ hits (definition + export)
+grep -n "Self-healed meta"   api-server/services/followupGenerator.ts     # expect 1 hit
+grep -n "MAX_ATTEMPTS = 50"  api-server/routes/doctrine.ts                # expect 1 hit
+grep -n "Fast-tick"          api-server/cron.ts                           # expect 1 hit
+grep -n "Test mode is deprecated" api-server/services/scheduler.ts        # expect 1 hit
+```
+All five greps must return at least one match. If any returns nothing, the copy failed — restore from `.backups/$STAMP/` and STOP.
+
+### Step 7 — Confirm no stray test-mode code slipped back in
+```bash
+grep -n "autoQueueNextStages" api-server/cron.ts                          # expect zero hits
+grep -n "TEST_MODE_LABEL"     api-server/services/scheduler.ts            # expect zero hits
+grep -n "testMode: true"      api-server/                                 # expect zero hits globally
+```
+All three must return empty. If any returns a hit, restore from backup and STOP.
+
+### Step 8 — Rebuild the api-server
+From repo root:
+```bash
+cd api-server && pnpm build
+```
+Expected: clean exit, produces `api-server/dist/index.mjs`. If the build fails with a TypeScript error, read the error, report it to the user, and STOP. Do not attempt to "fix" TypeScript errors — the files shipped clean.
+
+Note: one pre-existing Map-typing warning at `scheduler.ts:292` may appear (`Operator '>' cannot be applied to types 'number' and 'unknown'`). This was in the original code before this patch. If the build uses `tsc --noEmit` strict mode and fails on only that line, confirm with the user before any fix — do not silently edit it.
+
+### Step 9 — Restart the running process
+Kill the currently running api-server (whichever PID is serving from `dist/index.mjs`) and start fresh:
+```bash
+pkill -f "dist/index.mjs" || true
+sleep 2
+cd api-server && pnpm start &
+```
+Or, if Replit manages the process via the Run button / workflow, use the Replit-native restart (stop the running workflow and start it again).
+
+### Step 10 — Tail the log for 30 seconds and confirm healthy startup
+Expected log lines within the first 10 seconds:
+```
+Cron jobs active: sync+auto-queue @*/15, process @5,20,35,50, fast-tick @*/3
+```
+If you see `Cron jobs active: sync @*/15, process @5,20,35,50, test-mode @*/3` instead, the old `cron.ts` is still running — you deployed the wrong file or the build used a stale cache. Clear `api-server/dist/`, rebuild, and restart.
+
+### Step 11 — Smoke test the two fixes
+
+**Fix 1 — Send Now / stage race.** Pick an unreplied prospect in the database that already has at least one queued or sent follow-up. Click "Send now" on it. Expected: an HTTP 200 with `{ success: true, stage_queued: <N>, message: "Follow-up stage <N> sent." }` where N is `max(existing stage) + 1`. Previous behavior: HTTP 500 with Postgres unique-constraint error surfaced as "Stage X already exists".
+
+**Fix 2 — Meta-language self-heal.** Find a prospect whose `original_body_summary` in the `prospects` table begins with "Pitched" or contains "citing" / "claiming" / "the ability to". Trigger a follow-up generation on it (either queue a follow-up or Send Now). In the logs, expect:
+```
+Self-healed meta-contaminated original_body_summary before generation
+```
+with a `before` and `after` showing the cleaned summary.
+
+### Step 12 — Report back
+Post to the user:
+- `STAMP` value (so they can find the backup if rollback is needed).
+- The output of Step 6 greps.
+- The first 20 lines of startup log from Step 10.
+- Result of each smoke test in Step 11.
+
+## ROLLBACK (if anything in Steps 6–11 fails)
+```bash
+cp .backups/$STAMP/cron.ts               api-server/cron.ts
+cp .backups/$STAMP/doctrine.ts           api-server/routes/doctrine.ts
+cp .backups/$STAMP/emailSummarizer.ts    api-server/services/emailSummarizer.ts
+cp .backups/$STAMP/followupGenerator.ts  api-server/services/followupGenerator.ts
+cp .backups/$STAMP/scheduler.ts          api-server/services/scheduler.ts
+cd api-server && pnpm build && pnpm start
+```
+
+## CLEANUP (only after the user confirms Step 11 passed)
+```bash
+rm -rf /tmp/sc_fixed
+# Keep source-code-fixed.zip and .backups/$STAMP/ — the user may want them for audit.
+```

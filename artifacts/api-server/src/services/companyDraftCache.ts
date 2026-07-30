@@ -1,0 +1,484 @@
+/**
+ * companyDraftCache.ts — CSD v1: Company-Shared Drafts.
+ *
+ * Purpose: when N contacts at the same company are at the same stage of the
+ * same campaign, in the same ORIGINAL THREAD LANGUAGE, the follow-up body is
+ * generated ONCE and reused N times. The doctrine pipeline costs 3-7 LLM
+ * calls per generation (Sonnet draft, Opus critic, Sonnet rewrite, up to 3
+ * healing iterations); this module removes N-1 of those pipeline runs per
+ * cohort per stage.
+ *
+ * Cohort = (userId, app, companyKey, language, stage, cycle, contextHash,
+ * historyHash). See db/schema/company-shared-drafts.ts for the rationale on
+ * each component. Two invariants this module enforces:
+ *
+ *   1. LANGUAGE ISOLATION (hard product requirement): language is a
+ *      first-class key column. A contact whose original thread was English
+ *      can never be served a Spanish shared draft — the Spanish draft lives
+ *      under a different key entirely.
+ *
+ *   2. HISTORY ISOLATION: a shared draft is only reused by contacts whose
+ *      prior SENT follow-ups (current cycle) are byte-identical to those the
+ *      draft was written against. "Circling back on my note about X" can
+ *      never reference an angle the recipient was never sent.
+ *
+ * Failure posture: EVERY db-touching function in this module is fail-open.
+ * A cache error degrades to per-contact generation (today's behavior) and
+ * never blocks a send. This is asserted by the try/catch-and-log wrappers,
+ * not by caller discipline.
+ *
+ * Scope: SHARED_DRAFT_APPS gates which apps participate. v1 = doctrine only.
+ * anti_ghosting is permanently excluded: its generation context is a LIVE
+ * per-thread Gmail re-read, so sharing is semantically wrong there.
+ */
+
+import { createHash } from "node:crypto";
+import { sql, and, eq } from "drizzle-orm";
+import { db, companySharedDraftsTable, prospectsTable } from "@workspace/db";
+import { logger } from "../lib/logger";
+import type { PreviousFollowup } from "./followupPrompts";
+
+// v1 scope. Adding "context" later is a one-token change here, after its own
+// audit pass. anti_ghosting must NEVER be added (live-thread context).
+export const SHARED_DRAFT_APPS: ReadonlySet<string> = new Set(["doctrine"]);
+
+// A shared draft older than this is regenerated. Cohorts are scheduled at
+// the same timestamp by autoQueueAllCampaigns, so members normally consume
+// the cache within minutes of each other; the TTL only matters when the
+// LIMIT-20 dispatcher window, send-window deferrals, or budget deferrals
+// split a cohort across ticks or days.
+export const SHARED_DRAFT_TTL_HOURS = 72;
+
+// Daily prune deletes rows older than this. Long past any plausible reuse.
+export const SHARED_DRAFT_RETENTION_DAYS = 30;
+
+export interface CohortDescriptor {
+  userId: number;
+  app: string;
+  companyKey: string;
+  language: string;
+  stage: number;
+  cycle: number;
+  contextHash: string;
+  historyHash: string;
+  // Raw fields retained for the live cohort-size count (the count queries
+  // prospects by raw column values, not by hash).
+  vertical: string;
+  subVertical: string | null;
+  product: string;
+  batchLabel: string;
+  sentAt: Date;
+}
+
+export interface SharedDraftHit {
+  id: number;
+  subject: string;
+  body: string;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Pure helpers (unit-tested in tests/test-company-shared-drafts.ts)
+// ─────────────────────────────────────────────────────────────────────────
+
+/** Lowercase, trim, collapse internal whitespace. "" means "no company". */
+export function normalizeCompanyKey(company: string | null | undefined): string {
+  if (!company) return "";
+  return company.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/** Normalized language code; defaults to "en" like every generator path. */
+export function normalizeLanguage(language: string | null | undefined): string {
+  const l = (language || "").trim().toLowerCase();
+  return l || "en";
+}
+
+/**
+ * Batch key: the campaign-wave discriminator. batchLabel when present;
+ * otherwise the UTC calendar date of the original send, so unlabeled
+ * prospects only cohort with same-day ingests of the same campaign rather
+ * than with every historical send to that company.
+ */
+export function buildBatchKey(batchLabel: string | null | undefined, sentAt: Date): string {
+  const label = (batchLabel || "").trim();
+  if (label) return `label:${label}`;
+  return `sentdate:${sentAt.toISOString().slice(0, 10)}`;
+}
+
+function sha256(input: string): string {
+  return createHash("sha256").update(input, "utf8").digest("hex");
+}
+
+/**
+ * Campaign-context hash. Fields are joined with an unlikely delimiter and
+ * length-prefixed so no two distinct field tuples can collide by
+ * concatenation ("ab"+"c" vs "a"+"bc").
+ */
+export function buildContextHash(args: {
+  vertical: string;
+  subVertical: string | null;
+  product: string;
+  originalSubject: string;
+  batchKey: string;
+}): string {
+  const parts = [
+    args.vertical || "",
+    args.subVertical || "",
+    args.product || "",
+    (args.originalSubject || "").trim(),
+    args.batchKey,
+  ];
+  return sha256(parts.map((p) => `${p.length}:${p}`).join("\u241F"));
+}
+
+/**
+ * History hash over the prior sent follow-ups EXACTLY as the prompt sees
+ * them (the previousFollowups array the scheduler already builds: sent rows
+ * of the current cycle, lower stages, with non-null subject+body, ordered by
+ * stage). Empty history hashes to a stable constant, so stage-1 cohorts
+ * share unconditionally.
+ */
+export function buildHistoryHash(previousFollowups: PreviousFollowup[] | undefined): string {
+  if (!previousFollowups || previousFollowups.length === 0) return sha256("none");
+  const canon = previousFollowups
+    .map((p) => `${p.stage}\u241E${p.subject.length}:${p.subject}\u241E${p.body.length}:${p.body}`)
+    .join("\u241D");
+  return sha256(canon);
+}
+
+/** TTL check, pure for testability. */
+export function isSharedDraftFresh(generatedAt: Date, now: Date): boolean {
+  return now.getTime() - generatedAt.getTime() <= SHARED_DRAFT_TTL_HOURS * 60 * 60 * 1000;
+}
+
+/**
+ * CSD v1.1: deterministic egress guard against personal-name leakage into a
+ * shared draft. Production incident 2026-06-08 (Bauhaus/de): the critic
+ * mined the recipient's first name from the original email text and pushed
+ * it back into the greeting of a shared draft; the prompt-level shared-mode
+ * override is the primary fix, and this guard is the belt-and-suspenders
+ * layer that refuses to CACHE any shared draft containing a name token of
+ * the source prospect.
+ *
+ * Behavior on detection: the draft is still SENT to the current contact
+ * (the leaked name is their own, so the email is correct for them), but it
+ * is NOT stored, so no sibling can ever receive it.
+ *
+ * Mechanics: name tokens of length >= 3 from the source prospect's name,
+ * matched case-insensitively on Unicode-letter boundaries. Tokens that also
+ * appear in the company name are skipped (e.g. founder-named companies), in
+ * which case the prompt layer remains the only guard for that token.
+ * Limitation, documented: for non-Latin target languages the greeting name
+ * is transliterated (e.g. John -> Джон), which Latin-token matching cannot
+ * see; the prompt-level override carries those cases.
+ */
+export function detectPersonalNameLeak(args: {
+  subject: string;
+  body: string;
+  prospectName: string;
+  company: string;
+}): { leaked: boolean; tokens: string[] } {
+  const name = (args.prospectName || "").trim();
+  if (!name || name.includes("@")) return { leaked: false, tokens: [] };
+
+  const companyLower = (args.company || "").toLowerCase();
+  const haystack = `${args.subject || ""}\n${args.body || ""}`;
+
+  const tokens = name
+    .split(/[\s,.'"()-]+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 3)
+    .filter((t) => !companyLower.includes(t.toLowerCase()));
+
+  const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const hits: string[] = [];
+  for (const token of tokens) {
+    const re = new RegExp(`(^|[^\\p{L}])${escape(token)}([^\\p{L}]|$)`, "iu");
+    if (re.test(haystack)) hits.push(token);
+  }
+  return { leaked: hits.length > 0, tokens: hits };
+}
+
+/**
+ * Build the cohort descriptor for a due follow-up row, or null when the row
+ * is ineligible for sharing. Ineligible: app outside SHARED_DRAFT_APPS, or
+ * empty normalized company (an empty companyKey would cohort unrelated
+ * no-company prospects together — never share those).
+ */
+export function buildCohortDescriptor(args: {
+  userId: number | null;
+  app: string;
+  company: string;
+  originalLanguage: string;
+  stage: number;
+  cycle: number;
+  vertical: string;
+  subVertical: string | null;
+  product: string;
+  originalSubject: string;
+  batchLabel: string;
+  sentAt: Date;
+  previousFollowups: PreviousFollowup[] | undefined;
+}): CohortDescriptor | null {
+  if (!args.userId) return null;
+  if (!SHARED_DRAFT_APPS.has(args.app)) return null;
+  const companyKey = normalizeCompanyKey(args.company);
+  if (!companyKey) return null;
+
+  const batchKey = buildBatchKey(args.batchLabel, args.sentAt);
+  return {
+    userId: args.userId,
+    app: args.app,
+    companyKey,
+    language: normalizeLanguage(args.originalLanguage),
+    stage: args.stage,
+    cycle: args.cycle,
+    contextHash: buildContextHash({
+      vertical: args.vertical,
+      subVertical: args.subVertical,
+      product: args.product,
+      originalSubject: args.originalSubject,
+      batchKey,
+    }),
+    historyHash: buildHistoryHash(args.previousFollowups),
+    vertical: args.vertical,
+    subVertical: args.subVertical,
+    product: args.product,
+    batchLabel: (args.batchLabel || "").trim(),
+    sentAt: args.sentAt,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// DB-backed functions — all fail-open
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Look up a fresh shared draft for the cohort. Returns null on miss, on
+ * stale (older than TTL — caller regenerates and the upsert refreshes the
+ * row), and on ANY error.
+ */
+export async function lookupSharedDraft(d: CohortDescriptor): Promise<SharedDraftHit | null> {
+  try {
+    const rows = await db
+      .select({
+        id: companySharedDraftsTable.id,
+        subject: companySharedDraftsTable.generatedSubject,
+        body: companySharedDraftsTable.generatedBody,
+        generatedAt: companySharedDraftsTable.generatedAt,
+      })
+      .from(companySharedDraftsTable)
+      .where(and(
+        eq(companySharedDraftsTable.userId, d.userId),
+        eq(companySharedDraftsTable.app, d.app),
+        eq(companySharedDraftsTable.companyKey, d.companyKey),
+        eq(companySharedDraftsTable.language, d.language),
+        eq(companySharedDraftsTable.stage, d.stage),
+        eq(companySharedDraftsTable.cycle, d.cycle),
+        eq(companySharedDraftsTable.contextHash, d.contextHash),
+        eq(companySharedDraftsTable.historyHash, d.historyHash),
+      ))
+      .limit(1);
+
+    const row = rows[0];
+    if (!row) return null;
+    if (!isSharedDraftFresh(row.generatedAt, new Date())) {
+      logger.info({ sharedDraftId: row.id, companyKey: d.companyKey, stage: d.stage }, "CSD: shared draft stale beyond TTL — regenerating");
+      return null;
+    }
+    return { id: row.id, subject: row.subject, body: row.body };
+  } catch (err) {
+    logger.warn({ err: String(err), companyKey: d.companyKey, stage: d.stage }, "CSD: shared draft lookup failed — falling back to per-contact generation");
+    return null;
+  }
+}
+
+/** Bump reuse counters after a follow-up adopts a shared draft. Fail-open. */
+export async function recordSharedDraftReuse(sharedDraftId: number): Promise<void> {
+  try {
+    await db
+      .update(companySharedDraftsTable)
+      .set({
+        reuseCount: sql`${companySharedDraftsTable.reuseCount} + 1`,
+        lastReusedAt: new Date(),
+      })
+      .where(eq(companySharedDraftsTable.id, sharedDraftId));
+  } catch (err) {
+    logger.warn({ err: String(err), sharedDraftId }, "CSD: failed to record reuse (non-fatal)");
+  }
+}
+
+/**
+ * Store (upsert) the shared draft for a cohort. ON CONFLICT refreshes the
+ * body and generated_at in place — this both handles the overlapping-tick
+ * race (two workers both miss and both generate; last write wins, no
+ * correctness issue) and the stale-TTL regeneration path. reuse_count is
+ * preserved on conflict. Fail-open: a store failure costs future savings
+ * only; the in-hand generated draft still ships.
+ */
+export async function storeSharedDraft(
+  d: CohortDescriptor,
+  generated: { subject: string; body: string },
+  source: { prospectId: number; followupId: number },
+): Promise<void> {
+  try {
+    await db
+      .insert(companySharedDraftsTable)
+      .values({
+        userId: d.userId,
+        app: d.app,
+        companyKey: d.companyKey,
+        language: d.language,
+        stage: d.stage,
+        cycle: d.cycle,
+        contextHash: d.contextHash,
+        historyHash: d.historyHash,
+        generatedSubject: generated.subject,
+        generatedBody: generated.body,
+        sourceProspectId: source.prospectId,
+        sourceFollowupId: source.followupId,
+        generatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: [
+          companySharedDraftsTable.userId,
+          companySharedDraftsTable.app,
+          companySharedDraftsTable.companyKey,
+          companySharedDraftsTable.language,
+          companySharedDraftsTable.stage,
+          companySharedDraftsTable.cycle,
+          companySharedDraftsTable.contextHash,
+          companySharedDraftsTable.historyHash,
+        ],
+        set: {
+          generatedSubject: generated.subject,
+          generatedBody: generated.body,
+          sourceProspectId: source.prospectId,
+          sourceFollowupId: source.followupId,
+          generatedAt: new Date(),
+        },
+      });
+  } catch (err) {
+    logger.warn({ err: String(err), companyKey: d.companyKey, stage: d.stage }, "CSD: failed to store shared draft (non-fatal)");
+  }
+}
+
+/**
+ * Live cohort size: how many ACTIVE prospects (unreplied, unpaused,
+ * unarchived) belong to this cohort's campaign wave for this company,
+ * language, and user. >= 2 means the generation should run in shared mode
+ * (neutral greeting) and be cached. 1 (or an error → 1) means the existing
+ * fully-personalized single-contact path runs, byte-for-byte unchanged.
+ *
+ * The count deliberately uses raw column comparisons, mirroring
+ * buildBatchKey/normalizeCompanyKey semantics in SQL.
+ */
+export async function countActiveCohortMembers(d: CohortDescriptor): Promise<number> {
+  try {
+    const batchCondition = d.batchLabel
+      ? sql`${prospectsTable.batchLabel} = ${d.batchLabel}`
+      : sql`btrim(${prospectsTable.batchLabel}) = '' AND to_char(${prospectsTable.sentAt} AT TIME ZONE 'UTC', 'YYYY-MM-DD') = ${d.sentAt.toISOString().slice(0, 10)}`;
+
+    const subVerticalCondition = d.subVertical === null || d.subVertical === undefined
+      ? sql`${prospectsTable.subVertical} IS NULL`
+      : sql`${prospectsTable.subVertical} = ${d.subVertical}`;
+
+    const rows = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(prospectsTable)
+      .where(and(
+        eq(prospectsTable.userId, d.userId),
+        sql`${prospectsTable.app} = ${d.app}`,
+        sql`lower(regexp_replace(btrim(${prospectsTable.company}), '\\s+', ' ', 'g')) = ${d.companyKey}`,
+        sql`lower(coalesce(nullif(btrim(${prospectsTable.originalLanguage}), ''), 'en')) = ${d.language}`,
+        eq(prospectsTable.vertical, d.vertical),
+        subVerticalCondition,
+        eq(prospectsTable.product, d.product),
+        sql`(${batchCondition})`,
+        eq(prospectsTable.replied, 0),
+        eq(prospectsTable.followupPaused, false),
+        eq(prospectsTable.archived, false),
+      ));
+
+    return rows[0]?.count ?? 1;
+  } catch (err) {
+    logger.warn({ err: String(err), companyKey: d.companyKey }, "CSD: cohort count failed — treating as singleton (personalized generation)");
+    return 1;
+  }
+}
+
+/** Daily prune of shared drafts past retention. Fail-open, returns rows deleted. */
+export async function pruneSharedDrafts(options?: { now?: Date }): Promise<number> {
+  try {
+    const now = options?.now ?? new Date();
+    const cutoff = new Date(now.getTime() - SHARED_DRAFT_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+    const result = await db
+      .delete(companySharedDraftsTable)
+      .where(sql`${companySharedDraftsTable.generatedAt} < ${cutoff}`);
+    return result.rowCount || 0;
+  } catch (err) {
+    logger.warn({ err: String(err) }, "CSD: prune failed (non-fatal)");
+    return 0;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Cohort scheduling alignment helpers (pure; used by autoQueueAllCampaigns)
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Grouping key for scheduling alignment in the auto-queue. Same shape as
+ * the cohort identity minus the hashes (subject/history are not loaded on
+ * the auto-queue hot path and are not needed: members that later prove
+ * hash-divergent at generation time simply generate separately; aligned
+ * timing costs nothing). Returns null when the prospect must not be
+ * aligned (wrong app, empty company).
+ */
+export function buildAlignmentKey(args: {
+  userId: number | null;
+  app: string;
+  company: string;
+  originalLanguage: string;
+  vertical: string;
+  subVertical: string | null;
+  product: string;
+  batchLabel: string;
+  sentAt: Date;
+  nextStage: number;
+}): string | null {
+  if (!args.userId) return null;
+  if (!SHARED_DRAFT_APPS.has(args.app)) return null;
+  const companyKey = normalizeCompanyKey(args.company);
+  if (!companyKey) return null;
+  const batchKey = buildBatchKey(args.batchLabel, args.sentAt);
+  return [
+    args.userId,
+    args.app,
+    companyKey,
+    normalizeLanguage(args.originalLanguage),
+    args.vertical || "",
+    args.subVertical || "",
+    args.product || "",
+    batchKey,
+    args.nextStage,
+  ].join("\u241F");
+}
+
+/**
+ * Representative anchors for one shared scheduledAt across a cohort: the
+ * LATEST initial send and the LATEST previous-stage send among members, so
+ * the configured minimum gap holds for every member.
+ */
+export function pickCohortAnchors(members: Array<{ sentAt: Date; lastFollowupSentAt: Date | null }>): {
+  initialSentAt: Date;
+  lastFollowupSentAt: Date | null;
+} {
+  let initial = members[0].sentAt;
+  let last: Date | null = null;
+  for (const m of members) {
+    if (m.sentAt.getTime() > initial.getTime()) initial = m.sentAt;
+    if (m.lastFollowupSentAt && (!last || m.lastFollowupSentAt.getTime() > last.getTime())) {
+      last = m.lastFollowupSentAt;
+    }
+  }
+  return { initialSentAt: initial, lastFollowupSentAt: last };
+}

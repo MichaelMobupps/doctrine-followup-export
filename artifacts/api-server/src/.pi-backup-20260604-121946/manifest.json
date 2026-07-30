@@ -1,0 +1,7 @@
+{
+  "stamp": "20260604-121946",
+  "api_dir": "/home/runner/workspace/artifacts/api-server/src",
+  "module_was_present": 0,
+  "placed": ["lib/promptInjection.ts", "tests/promptInjection.test.ts"],
+  "backed_up_services": ["replySentiment.ts", "emailSummarizer.ts", "followupPrompts.ts", "contextFollowupPrompts.ts", "antiGhostingFollowupPrompts.ts", "followupGenerator.ts", "contextFollowupGenerator.ts", "antiGhostingFollowupGenerator.ts"]
+}

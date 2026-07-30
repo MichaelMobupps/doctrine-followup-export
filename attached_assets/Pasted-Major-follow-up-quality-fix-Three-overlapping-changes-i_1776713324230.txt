@@ -1,0 +1,75 @@
+Major follow-up quality fix. Three overlapping changes in one deploy:
+
+(1) The follow-up system was failing because every Anthropic API call returned 404 "Replit AI Integrations is not configured". Switching off Replit's AI proxy and calling Anthropic's API directly using ANTHROPIC_API_KEY.
+(2) The hardcoded multilingual FALLBACK_TEMPLATES dict is deleted. Only real LLM output goes out, in whatever language Claude naturally responds in. Transient API failures are handled by a new retry layer with exponential backoff.
+(3) Supporting improvements: body-greeting name extraction, free-mail-domain company filter, prose-summary rejection, full original body stored + fed to LLM, 3-dots "view original email" modal.
+
+Files uploaded (13 total). Paths are relative to the monorepo source tree; prepend artifacts/ or whatever prefix your layout uses:
+
+  api-server/lib/anthropic.ts                NEW
+  api-server/services/anthropicRetry.ts      NEW
+  api-server/services/emailSummarizer.ts
+  api-server/services/followupGenerator.ts
+  api-server/services/followupPrompts.ts
+  api-server/services/gmailClient.ts
+  api-server/services/gmailSync.ts
+  api-server/services/scheduler.ts
+  api-server/routes/doctrine.ts
+  db/schema/prospects.ts
+  dashboard/pages/followups.tsx
+  openapi.yaml                               (repo root)
+  api-server/package.json                    (one new dep: @anthropic-ai/sdk)
+
+Plus one SQL file: cleanup_test_prospects.sql — do NOT commit it; you run it manually after the deploy lands (step 9 below).
+
+Do all of these in order. Do not skip.
+
+STEP 1 — PRE-DEPLOY CHECK. Verify ANTHROPIC_API_KEY is set in the PRODUCTION deployment environment (not just workspace). If missing, STOP and tell me — the new code throws at boot without it. The value must be a direct Anthropic key (starts with sk-ant-) from console.anthropic.com, not a Replit integration token.
+
+STEP 2 — Confirm all 13 files are at their resolved paths in the monorepo. If any missing, stop and report.
+
+STEP 3 — Install the new dependency. Run: pnpm install (from repo root, or pnpm --filter @workspace/api-server install). Confirm @anthropic-ai/sdk is in node_modules.
+
+STEP 4 — Search for any leftover references to the removed code. Repo-wide grep (exclude node_modules, dist, build, .git):
+      "buildFallbackFollowup"
+      "FALLBACK_TEMPLATES"
+      "FallbackTemplate"
+      "firstToken"
+      "@workspace/integrations-anthropic-ai"    in api-server/ only
+   Expected: ZERO hits for the first four. For the last one, only api-server-package.json should still reference the package (we kept it in deps for now to avoid cascading changes). NO .ts file in api-server/ should import from it.
+
+STEP 5 — Regenerate API client types from openapi.yaml (same command as last time, likely pnpm --filter @workspace/api-spec run codegen). Verify Followup type in lib/api-zod generated files contains original_body, original_body_summary, original_language, original_sent_at, gmail_thread_id.
+
+STEP 6 — Typecheck both workspaces. Report errors verbatim.
+
+STEP 7 — Restart/rebuild locally, verify the server boots. The new lib/anthropic.ts throws at import if ANTHROPIC_API_KEY is missing — a boot failure here means step 1 wasn't done correctly.
+
+STEP 8 — Republish to production at https://doctrine-followupv-2.replit.app.
+
+STEP 9 — Run cleanup_test_prospects.sql AGAINST PROD:
+      psql "$PROD_DATABASE_URL" -f cleanup_test_prospects.sql
+   Report the "prospects_remaining" count. Expected: 0 (all 15 test rows removed along with their follow-ups).
+
+STEP 10 — Smoke test. Run:
+   a) curl -X POST -H "x-api-key: $ADDON_API_KEY" https://doctrine-followupv-2.replit.app/api/sync
+      (Sync should run clean. With 0 prospects currently, synced=0.)
+   b) If Michael has labeled new emails since, re-run sync; otherwise wait for him to send one. Verify new rows populate:
+      psql "$PROD_DATABASE_URL" -c "SELECT id, prospect_name, company, original_language, LENGTH(original_body) AS body_len, LENGTH(original_body_summary) AS sum_len FROM prospects ORDER BY id DESC LIMIT 3;"
+      Expected: body_len > 500 on new rows; prospect_name is a real first name (not 'hwholestorm' nor an email); company is empty string for free-mail recipients or the real company domain otherwise; original_language is correctly detected.
+   c) Production log tail — watch for any "Replit AI Integrations" errors. Expected: NONE. Instead, if calls succeed, you'll see "Step 1: Generating initial draft" etc. If calls fail, you'll see "Transient Anthropic error — retrying" (from the new retry layer) — which is normal transient behavior.
+
+STEP 11 — Report back with:
+   - Confirmation ANTHROPIC_API_KEY was set in deployment env (step 1)
+   - Leftover-grep output (step 4)
+   - Regenerated type file presence of new fields (step 5)
+   - Build output (step 6)
+   - Boot log snippet (step 7) — must NOT contain "ANTHROPIC_API_KEY is not set"
+   - Cleanup SQL output (step 9)
+   - LENGTH query output AFTER a fresh post-deploy sync (step 10b)
+   - Any "Replit AI Integrations" hits in logs (step 10c) — should be zero going forward
+
+Do NOT:
+- Reintroduce the template fallback in any form
+- Re-enable the Replit AI Integrations proxy in code — we're off it permanently
+- Modify .replit or infra files
+- Send any follow-up to hwholestorm@gmail.com — cleanup deletes those rows; any fresh sync must come from new real-prospect emails

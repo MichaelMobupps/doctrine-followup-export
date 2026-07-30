@@ -1,0 +1,76 @@
+I'm deploying 12 patched source files that (1) remove test mode entirely, (2) fix the Send now button visibility, (3) add a domain-restricted login allowlist for the dashboard sign-in flow. These are full-file replacements, NOT diffs. I have already uploaded all 12 files into the repo at the paths they belong at. Your job is to verify everything applied cleanly, make sure nothing stale is referencing removed symbols, and redeploy to production.
+
+Do the following in order and do not skip steps:
+
+1. VERIFY FILE PRESENCE. Confirm these 12 files exist in the repo at the paths listed. If ANY are missing, STOP and tell me which ones:
+   - api-server/routes/auth.ts
+   - api-server/routes/doctrine.ts
+   - api-server/routes/gmail-auth.ts
+   - api-server/services/gmailSync.ts
+   - api-server/services/timingEngine.ts
+   - api-server/scripts/createLabels.ts
+   - dashboard/components/api-key-provider.tsx
+   - dashboard/pages/prospects.tsx
+   - dashboard/pages/activity-log.tsx
+   - dashboard/pages/dashboard.tsx
+   - dashboard/pages/accounts.tsx
+   - dashboard/pages/followups.tsx
+   Note: in this monorepo api-server and dashboard may live under a packages/ or artifacts/ or apps/ prefix. Locate them by searching for a file named prospects.tsx inside any dashboard-like workspace, then apply this prompt to whatever prefix you find.
+
+2. SEARCH FOR LEFTOVERS. Repo-wide search excluding node_modules, dist, build, .next, .turbo, .git. Report every hit for each token:
+      testMode
+      test_mode
+      TEST_MODE
+      is_test_campaign
+      generateTestModeSchedule
+   Expected surviving hits (all OK, do not touch):
+   - api-server/lib/constants.ts: exports TEST_MODE_LABEL constant (dead but harmless)
+   - db/schema/users.ts: testMode column definition (we keep the column to avoid a migration)
+   - Comments that say "Test mode removed" or similar
+   Any OTHER hit is a real leftover - remove the reference (for API response fields) or remove the conditional branch (for code). Do not reintroduce removed fields.
+
+3. TYPECHECK. Run the TypeScript build for both workspaces. Pick whichever matches:
+      pnpm -w build
+      pnpm -r build
+      pnpm --filter ./api-server build && pnpm --filter ./dashboard build
+      npm run build
+   If the build fails with "Property 'testMode'/'test_mode'/'is_test_campaign' does not exist" - find the reference and delete it, do NOT re-add the removed field. If an unused-import warning for TEST_MODE_LABEL appears, delete that import. For any other error, report it verbatim and stop.
+   Repeat until both builds succeed with zero errors.
+
+4. DATABASE. Do NOT run any migration. The users.test_mode column stays in the database as a harmless unused column. If drizzle-kit or a migration runner wants to drop it, DECLINE.
+
+5. REDEPLOY TO PRODUCTION. This is important: the production deployment is at https://doctrine-followupv-2.replit.app - NOT the old doctrine-followup.replit.app. Republish to the current active deployment (doctrine-followupv-2).
+
+6. SMOKE-TEST VIA CURL against https://doctrine-followupv-2.replit.app. Replace <APIKEY> with a valid key from the env.
+      GET  /api/campaign/status    -H "x-api-key: <APIKEY>"
+      GET  /api/prospects          -H "x-api-key: <APIKEY>"
+      GET  /api/followups          -H "x-api-key: <APIKEY>"
+   Verify in each response:
+   - /api/campaign/status: NO "test_mode" field top-level, NO "test_mode" field per user, each user's "campaigns" array has exactly ONE entry (no "type" field, no "test" entry).
+   - /api/prospects: no "is_test_campaign" field, no "batch_label" field on any prospect.
+   - /api/followups: no "is_test_campaign" field, no "batch_label" field on any follow-up.
+   If any removed field still appears, the old code is still being served - flush caches, hard-restart the deployment, re-verify.
+
+7. SMOKE-TEST DOMAIN LOCK. From a non-mobupps/non-wmadv Gmail account (if you can simulate one, or explain to the user how to test), attempt Sign in with Google. Expected: land back on the login page with message "Access restricted. Only company accounts are permitted to sign in." Server log should show: "Login denied: email domain not in allowlist" at WARN level.
+
+8. SMOKE-TEST UI. Open doctrine-followupv-2.replit.app in a browser:
+   - Log in with michael.a.g@mobupps.com - should succeed
+   - Prospects page: on a paused prospect (PAUSED badge), hover the row - "Send now" button must be visible and work
+   - Prospects: no PROD or TEST badge next to WAITING
+   - Activity Log: each user card shows exactly ONE campaign block, no "test" campaign
+   - Settings (Accounts): no "Test Mode" checkbox
+
+9. REPORT BACK with:
+   - Paths actually found for each of the 12 files (to confirm monorepo prefix)
+   - Output of leftover-search (step 2)
+   - Build result (step 3)
+   - The three raw JSON responses from step 6
+   - Whether step 7 blocked non-company logins
+   - Confirmation for each of the UI checks in step 8
+
+Do NOT:
+- Run database migrations
+- Rename files or folders
+- Re-add removed fields for backward compatibility
+- Modify .replit or any files I did not upload
+- Claim success without completing steps 2, 3, 6, 7, and 8

@@ -1,0 +1,28 @@
+Apply Batch 2 (bulk Send All / Pause All — backend endpoints + frontend selection UI on the Pipeline page).
+
+Place the uploaded batch2-bulk-actions.zip somewhere accessible (project root or /tmp) and extract it.
+Run the patch script: node <extracted-dir>/apply-batch2.mjs. The script targets artifacts/dashboard/src/ and artifacts/api-server/src/ by default — set DASH_BASE and/or API_BASE env vars if your live trees differ. The script is idempotent (re-running is a no-op) and prints a verify report at the end. Report that report back verbatim.
+Build BOTH packages, since this batch touches the dashboard and the api-server:
+
+From the api-server package: pnpm run build inside artifacts/api-server, or the workspace-filtered pnpm --filter @workspace/api-server run build from the repo root.
+From the dashboard package: pnpm run build inside artifacts/dashboard, or pnpm --filter @workspace/dashboard run build from the repo root.
+Report build output verbatim for both, including any warnings.
+
+
+Restart the api-server workflow using restart_workflow. Do NOT use kill 1 — that takes down the whole container, not just the workflow.
+After restart, fetch the api-server boot logs and confirm it's listening on its port with no errors. Look for the new routes being registered if the boot log shows route mounting.
+Smoke-test the new endpoints by hitting them with empty bodies (expect 400 with the input-validation error message):
+
+curl -i -X POST http://localhost:<port>/api/followup/send-bulk -H "x-api-key: <key>" -H "Content-Type: application/json" -d '{}'
+curl -i -X POST http://localhost:<port>/api/prospect/pause-bulk -H "x-api-key: <key>" -H "Content-Type: application/json" -d '{}'
+Both should return {"error":"prospectIds must be a non-empty array of positive integers"}. Report both responses verbatim.
+
+
+Sync the changed files into the source-code mirror per the standard rule:
+
+artifacts/dashboard/src/pages/pipeline.tsx → source-code/dashboard/pages/pipeline.tsx
+artifacts/api-server/src/routes/doctrine.ts → source-code/api-server/routes/doctrine.ts
+
+
+
+If any step fails, stop and report the exact error — do not improvise fixes. If TypeScript surfaces errors that reference the new bulk endpoints or the bulk-action UI, copy them verbatim so I can patch.

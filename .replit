@@ -1,0 +1,50 @@
+modules = ["nodejs-24", "postgresql-16", "python-3.11"]
+
+[[artifacts]]
+id = "artifacts/api-server"
+
+[[artifacts]]
+id = "artifacts/mockup-sandbox"
+
+[deployment]
+router = "application"
+# Reserved VM, NOT autoscale: this server runs node-cron background jobs
+# (15-min Gmail sync, follow-up processing). Autoscale scales to zero
+# between requests, so cron ticks only fired while dashboard/add-on
+# traffic happened to keep the container warm — which is why "automatic"
+# sync silently starved (2026-07-16 incident). Requires re-publish.
+deploymentTarget = "vm"
+
+[deployment.postBuild]
+args = ["pnpm", "store", "prune"]
+env = { "CI" = "true" }
+
+[workflows]
+
+[agent]
+stack = "PNPM_WORKSPACE"
+expertMode = true
+
+[postMerge]
+path = "scripts/post-merge.sh"
+timeoutMs = 20000
+
+[nix]
+channel = "stable-25_05"
+
+[userenv]
+
+[userenv.shared]
+DOCTRINE_LABELS = "Doctrine SDR"
+SENDER_EMAIL = "michael.a.g@mobupps.com"
+SENDER_NAME = "Michael"
+# Domain changed 2026-07-16: switching the deployment to Reserved VM created a
+# new deployment; the old doctrine-followupv-2.replit.app address died with the
+# old one. Canonical address is now the custom domain (survives future
+# deployment changes). Also update: Google Cloud OAuth redirect URIs + the
+# add-on's BACKEND_URL script property + APP_URL in Deployment secrets if set.
+APP_URL = "https://followupper.mobupps.net"
+
+[userenv.development]
+
+[userenv.production]

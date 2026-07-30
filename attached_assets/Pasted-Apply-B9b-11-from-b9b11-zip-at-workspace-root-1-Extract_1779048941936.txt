@@ -1,0 +1,48 @@
+Apply B9b.11 from b9b11.zip at workspace root.
+
+1. Extract and apply:
+   rm -rf /tmp/b9b11 && unzip -q b9b11.zip -d /tmp/b9b11 && python3 /tmp/b9b11/apply-b9b11.py
+
+   Expect:
+   [ok]   drizzle-orm import (inArray): updated
+   [ok]   pause-bulk handler: inserted
+   [ok]   resume-bulk handler: inserted
+   [ok]   wrote artifacts/api-server/src/routes/anti-ghosting.ts
+   [ok]   overwrote artifacts/dashboard/src/pages/anti-ghosting-pipeline.tsx
+   B9b.11 bulk pause/resume applied.
+
+2. Typecheck api-server (gate before build):
+   cd artifacts/api-server && pnpm run typecheck && cd -
+
+   If TS error appears, paste it. Do not proceed.
+
+3. Build both:
+   cd artifacts/api-server && pnpm run build && cd -
+   cd artifacts/dashboard && pnpm run build && cd -
+
+4. Restart both workflows.
+
+5. Smoke tests against localhost:80:
+   a. curl -sS -X POST -H "x-api-key: $ADDON_API_KEY" -H "Content-Type: application/json" \
+        -d '{}' "http://localhost:80/api/anti-ghosting/prospect/pause-bulk"
+      Expect: HTTP 400 with {"error":"prospectIds must be a non-empty array of positive integers"}
+   b. curl -sS -X POST -H "x-api-key: $ADDON_API_KEY" -H "Content-Type: application/json" \
+        -d '{"prospectIds":[99999]}' "http://localhost:80/api/anti-ghosting/prospect/pause-bulk"
+      Expect: HTTP 200 with {"success":true,"total":1,"paused":0,"cancelled_queued":0,"sent_prospect_ids":[]}
+        (no such prospect exists in heliumdb; AG-scope SELECT returns empty)
+   c. Same two tests for /resume-bulk endpoint.
+
+6. Republish.
+
+7. Browser test on https://doctrine-followupv-2.replit.app/anti-ghosting/pipeline:
+   a. Each row should now show a checkbox (Square icon) before the chevron.
+   b. Click the checkbox → CheckSquare appears, accent color. The row itself doesn't expand
+      (stopPropagation working).
+   c. Above the rows, a Select-all toggle should appear (Square → MinusSquare → CheckSquare states).
+   d. Click Select all → all visible rows checked → MinusSquare (or CheckSquare if all are visible).
+   e. Bulk action bar floats at bottom-center showing "1 selected" (or N selected), with
+      "Pause all" (danger red, Square icon) and "Resume all" (success green, Play icon) buttons.
+   f. Click Pause all → confirm dialog → on confirm, feedback banner: "Paused X of Y; cancelled Z queued follow-ups".
+      Pipeline refreshes; selected prospects show paused state.
+   g. Re-select the now-paused prospects, click Resume all → confirm → feedback: "Resumed X of Y; queued Z new stages".
+   h. Click X on the bulk bar → selection clears, bar disappears.

@@ -1,0 +1,54 @@
+I need to apply a multi-tenancy bug fix to the email sync flow. Six files
+need to be replaced with the attached versions, then typechecked and deployed.
+
+Do NOT modify any other files. Do NOT regenerate code. The attached files are
+the exact final versions — replace, don't rewrite.
+
+## Step 1 — Replace these files exactly
+
+Replace each existing file with its attached counterpart:
+
+- `api-server/services/gmailSync.ts` ← attached gmailSync.ts
+- `api-server/services/scheduler.ts` ← attached scheduler.ts
+- `api-server/routes/doctrine.ts` ← attached doctrine.ts
+- `api-server/routes/gmail-auth.ts` ← attached gmail-auth.ts
+- `dashboard/pages/email-inspector.tsx` ← attached email-inspector.tsx
+- `addon/Actions.gs` ← attached Actions.gs
+
+## Step 2 — Verify
+
+After replacing, run from the api-server directory:
+  pnpm typecheck
+
+Expected outcome: no NEW typescript errors compared to the previous build.
+Some pre-existing errors in unrelated routes (string | string[] from
+req.query) are expected and not caused by this change. If you see new
+errors that reference the six files above, stop and report.
+
+## Step 3 — Deploy the api-server only
+
+Once typecheck passes, redeploy the api-server using the existing Replit
+deployment for this app. Do not redeploy the addon — that lives in Google
+Apps Script and requires a separate push (I'll handle it manually).
+
+## Step 4 — Confirm
+
+After deploy, watch the deployment logs for one of these new log lines on
+the next manual sync click:
+  "Manual sync requested" with mode: "per_user"
+  "Manual sync requested" with mode: "all_users"
+
+Per-user is the new path; all-users is the legacy fallback. Report which
+one fires when I click "Sync Gmail now" in the addon (after I push the
+addon update separately).
+
+## What this fixes
+
+Currently the /api/sync endpoint syncs every connected user's mailbox on
+every button click. With one user this is invisible; with N users the
+clicker waits for all N. The fix adds a per-user code path triggered by
+{email} in the request body. Legacy callers (no body) still get all-users
+behavior, so dashboard admin sync is unchanged.
+
+Before stopping, summarize: which files you replaced, typecheck result,
+deploy status.

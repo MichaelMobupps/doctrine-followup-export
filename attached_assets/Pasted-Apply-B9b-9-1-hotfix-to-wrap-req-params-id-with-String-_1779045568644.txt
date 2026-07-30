@@ -1,0 +1,32 @@
+Apply B9b.9.1 hotfix to wrap req.params.id with String() in both AntiGhosting pause/resume handlers. Same Express 5 typing fix used in B8c.
+
+1. Decode and apply:
+
+echo 'IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiIKQjliLjkuMSBob3RmaXgg4oCUIHdyYXBzIHJlcS5wYXJhbXMuaWQgd2l0aCBTdHJpbmcoKSBpbiB0aGUgcGF1c2UvcmVzdW1lCmhhbmRsZXJzIGFkZGVkIGJ5IEI5Yi45IHYyLgoKRXhwcmVzcyA1IHR5cGluZzogcmVxLnBhcmFtc1trXSBpcyBgc3RyaW5nIHwgc3RyaW5nW11gLCBub3QgYHN0cmluZ2AuCnBhcnNlSW50IHJlcXVpcmVzIGBzdHJpbmdgLiBTYW1lIHBhdHRlcm4gdXNlZCBpbiBCOGMuCgpUd28gb2NjdXJyZW5jZXMgaW4gYW50aS1naG9zdGluZy50cyAob25lIHBlciBoYW5kbGVyKS4gSWRlbXBvdGVudC4KIiIiCgpmcm9tIF9fZnV0dXJlX18gaW1wb3J0IGFubm90YXRpb25zCmltcG9ydCBzeXMKZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCgpXT1JLU1BBQ0UgPSBQYXRoLmN3ZCgpClRBUkdFVCA9IFdPUktTUEFDRSAvICJhcnRpZmFjdHMvYXBpLXNlcnZlci9zcmMvcm91dGVzL2FudGktZ2hvc3RpbmcudHMiCgpPTEQgPSAicGFyc2VJbnQocmVxLnBhcmFtcy5pZCwgMTApIgpORVcgPSAicGFyc2VJbnQoU3RyaW5nKHJlcS5wYXJhbXMuaWQpLCAxMCkiCgpFWFBFQ1RFRF9PQ0NVUlJFTkNFUyA9IDIgICMgb25lIGluIHBhdXNlLCBvbmUgaW4gcmVzdW1lCgoKZGVmIGZhaWwobXNnKToKICAgIHByaW50KGYiW0ZBSUxdIHttc2d9IiwgZmlsZT1zeXMuc3RkZXJyKQogICAgc3lzLmV4aXQoMSkKCgpkZWYgbWFpbigpOgogICAgaWYgbm90IFRBUkdFVC5leGlzdHMoKToKICAgICAgICBmYWlsKGYiZmlsZSBub3QgZm91bmQ6IHtUQVJHRVR9IikKCiAgICB0ZXh0ID0gVEFSR0VULnJlYWRfdGV4dChlbmNvZGluZz0idXRmLTgiKQoKICAgIG5ld19jb3VudCA9IHRleHQuY291bnQoTkVXKQogICAgb2xkX2NvdW50ID0gdGV4dC5jb3VudChPTEQpCgogICAgIyBJZGVtcG90ZW5jeTogYWxyZWFkeSBwYXRjaGVkLgogICAgaWYgbmV3X2NvdW50ID09IEVYUEVDVEVEX09DQ1VSUkVOQ0VTIGFuZCBvbGRfY291bnQgPT0gMDoKICAgICAgICBwcmludChmIltza2lwXSBib3RoIG9jY3VycmVuY2VzIGFscmVhZHkgd3JhcHBlZCB3aXRoIFN0cmluZygpIikKICAgICAgICByZXR1cm4KCiAgICAjIFBhcnRpYWwgc3RhdGUg4oCUIHNob3VsZCBub3QgaGFwcGVuLCBhYm9ydCBsb3VkbHkuCiAgICBpZiBuZXdfY291bnQgPiAwIGFuZCBvbGRfY291bnQgPiAwOgogICAgICAgIGZhaWwoZiJtaXhlZCBzdGF0ZToge25ld19jb3VudH0gd3JhcHBlZCwge29sZF9jb3VudH0gbm90LiBNYW51YWwgaW5zcGVjdGlvbiBuZWVkZWQuIikKCiAgICBpZiBvbGRfY291bnQgIT0gRVhQRUNURURfT0NDVVJSRU5DRVM6CiAgICAgICAgZmFpbCgKICAgICAgICAgICAgZiJleHBlY3RlZCB7RVhQRUNURURfT0NDVVJSRU5DRVN9IG9jY3VycmVuY2VzIG9mIHtPTEQhcn0sIGZvdW5kIHtvbGRfY291bnR9LiAiCiAgICAgICAgICAgIGYiRGlkIEI5Yi45IHYyIG5vdCBhcHBseSwgb3IgZGlkIHRoZSBmaWxlIHN0cnVjdHVyZSBjaGFuZ2U/IgogICAgICAgICkKCiAgICB0ZXh0ID0gdGV4dC5yZXBsYWNlKE9MRCwgTkVXKQogICAgVEFSR0VULndyaXRlX3RleHQodGV4dCwgZW5jb2Rpbmc9InV0Zi04IikKICAgIHByaW50KGYiW29rXSAgIHdyYXBwZWQge0VYUEVDVEVEX09DQ1VSUkVOQ0VTfSBvY2N1cnJlbmNlcyB3aXRoIFN0cmluZygpIikKICAgIHByaW50KGYiW29rXSAgIHdyb3RlIHtUQVJHRVQucmVsYXRpdmVfdG8oV09SS1NQQUNFKX0iKQogICAgcHJpbnQoKQogICAgcHJpbnQoIkI5Yi45LjEgaG90Zml4IGFwcGxpZWQuIikKCgppZiBfX25hbWVfXyA9PSAiX19tYWluX18iOgogICAgbWFpbigpCg==' | base64 -d > /tmp/apply-b9b9-1.py && python3 /tmp/apply-b9b9-1.py
+
+   Expect:
+   [ok]   wrapped 2 occurrences with String()
+   [ok]   wrote artifacts/api-server/src/routes/anti-ghosting.ts
+   B9b.9.1 hotfix applied.
+
+2. Re-typecheck:
+   cd artifacts/api-server && pnpm run typecheck && cd -
+
+   Expect: clean exit (no TS2345). If a different TS error appears, paste it.
+
+3. Build api-server:
+   cd artifacts/api-server && pnpm run build && cd -
+
+4. Restart api-server workflow.
+
+5. Smoke test pause endpoint locally:
+   curl -sS -X POST -H "x-api-key: $ADDON_API_KEY" "http://localhost:80/api/anti-ghosting/prospect/99999/pause"
+   
+   Expect HTTP 404 with body {"error":"anti_ghosting prospect not found"}. If you see "cancelActiveFollowupsForProspects is not a function" or any 500, paste full error.
+
+6. Republish.
+
+7. After publish, browser test on https://doctrine-followupv-2.replit.app/anti-ghosting/pipeline:
+   a. Square icon on Magnit row → "Stopped followups for this thread — cancelled 1 queued" banner, paused state visible.
+   b. Play icon → "Resumed followups for this thread" (the absence of "— queued F2" is expected per the UNIQUE-collision trade-off documented in B9b.9 v2).
+   c. Refresh — paused state persists from DB.

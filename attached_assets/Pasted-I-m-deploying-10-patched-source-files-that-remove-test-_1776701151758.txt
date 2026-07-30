@@ -1,0 +1,73 @@
+I'm deploying 10 patched source files that remove "test mode" entirely from this Doctrine Follow-up app and fix the "Send now" button visibility. These are full-file replacements, NOT diffs. I have already uploaded all 10 files into the repo at the paths they belong at. Your job is to verify everything applied cleanly, make sure nothing stale is referencing removed symbols, and redeploy.
+
+Do the following in order and do not skip steps:
+
+1. VERIFY FILE PRESENCE. Confirm these 10 files exist in the repo with the exact paths below. If ANY are missing, STOP and list which ones are missing before doing anything else:
+   - dashboard/pages/prospects.tsx
+   - dashboard/pages/activity-log.tsx
+   - dashboard/pages/dashboard.tsx
+   - dashboard/pages/accounts.tsx
+   - dashboard/pages/followups.tsx
+   - api-server/routes/doctrine.ts
+   - api-server/routes/gmail-auth.ts
+   - api-server/services/gmailSync.ts
+   - api-server/services/timingEngine.ts
+   - api-server/scripts/createLabels.ts
+   Note: in this monorepo the "dashboard" and "api-server" folders may live under a packages/ or apps/ prefix. Resolve the actual paths by searching for a file named prospects.tsx inside any dashboard-like workspace and doctrine.ts inside any api-server-like workspace, and apply the rest of this prompt to whatever prefix you find. Do not create parallel folders.
+
+2. SEARCH FOR LEFTOVERS. Run a repo-wide search (excluding node_modules, dist, build, .next, .turbo, and any .git folder) for each of these tokens and report every hit:
+      testMode
+      test_mode
+      TEST_MODE
+      is_test_campaign
+      generateTestModeSchedule
+   Expected surviving hits after my patch and which are OK:
+   - api-server/lib/constants.ts line 1: `export const TEST_MODE_LABEL = "followup app test";` — OK, keep it, it's dead code now but harmless.
+   - db/schema/users.ts around line 31: `testMode: boolean("test_mode").notNull().default(false),` — OK, keep the DB column so we don't need a migration.
+   - Comments that say "Test mode removed" or similar — OK.
+   Any OTHER hit is a real leftover and must be removed or fixed. If you find leftovers outside this expected list, show me the file and line, then fix them by deleting the reference (for API response fields) or removing the conditional branch (for code). Do not invent new behavior — if in doubt, strip the reference entirely.
+
+3. TYPECHECK. Run the TypeScript build for both workspaces. Typical commands in a pnpm/Turbo monorepo are one of:
+      pnpm -w build
+      pnpm -r build
+      pnpm --filter ./api-server build && pnpm --filter ./dashboard build
+      npm run build
+   Pick the one that matches this repo. If the build fails:
+   - If the error is "Property 'testMode' does not exist" or "Property 'test_mode' does not exist" or "Property 'is_test_campaign' does not exist" or similar, that means there is still code elsewhere referencing removed fields. Find each one and delete the reference. Do NOT re-add the removed fields.
+   - If the error is an unused-import warning for TEST_MODE_LABEL or TestMode-related imports, delete that import.
+   - If any other error appears, report it verbatim and do not continue.
+   Repeat until both builds succeed with zero errors.
+
+4. DATABASE. Do NOT run a migration. The users.test_mode column stays in the database as a harmless unused column. If drizzle-kit or a migration runner wants to drop it, DECLINE — we want zero DB changes in this deploy.
+
+5. REDEPLOY. Restart the api-server dev/prod process and rebuild the dashboard so the new bundle is served. Confirm the api-server boots without runtime errors. If it fails to boot, show the full error and do not proceed.
+
+6. SMOKE-TEST VIA CURL. Hit the following endpoints against the running server and show me the raw JSON response for each. Replace <APIKEY> with a valid key from the env.
+      GET  /api/campaign/status           -H "x-api-key: <APIKEY>"
+      GET  /api/prospects                 -H "x-api-key: <APIKEY>"
+      GET  /api/followups                 -H "x-api-key: <APIKEY>"
+   Verify in each response:
+   - /api/campaign/status: top-level object has NO "test_mode" field. Each user object has NO "test_mode" field. Each user's "campaigns" array has exactly ONE entry (the production one), with NO "type" field and NO "test" entry.
+   - /api/prospects: each prospect in each group has NO "is_test_campaign" field and NO "batch_label" field.
+   - /api/followups: each follow-up has NO "is_test_campaign" field and NO "batch_label" field.
+   If any of these fields still appear, the old code is still being served — flush caches, hard-restart the process, re-verify. Do not declare success until the fields are gone.
+
+7. SMOKE-TEST VIA UI. Open the dashboard in a browser and verify:
+   - Prospects page: on a paused prospect (PAUSED badge), hover the row — the "Send now" button must be visible and must work (click it and confirm the follow-up fires).
+   - Prospects page: no "PROD" or "TEST" badge appears next to WAITING on any row.
+   - Activity Log page: each user card shows exactly ONE campaign block (no "test" campaign).
+   - Accounts page → Settings expand: no "Test Mode" checkbox visible.
+
+8. REPORT BACK with:
+   - Paths you actually found for each of the 10 files (to confirm the monorepo prefix).
+   - Output of the leftover-search (step 2).
+   - Build result (step 3).
+   - The three raw JSON responses from step 6.
+   - Confirmation that each of the four UI checks in step 7 passed.
+
+Do NOT:
+- Do not run database migrations.
+- Do not rename any files or folders.
+- Do not "helpfully" re-add removed fields for backward compatibility.
+- Do not modify the .replit config or any files I did not upload.
+- Do not claim success without completing steps 2, 3, 6, and 7.
