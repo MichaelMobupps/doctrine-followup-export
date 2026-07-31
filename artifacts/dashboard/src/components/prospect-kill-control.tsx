@@ -20,6 +20,7 @@ import { useState, useCallback } from "react";
 import { Button } from "@/components/ui";
 import { useAdmin } from "@/hooks/use-admin";
 import { XOctagon, Loader2 } from "lucide-react";
+import { BASE_PATH } from "@/lib/app-urls";
 
 // The endpoint's success response shape (POST /api/admin/prospects/:id/kill).
 interface ProspectKillResponse {
@@ -76,7 +77,7 @@ export function ProspectKillControl({
     setPending(true);
     setError(null);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/admin/prospects/${prospectId}/kill`, {
         method: "POST",
         headers: { "x-api-key": apiKey, "x-admin-key": adminToken || "", "Content-Type": "application/json" },

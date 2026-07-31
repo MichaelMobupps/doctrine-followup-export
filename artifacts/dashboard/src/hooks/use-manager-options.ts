@@ -17,6 +17,7 @@ import {
   type PickerOption,
   type ActivityUserLike,
 } from "../../../api-server/src/lib/pipelineUserPicker";
+import { BASE_PATH } from "@/lib/app-urls";
 
 interface ManagerOptionsState {
   options: PickerOption[];
@@ -43,7 +44,7 @@ export function useManagerOptions(apiKey: string | null): ManagerOptionsState {
     let cancelled = false;
     setState((s) => ({ ...s, loading: true, error: null }));
 
-    const base = import.meta.env.BASE_URL || "/";
+    const base = BASE_PATH;
     fetch(`${base}api/admin/activity`, {
       headers: { "x-api-key": apiKey, "x-admin-key": adminToken },
     })

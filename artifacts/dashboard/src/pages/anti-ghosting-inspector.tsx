@@ -18,6 +18,7 @@ import {
   MessageSquare, Building2, Sparkles, Database, Loader2, Zap,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { BASE_PATH } from "@/lib/app-urls";
 
 type SentEmail = {
   id: string;
@@ -124,7 +125,7 @@ function ThreadView({ threadId, apiKey, userId }: { threadId: string; apiKey: st
       messages: prev.messages?.map((m: any) => ({ ...m, isSeed: m.id === messageId })),
     } : prev);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/anti-ghosting/prospect/${data.prospect.id}/set-seed`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "", "Content-Type": "application/json" },
@@ -157,7 +158,7 @@ function ThreadView({ threadId, apiKey, userId }: { threadId: string; apiKey: st
     if (!threadId) { setIsLoading(false); return; }
     let cancelled = false;
     setIsLoading(true);
-    const base = import.meta.env.BASE_URL || "/";
+    const base = BASE_PATH;
     fetch(`${base}api/anti-ghosting/thread/${threadId}/messages?userId=${encodeURIComponent(userId)}`, {
       headers: { "x-api-key": apiKey || "" },
     })
@@ -532,7 +533,7 @@ export default function AntiGhostingEmailInspector() {
   useEffect(() => {
     if (!apiKey) return;
     let cancelled = false;
-    const base = import.meta.env.BASE_URL || "/";
+    const base = BASE_PATH;
     fetch(`${base}api/gmail/accounts`, {
       headers: { "x-api-key": apiKey || "" },
     })
@@ -566,7 +567,7 @@ export default function AntiGhostingEmailInspector() {
     if (search) params.set("search", search);
     if (selectedUserId) params.set("userId", selectedUserId);
 
-    const base = import.meta.env.BASE_URL || "/";
+    const base = BASE_PATH;
     fetch(`${base}api/anti-ghosting/gmail/sent-emails?${params.toString()}`, {
       headers: { "x-api-key": apiKey || "" },
     })
@@ -594,7 +595,7 @@ export default function AntiGhostingEmailInspector() {
     setSyncing(true);
     setSyncMsg(null);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/anti-ghosting/sync`, {
         method: "POST",
         headers: {

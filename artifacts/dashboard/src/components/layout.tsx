@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 import { useApiKey } from "@/hooks/use-api-key";
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { useAdmin } from "@/hooks/use-admin";
+import { BASE_PATH } from "@/lib/app-urls";
 
 interface LayoutProps {
   children: React.ReactNode;
@@ -45,7 +46,7 @@ export function Layout({ children }: LayoutProps) {
       : "api/my/activity";
     const fetchActivity = async () => {
       try {
-        const base = import.meta.env.BASE_URL || "/";
+        const base = BASE_PATH;
         const res = await fetch(`${base}${activityPath}?userId=${currentUser.userId}`, {
           headers: { "x-api-key": apiKey },
         });

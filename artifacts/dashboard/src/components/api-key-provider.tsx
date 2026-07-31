@@ -5,6 +5,7 @@ import { useAdmin } from "@/hooks/use-admin";
 import { Card } from "@/components/ui";
 import { Loader2 } from "lucide-react";
 import { motion } from "framer-motion";
+import { BASE_PATH } from "@/lib/app-urls";
 
 export function ApiKeyGate({ children }: { children: React.ReactNode }) {
   const { apiKey, setApiKey, isLoaded } = useApiKey();
@@ -23,7 +24,7 @@ export function ApiKeyGate({ children }: { children: React.ReactNode }) {
     if (loginCode) {
       window.history.replaceState({}, "", window.location.pathname);
       setExchanging(true);
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       fetch(`${base}api/auth/exchange`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -38,7 +39,7 @@ export function ApiKeyGate({ children }: { children: React.ReactNode }) {
             // A non-admin response (isAdmin false / no adminToken) clears any
             // stale admin token from a prior session via setAdmin's else path.
             setAdmin({ isAdmin: !!data.isAdmin, adminToken: data.adminToken ?? null });
-            const base2 = import.meta.env.BASE_URL || "/";
+            const base2 = BASE_PATH;
             fetch(`${base2}api/gmail/accounts`, { headers: { "x-api-key": data.token } })
               .then(r => r.json())
               .then(accts => {
@@ -83,7 +84,7 @@ export function ApiKeyGate({ children }: { children: React.ReactNode }) {
     if (!apiKey || !isLoaded || currentUser?.userId || resolving || exchanging) return;
 
     setResolving(true);
-    const base = import.meta.env.BASE_URL || "/";
+    const base = BASE_PATH;
     fetch(`${base}api/gmail/accounts`, { headers: { "x-api-key": apiKey } })
       .then(r => r.json())
       .then(data => {
@@ -139,7 +140,7 @@ export function ApiKeyGate({ children }: { children: React.ReactNode }) {
   const handleGoogleLogin = async () => {
     setError(null);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/auth/google`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to start login");

@@ -20,6 +20,7 @@ import {
   type PickerSelection,
   resolveEffectiveUserId,
 } from "../../../api-server/src/lib/pipelineUserPicker";
+import { BASE_PATH } from "@/lib/app-urls";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -651,7 +652,7 @@ export default function Pipeline() {
     if (!confirm(`Send next-stage follow-up now for ${ids.length} prospect${ids.length !== 1 ? "s" : ""}? This bypasses the schedule.`)) return;
     setBulkSending(true);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/followup/send-bulk`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "", "Content-Type": "application/json" },
@@ -683,7 +684,7 @@ export default function Pipeline() {
     if (!confirm(`Pause campaigns for ${ids.length} prospect${ids.length !== 1 ? "s" : ""}? Queued follow-ups for these prospects will be cancelled.`)) return;
     setBulkPausing(true);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/prospect/pause-bulk`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "", "Content-Type": "application/json" },
@@ -712,7 +713,7 @@ export default function Pipeline() {
     if (!confirm(`Resume campaigns for ${ids.length} prospect${ids.length !== 1 ? "s" : ""}? Paused prospects will be unpaused; stalled drafts will be requeued and next-stage follow-ups will be queued where appropriate.`)) return;
     setBulkResuming(true);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/prospect/resume-bulk`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "", "Content-Type": "application/json" },
@@ -805,7 +806,7 @@ export default function Pipeline() {
     // Same identity gate as the primary list: never issue the userId-less
     // all-users variant unless this is a legacy single-user install.
     if (effectiveUserId === null && identityStatus !== "legacy") return;
-    const base = import.meta.env.BASE_URL || "/";
+    const base = BASE_PATH;
     const url = effectiveUserId
       ? `${base}api/followups?includeArchived=1&userId=${effectiveUserId}`
       : `${base}api/followups?includeArchived=1`;
@@ -835,7 +836,7 @@ export default function Pipeline() {
     if (!confirm("Restore this campaign? It returns to the pipeline in its current paused state. Use Resume afterward to reactivate sending.")) return;
     setRestoringId(prospectId);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/prospect/${prospectId}/restore`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "" },
@@ -858,7 +859,7 @@ export default function Pipeline() {
   const handleTogglePause = async (prospectId: number, currentlyPaused: boolean) => {
     setTogglingPauseId(prospectId);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const endpoint = currentlyPaused ? "resume" : "pause";
       const res = await fetch(`${base}api/prospect/${prospectId}/${endpoint}`, {
         method: "POST",
@@ -884,7 +885,7 @@ export default function Pipeline() {
   const handleAddStage = async (prospectId: number) => {
     setAddingStageId(prospectId);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/followup-now/${prospectId}`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "", "Content-Type": "application/json" },
@@ -904,7 +905,7 @@ export default function Pipeline() {
   const handleResumeStalled = async (prospectId: number) => {
     setResumingStalledId(prospectId);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       // The /api/prospect/:id/resume endpoint internally requeues the stalled
       // draft via requeueStalledDraftForProspect when one is present.
       const res = await fetch(`${base}api/prospect/${prospectId}/resume`, {
@@ -929,7 +930,7 @@ export default function Pipeline() {
   const handleApprove = async (id: number) => {
     setApprovingId(id);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/followups/${id}/approve`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "", "Content-Type": "application/json" },
@@ -946,7 +947,7 @@ export default function Pipeline() {
     if (!confirm("Reject this follow-up? It will be cancelled.")) return;
     setRejectingId(id);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/followups/${id}/reject`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "", "Content-Type": "application/json" },

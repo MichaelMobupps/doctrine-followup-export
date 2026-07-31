@@ -17,6 +17,7 @@ import {
   FileEdit,
   X,
 } from "lucide-react";
+import { BASE_PATH } from "@/lib/app-urls";
 
 interface StageTiming {
   minDays: number;
@@ -76,7 +77,7 @@ export default function Accounts() {
       setSuccessMsg(`Connected ${connectedEmail || "account"}`);
       window.history.replaceState({}, "", window.location.pathname);
       setTimeout(() => setSuccessMsg(null), 5000);
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       fetch(`${base}api/gmail/accounts`, { headers: { "x-api-key": apiKey || "" } })
         .then(r => r.json())
         .then(acctData => {
@@ -112,7 +113,7 @@ export default function Accounts() {
     setConnecting(true);
     setErrorMsg(null);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/gmail/auth`, {
         headers: { "x-api-key": apiKey || "" },
       });
@@ -129,7 +130,7 @@ export default function Accounts() {
   const handleDisconnect = async (id: number) => {
     if (!confirm("Disconnect this Gmail account? Existing prospects and follow-ups will remain.")) return;
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/gmail/accounts/${id}`, {
         method: "DELETE",
         headers: { "x-api-key": apiKey || "" },
@@ -596,7 +597,7 @@ function AccountCard({
     setSaving(true);
     setSaveMsg("");
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const body: Record<string, any> = {
         followupMode,
         stageTiming: autoStages,

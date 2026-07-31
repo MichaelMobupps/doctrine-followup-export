@@ -12,6 +12,10 @@ import {
 import { eq, lt, and, gt, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { HARD_FOLLOWUP_CAP } from "../lib/followupLimits";
+// Bundle 1: appPath (not redirectPath) — these callback redirects are
+// same-origin RELATIVE today and stay relative, unlike the login callback
+// in auth.ts which prefixes the configured public origin.
+import { publicUrl, appPath } from "../lib/appUrls";
 
 const router = Router();
 
@@ -31,11 +35,7 @@ async function cleanExpiredNonces() {
 }
 
 function getRedirectUri(): string {
-  if (process.env.APP_URL) {
-    return process.env.APP_URL.replace(/\/$/, '') + '/api/gmail/callback';
-  }
-  const domain = process.env.REPLIT_DEV_DOMAIN || process.env.REPLIT_DOMAINS?.split(",")[0] || "localhost";
-  return `https://${domain}/api/gmail/callback`;
+  return publicUrl("/api/gmail/callback");
 }
 
 function getOAuth2Client() {
@@ -121,12 +121,12 @@ router.get("/gmail/callback", async (req: Request, res: Response) => {
 
     if (oauthError) {
       logger.warn({ oauthError }, "OAuth flow denied by user");
-      res.redirect("/?oauth_error=denied");
+      res.redirect(appPath("/?oauth_error=denied"));
       return;
     }
 
     if (!code || !state) {
-      res.redirect("/?oauth_error=missing_params");
+      res.redirect(appPath("/?oauth_error=missing_params"));
       return;
     }
 
@@ -139,7 +139,7 @@ router.get("/gmail/callback", async (req: Request, res: Response) => {
       .returning();
     if (!nonceData) {
       logger.warn("Invalid or expired OAuth nonce");
-      res.redirect("/?oauth_error=invalid_state");
+      res.redirect(appPath("/?oauth_error=invalid_state"));
       return;
     }
     cleanExpiredNonces().catch(() => {});
@@ -149,7 +149,7 @@ router.get("/gmail/callback", async (req: Request, res: Response) => {
 
     if (!tokens.refresh_token) {
       logger.error("No refresh token received from Google");
-      res.redirect("/accounts?oauth_error=no_refresh_token");
+      res.redirect(appPath("/accounts?oauth_error=no_refresh_token"));
       return;
     }
 
@@ -166,7 +166,7 @@ router.get("/gmail/callback", async (req: Request, res: Response) => {
     const name = userInfo.data.name || email.split("@")[0];
 
     if (!email) {
-      res.redirect("/accounts?oauth_error=no_email");
+      res.redirect(appPath("/accounts?oauth_error=no_email"));
       return;
     }
 
@@ -193,10 +193,10 @@ router.get("/gmail/callback", async (req: Request, res: Response) => {
       logger.info({ email }, "Connected new Gmail account via OAuth");
     }
 
-    res.redirect("/accounts?oauth_success=true&email=" + encodeURIComponent(email));
+    res.redirect(appPath("/accounts?oauth_success=true&email=" + encodeURIComponent(email)));
   } catch (err) {
     logger.error({ err }, "OAuth callback failed");
-    res.redirect("/accounts?oauth_error=callback_failed");
+    res.redirect(appPath("/accounts?oauth_error=callback_failed"));
   }
 });
 

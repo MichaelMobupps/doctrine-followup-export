@@ -20,6 +20,7 @@ import { useState, useCallback } from "react";
 import { Button, Input } from "@/components/ui";
 import { useAdmin } from "@/hooks/use-admin";
 import { XOctagon, Loader2 } from "lucide-react";
+import { BASE_PATH } from "@/lib/app-urls";
 
 // The endpoint's success response shape (POST /api/admin/company/kill).
 interface CompanyKillResponse {
@@ -86,7 +87,7 @@ export function CompanyKillControl({
     setPending(true);
     setError(null);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/admin/company/kill`, {
         method: "POST",
         headers: { "x-api-key": apiKey, "x-admin-key": adminToken || "", "Content-Type": "application/json" },

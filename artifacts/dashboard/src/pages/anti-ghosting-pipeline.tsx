@@ -26,6 +26,7 @@ import {
   RotateCcw, Loader2, Square, Plus, CheckSquare, MinusSquare,
 } from "lucide-react";
 import { ProspectKillControl } from "@/components/prospect-kill-control";
+import { BASE_PATH } from "@/lib/app-urls";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -426,7 +427,7 @@ export default function AntiGhostingPipeline() {
 
     async function fetchFollowups() {
       try {
-        const base = import.meta.env.BASE_URL || "/";
+        const base = BASE_PATH;
         const qs = new URLSearchParams();
         if (effectiveUserId) qs.set("userId", String(effectiveUserId));
         if (showArchived) qs.set("includeArchived", "1");
@@ -475,7 +476,7 @@ export default function AntiGhostingPipeline() {
     if (!confirm("Restore this campaign? It returns to the pipeline in its current paused state. Use Resume afterward to reactivate sending.")) return;
     setRestoringId(prospectId);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/anti-ghosting/prospect/${prospectId}/restore`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "" },
@@ -497,7 +498,7 @@ export default function AntiGhostingPipeline() {
   const handleTogglePause = async (prospectId: number, currentlyPaused: boolean) => {
     setTogglingPauseId(prospectId);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const endpoint = currentlyPaused ? "resume" : "pause";
       const res = await fetch(`${base}api/anti-ghosting/prospect/${prospectId}/${endpoint}`, {
         method: "POST",
@@ -527,7 +528,7 @@ export default function AntiGhostingPipeline() {
   const handleAddStage = async (prospectId: number) => {
     setAddingStageId(prospectId);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/anti-ghosting/followup-now/${prospectId}`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "", "Content-Type": "application/json" },
@@ -555,7 +556,7 @@ export default function AntiGhostingPipeline() {
     if (!confirm(`Send next-stage follow-up now for ${ids.length} prospect${ids.length !== 1 ? "s" : ""}? This bypasses the schedule.`)) return;
     setBulkSending(true);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/anti-ghosting/followup/send-bulk`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "", "Content-Type": "application/json" },
@@ -587,7 +588,7 @@ export default function AntiGhostingPipeline() {
     if (!confirm(`Pause AntiGhosting campaigns for ${ids.length} prospect${ids.length !== 1 ? "s" : ""}? Queued follow-ups will be cancelled.`)) return;
     setBulkPausing(true);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/anti-ghosting/prospect/pause-bulk`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "", "Content-Type": "application/json" },
@@ -617,7 +618,7 @@ export default function AntiGhostingPipeline() {
     if (!confirm(`Resume AntiGhosting campaigns for ${ids.length} prospect${ids.length !== 1 ? "s" : ""}? Next-stage follow-ups will be queued for eligible (non-replied) prospects.`)) return;
     setBulkResuming(true);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/anti-ghosting/prospect/resume-bulk`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "", "Content-Type": "application/json" },

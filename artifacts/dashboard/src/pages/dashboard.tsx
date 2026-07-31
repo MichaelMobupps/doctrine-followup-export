@@ -12,6 +12,7 @@ import {
 import { Card, Button, Badge, Modal } from "@/components/ui";
 import { RefreshCw, Play, AlertCircle, Square, Loader2, Send, Zap } from "lucide-react";
 import { formatNumber } from "@/lib/utils";
+import { BASE_PATH } from "@/lib/app-urls";
 
 export default function Dashboard() {
   const { apiKey } = useApiKey();
@@ -74,7 +75,7 @@ export default function Dashboard() {
     const loadingKey = String(userId);
     setQueueLoading(loadingKey);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/campaign/queue`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "", "Content-Type": "application/json" },
@@ -102,7 +103,7 @@ export default function Dashboard() {
   const handleStopUser = async (userId: number) => {
     setQueueLoading(`stop-${userId}`);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/campaign/stop`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "", "Content-Type": "application/json" },

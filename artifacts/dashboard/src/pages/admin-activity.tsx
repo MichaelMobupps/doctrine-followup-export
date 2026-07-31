@@ -21,6 +21,7 @@ import {
   ChevronDown, ChevronRight, Filter, Download, Pause, Play,
   ShieldOff, Plus, Trash2, XOctagon,
 } from "lucide-react";
+import { BASE_PATH } from "@/lib/app-urls";
 
 // ── Types (unchanged from B7u) ─────────────────────────────────────
 
@@ -238,7 +239,7 @@ export default function AdminActivity({ lockedApp }: { lockedApp?: string } = {}
     if (!opts?.silent) setLoading(true);
     setError(null);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const { since, until } = windowFor(windowPreset);
       const params = new URLSearchParams({ since, until });
       if (userFilter !== "all") params.set("user_id", userFilter);
@@ -263,7 +264,7 @@ export default function AdminActivity({ lockedApp }: { lockedApp?: string } = {}
   const fetchGlobalPause = useCallback(async () => {
     if (!apiKey || lockedApp) return;
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/admin/global-pause`, { headers: { "x-api-key": apiKey, "x-admin-key": adminToken || "" } });
       if (!res.ok) return;
       const json = (await res.json()) as { paused: boolean };
@@ -285,7 +286,7 @@ export default function AdminActivity({ lockedApp }: { lockedApp?: string } = {}
     )) return;
     setGlobalPending(true);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/admin/${pausing ? "pause-all" : "resume-all"}`, {
         method: "POST",
         headers: { "x-api-key": apiKey, "x-admin-key": adminToken || "" },
@@ -310,7 +311,7 @@ export default function AdminActivity({ lockedApp }: { lockedApp?: string } = {}
     )) return;
     setStopStalePending(true);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/admin/stop-stale`, {
         method: "POST",
         headers: { "x-api-key": apiKey, "x-admin-key": adminToken || "" },
@@ -336,7 +337,7 @@ export default function AdminActivity({ lockedApp }: { lockedApp?: string } = {}
   const fetchSuppression = useCallback(async () => {
     if (!apiKey || lockedApp) return;
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/admin/suppression`, { headers: { "x-api-key": apiKey, "x-admin-key": adminToken || "" } });
       if (!res.ok) return;
       const json = (await res.json()) as { count: number; addresses: typeof supList };
@@ -354,7 +355,7 @@ export default function AdminActivity({ lockedApp }: { lockedApp?: string } = {}
     if (!email || !email.includes("@") || !apiKey) return;
     setSupBusy(true);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/admin/suppression`, {
         method: "POST",
         headers: { "x-api-key": apiKey, "x-admin-key": adminToken || "", "Content-Type": "application/json" },
@@ -379,7 +380,7 @@ export default function AdminActivity({ lockedApp }: { lockedApp?: string } = {}
     if (!window.confirm(`Remove ${email} from the suppression list? It will be eligible for sending again.`)) return;
     setSupBusy(true);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/admin/suppression`, {
         method: "DELETE",
         headers: { "x-api-key": apiKey, "x-admin-key": adminToken || "", "Content-Type": "application/json" },
@@ -482,7 +483,7 @@ export default function AdminActivity({ lockedApp }: { lockedApp?: string } = {}
     if (!apiKey) return;
     setDownloading(true);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const { since, until } = windowFor(windowPreset);
       const params = new URLSearchParams({ since, until });
       if (userFilter !== "all") params.set("user_id", userFilter);
@@ -518,7 +519,7 @@ export default function AdminActivity({ lockedApp }: { lockedApp?: string } = {}
         : "Their queued follow-ups will be skipped by the scheduler until resumed. Existing queued rows are NOT cancelled — they wait."))) return;
     setPendingPause((prev) => new Set(prev).add(userId));
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/admin/users/${userId}/${action}`, {
         method: "POST",
         headers: { "x-api-key": apiKey, "x-admin-key": adminToken || "" },
@@ -570,7 +571,7 @@ export default function AdminActivity({ lockedApp }: { lockedApp?: string } = {}
     setKillPending(true);
     setKillError(null);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/admin/users/${killTarget.id}/kill`, {
         method: "POST",
         headers: { "x-api-key": apiKey, "x-admin-key": adminToken || "", "Content-Type": "application/json" },

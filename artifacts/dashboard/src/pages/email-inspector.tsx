@@ -14,6 +14,7 @@ import {
   MessageSquare, Building2, Sparkles, Database, Loader2, Zap,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { BASE_PATH, apiUrl } from "@/lib/app-urls";
 
 type SentEmail = {
   id: string;
@@ -167,7 +168,7 @@ function ThreadView({ threadId, apiKey, userId }: { threadId: string; apiKey: st
       // B10.5: include userId so backend getGmailForRequest uses the per-user
       // OAuth token. Without it, the legacy env-var token is tried — which is
       // invalid/expired, producing 500 invalid_grant.
-      const url = `/api/gmail/thread/${threadId}?userId=${encodeURIComponent(userId)}`;
+      const url = apiUrl(`/api/gmail/thread/${threadId}?userId=${encodeURIComponent(userId)}`);
       const res = await fetch(url, {
         headers: { "x-api-key": apiKey },
       });
@@ -583,7 +584,7 @@ export default function EmailInspector() {
     setSyncing(true);
     setSyncMsg(null);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/sync`, {
         method: "POST",
         headers: {
