@@ -90,7 +90,14 @@ function normalizePublicUrl(raw: string | undefined): string {
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return "";
   if (/[\u0000-\u001f\u007f]/.test(trimmed)) return "";
 
-  return stripTrailingSlashes(trimmed);
+  // Bundle 2: PUBLIC_URL may now carry a path prefix
+  // ("https://tools.mobupps.net/followup"), so return the PARSER'S canonical
+  // form rather than the raw string. A raw "https://host/\evil" would keep its
+  // backslash and re-open the Bundle 1 parser-divergence defect one level up;
+  // parsed.href has already normalized it. For an origin-only value the href
+  // gains a trailing "/", which stripTrailingSlashes removes — so the dark
+  // path stays byte-for-byte identical.
+  return stripTrailingSlashes(parsed.href);
 }
 
 /**
@@ -104,12 +111,22 @@ function normalizePublicUrl(raw: string | undefined): string {
  * import time would be a behavior change.
  */
 export function publicOrigin(): string {
+  // PUBLIC_URL is the operator-supplied PUBLIC BASE and already includes any
+  // path prefix. Returning it verbatim is what keeps outgoing links at
+  // exactly one prefix — appending BASE_PATH here would emit
+  // ".../followup/followup/api/auth/callback".
   if (PUBLIC_URL) return PUBLIC_URL;
+
   const domain =
     process.env.REPLIT_DEV_DOMAIN ||
     process.env.REPLIT_DOMAINS?.split(",")[0] ||
     "localhost";
-  return `https://${domain}`;
+  const origin = `https://${domain}`;
+
+  // No public base configured but the app IS mounted under a prefix: the
+  // best available answer is our own domain plus that prefix. With BASE_PATH
+  // "/" this appends nothing, so the dark path is unchanged.
+  return BASE_PATH === "/" ? origin : `${origin}${BASE_PATH}`;
 }
 
 /**
@@ -126,16 +143,24 @@ export function publicOrigin(): string {
  * else.
  */
 export function appPath(path: string): string {
-  const rooted = path.startsWith("/") ? path : `/${path}`;
-
-  // Collapse a leading run of slashes AND backslashes to one "/". Without
-  // this, appPath("//x") emits a protocol-relative URL, and appPath("/\\x")
-  // emits one too — the WHATWG URL parser reads "/\" as "//" for http(s),
-  // so "/\evil.example" resolves to "https://evil.example".
-  const safe = rooted.replace(/^[/\\]+/, "/");
-
+  const safe = safeRootedPath(path);
   if (BASE_PATH === "/") return safe;
   return safe === "/" ? BASE_PATH : `${BASE_PATH}${safe}`;
+}
+
+/**
+ * Normalize an in-app path to exactly one leading "/", with NO prefix applied.
+ *
+ * Collapses a leading run of slashes AND backslashes. Without this,
+ * "//x" is a protocol-relative URL, and "/\x" is one too — the WHATWG URL
+ * parser reads "/\" as "//" for http(s), so "/\evil.example" resolves to
+ * "https://evil.example". Every path that reaches an outgoing string goes
+ * through here, including the ones that skip appPath() to avoid double
+ * prefixing.
+ */
+function safeRootedPath(path: string): string {
+  const rooted = path.startsWith("/") ? path : `/${path}`;
+  return rooted.replace(/^[/\\]+/, "/");
 }
 
 /**
@@ -143,17 +168,30 @@ export function appPath(path: string): string {
  * Used for values handed to third parties (Google OAuth redirect URIs).
  */
 export function publicUrl(path: string): string {
-  return `${publicOrigin()}${appPath(path)}`;
+  // safeRootedPath, NOT appPath: publicOrigin() already carries the prefix
+  // (either from PUBLIC_URL, which the operator sets to the full public base,
+  // or from the BASE_PATH suffix added in the fallback branch). Using
+  // appPath() here would apply the prefix a second time and emit
+  // "https://tools.mobupps.net/followup/followup/api/auth/callback".
+  return `${publicOrigin()}${safeRootedPath(path)}`;
 }
 
 /**
  * Path for a same-app redirect issued by the server (`res.redirect`).
  *
  * Prefixed with PUBLIC_URL when it is configured, matching what the login
- * callback did with its `dashboardBase` local; relative otherwise. Because the
- * path half always comes from appPath(), the relative form can never begin
- * with "//".
+ * callback did with its `dashboardBase` local; relative otherwise.
+ *
+ * The two branches use different path helpers on purpose:
+ *   - PUBLIC_URL set   -> safeRootedPath, because PUBLIC_URL already carries
+ *                         the prefix. appPath() would double it.
+ *   - PUBLIC_URL unset -> appPath, because a relative Location must carry the
+ *                         prefix itself or the browser resolves it at the
+ *                         server root and leaves the mounted app.
+ *
+ * With BASE_PATH "/" the two are the same function, which is why the dark
+ * path is unchanged. Either way the result can never begin with "//".
  */
 export function redirectPath(path: string): string {
-  return `${PUBLIC_URL}${appPath(path)}`;
+  return PUBLIC_URL ? `${PUBLIC_URL}${safeRootedPath(path)}` : appPath(path);
 }

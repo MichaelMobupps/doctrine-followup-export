@@ -2,7 +2,32 @@
 
 ## Open items
 
-- **[Bundle 2] `lib/api-client-react` does not honour BASE_PATH.** The generated
+- **[CUTOVER BLOCKER, out of scope] The dashboard artifact pins its own build
+  base to `/`.** `artifacts/dashboard/.replit-artifact/artifact.toml` sets
+  `[services.env] BASE_PATH = "/"`. If that env governs the dashboard build at
+  cutover, the SPA the api-server serves under `/followup` will reference
+  `/assets/...` instead of `/followup/assets/...` and **every asset 404s**,
+  even though the server side is correct. Verified both ways locally: built
+  with `BASE_PATH=/` the html emits `src="/assets/index-*.js"`; built with
+  `BASE_PATH=/followup/` it emits `src="/followup/assets/index-*.js"`.
+  **Cutover step:** set the dashboard's `BASE_PATH` to `/followup/` (or build it
+  with that value) in the same change that sets the api-server's. Not fixed
+  here: Bundle 2 item 6 authorizes editing only `api-server`'s artifact.toml.
+
+- **[Pre-existing, out of scope] `GET /api/gmail/sent-emails` returns 500
+  `deleted_client`.** Google rejects the stored OAuth client for the Gmail
+  sent-emails path. Reproduces identically on `main` and on this branch in dark
+  mode, so it predates Bundle 2 and is unrelated to path routing — the request
+  reaches the correct route in both modes. Powers the Email Inspector page.
+  Likely needs the Google Cloud OAuth client re-created and accounts
+  reconnected. Untouched here.
+
+- **[RESOLVED in Bundle 2] `lib/api-client-react` does not honour BASE_PATH.**
+  Fixed by `setBaseUrl(ROUTER_BASE)` in `dashboard/src/main.tsx`; no generated
+  file was hand-edited. Verified in both modes against a live server. Original
+  finding retained below for history.
+
+- **[Bundle 1 finding, now resolved] `lib/api-client-react` does not honour BASE_PATH.** The generated
   Orval client hardcodes rooted paths (`/api/stats`, `/api/gmail/accounts`, …,
   20 distinct paths in `lib/api-client-react/src/generated/api.ts`). It does
   **not** hardcode a protocol+host base URL. A runtime setter already exists:
@@ -16,7 +41,7 @@
   `setBaseUrl(BASE_PATH without trailing slash)` once at dashboard startup.
   No code change made in Bundle 1, by instruction.
 
-- **[Pre-existing, out of scope] `pnpm run build` fails at `mockup-sandbox`
+- **[RESOLVED in Bundle 2] `pnpm run build` fails at `mockup-sandbox`
   unless `PORT` and `BASE_PATH` are exported.**
   `artifacts/mockup-sandbox/vite.config.ts:10` throws when `PORT` is unset and
   line 24 throws when `BASE_PATH` is unset, both unconditionally — unlike
@@ -47,6 +72,148 @@ Notes:
   Pub/Sub topics exist in this codebase.
 
 ## Ledger
+
+### 2026-07-31 — Bundle 2: base-path switch — BLAST RADIUS (pre-edit)
+
+Branch `bundle-2-base-path`. Goal: app fully servable under `/followup`,
+controlled by BASE_PATH/PUBLIC_URL, dark when both are unset.
+
+**Files to be touched — 8** (7 modified, 1 new)
+
+| File | Change |
+|---|---|
+| `api-server/src/lib/appUrls.ts` | one-prefix rule for `publicUrl`/`redirectPath`; prefix-aware `publicOrigin()` fallback |
+| `api-server/src/app.ts` | bare-prefix redirect, prefixed API mount, unconditional health mount, SPA static + catch-all, JSON-404 terminator |
+| `api-server/.replit-artifact/artifact.toml` | `paths = ["/api"]` -> `["/api", "/followup"]` (only line changed) |
+| `api-server/src/tests/test-base-path.ts` | NEW — unit tests, both modes |
+| `dashboard/src/main.tsx` | `setBaseUrl(ROUTER_BASE)` at startup |
+| `dashboard/vite.config.ts` | normalize BASE_PATH to a trailing-slash base |
+| `dashboard/src/components/ui/sidebar.tsx` | cookie path/name scoped to BASE_PATH |
+| `mockup-sandbox/vite.config.ts` | `isBuild` guard (authorized side fix) |
+
+**Behaviors affected:** every dashboard API call, both OAuth round-trips,
+static asset serving, SPA deep links, the platform startup health check.
+
+**Worst realistic failure — three named traps, all pre-identified:**
+1. **Bare-prefix redirect loop.** Express non-strict routing makes a route at
+   `/followup` also match `/followup/`, so a naive redirect targets itself and
+   the main page dies. Mitigation: an exact `req.path === BASE_PATH` string
+   compare in plain middleware — no route matching involved at all.
+2. **Express 5 wildcard crash.** Verified empirically: `app.get("/followup/*")`
+   **throws at registration** under Express 5.2.1 / path-to-regexp v8
+   (`Missing parameter name at index 11`). That is a boot crash, not a 404.
+   Mitigation: use `app.use(BASE_PATH, ...)` middleware, never a wildcard route.
+3. **Double prefix.** `PUBLIC_URL` carries the prefix
+   (`https://tools.mobupps.net/followup`), so Bundle 1's
+   `publicUrl = origin + appPath(p)` would emit `/followup/followup/...`.
+   Mitigation: `PUBLIC_URL` owns the prefix; `appPath()` adds it only for
+   server-local relative paths.
+
+**Rollback:** unset both env vars (the app returns to the dark path with no
+code change); or `git checkout main` — branch unmerged, nothing deployed.
+
+### 2026-07-31 — Bundle 2: base-path switch — DONE
+
+All 10 scope items delivered. 8 files (7 modified, 1 new test file).
+
+**Design decision — who owns the prefix.** `PUBLIC_URL` is the full public
+base and already contains the prefix, so `publicUrl()`/`redirectPath()` append
+the raw path to it. `appPath()` adds `BASE_PATH` and is used only for
+server-local relative paths. With `BASE_PATH="/"` the two are the same
+function, which is what keeps the dark path unchanged. Bundle 1's asymmetry is
+intact: `auth.ts` emits absolute Locations, `gmail-auth.ts` relative ones —
+now relative *and prefixed*.
+
+**Deliberate: the unprefixed `/api` mount stays** under BASE_PATH. It is what
+the platform startup health check and the Apps Script add-on
+(`BACKEND_URL + /api/...`) call, and it is exactly today's behavior, so it adds
+no new exposure. The prefixed mount is additive.
+
+**Item 8 — cookies, corrected.** Bundle 1's "no cookies" holds for auth
+(localStorage) and for sessions (none exist; `cookie-parser` is a dependency
+that is never imported). But there IS one cookie:
+`dashboard/src/components/ui/sidebar.tsx` set `sidebar_state` with `path=/`.
+The component is unused scaffold and never runs, so this is latent — but under
+the gateway two tools share one origin and that cookie would collide. Now
+scoped to `BASE_PATH` and named per-app, only when BASE_PATH is set.
+
+**Gates**
+| Gate | Result |
+|---|---|
+| typecheck | PASS |
+| tests | 34/34 files (33 prior + new `test-base-path.ts`, 25 cases) |
+| build, **no `PORT`/`BASE_PATH` exported** | PASS, exit 0 — item 10 achieved; `mockup-sandbox` now builds at its own `/__mockup/` base |
+
+**Godlike audit — 3 rounds, closed clean.** Round 1 findings:
+1. *(fixed, in scope)* A missing dashboard build under BASE_PATH produced an
+   opaque 500 per SPA request. Now a boot-time `logger.warn` naming the path.
+2. *(recorded, out of scope)* Dashboard artifact pins its own build base — see
+   Open items; item 6 forbids editing that file.
+3. *(fixed, in my own tooling)* The one-prefix oracle counted substrings, and
+   `"/followup"` also occurs inside `"/followups"`, a real route — it reported
+   a false double-prefix. Both the smoke and the unit tests now count path
+   SEGMENTS. Sanity-checked that the new oracle still catches a genuine double
+   prefix.
+Rounds 2 and 3 clean.
+
+**Security framing — Bundle 1's two defects cannot recur.** Re-verified with a
+URL-parser oracle (never string shape — the Bundle 1 string check passed while
+`/\evil.example` still resolved off-site). Hostile `BASE_PATH` and hostile path
+inputs, in both modes, resolved through `new URL(value, origin)`: the host never
+moves. On the live LIT server, 9 Location headers across the whole redirect
+surface — including `?x=//evil.example`, `?next=https://evil.example`, and a
+CRLF attempt — all stayed on-origin, none protocol-relative, none with CRLF.
+`PUBLIC_URL` is now stored as the parser's canonical `href`, so a backslash
+cannot survive into an outgoing URL. Static traversal probes
+(`/followup/../../../etc/passwd`, encoded variants) disclosed no file.
+
+**Traps avoided, both verified empirically before writing code**
+- `app.get("/followup/*")` **throws at registration** under Express 5.2.1 /
+  path-to-regexp v8 — a boot crash, not a 404. All prefix handling uses
+  `app.use(BASE_PATH, ...)`, which never touches path-to-regexp.
+- The bare-prefix redirect uses an exact `req.path === BASE_PATH` compare in
+  plain middleware, so the non-strict-routing self-redirect loop is
+  structurally impossible. Asserted in the unit tests ("the redirect target
+  never equals the request path") and in the lit smoke (`/followup` -> 302
+  -> `/followup/` -> 200, not another 302).
+
+**SMOKE a — DARK (both env vars unset): byte-for-byte identical to `main`.**
+All 16 Bundle 1 baseline endpoints diffed clean against a `main` worktree
+booted side by side. `/followup`, `/followup/`, `/followup/api/healthz` all
+still 404 exactly as on `main` — none of the new mounts exist when dark.
+
+**SMOKE b — LIT (`BASE_PATH=/followup/`, `PUBLIC_URL=https://tools.mobupps.net/followup`,
+process env only, never written to Replit Secrets): 14/14 checks pass.**
+
+| Check | Result |
+|---|---|
+| main page `/followup/` | 200 |
+| deep links (`/pipeline`, `/accounts`, `/context/pipeline`, `/anti-ghosting`) hard-load | 200 |
+| bare `/followup` -> `/followup/` | 302, and the target returns 200 — **no loop** |
+| query preserved across the redirect | `/followup/?login_code=abc&x=1` |
+| assets referenced by the served index.html | 3/3 resolve, **zero 404s** |
+| missing asset | 404 (Express error page, **not** index.html 200) |
+| unmatched API path | JSON — 404 `{"error":"Not found"}` authorized; 401/403 unauthorized, which correctly does not leak route existence. Never index.html. |
+| platform health `/api/healthz` unprefixed | 200 |
+| health `/followup/api/healthz` prefixed | 200 |
+| all 16 baseline endpoints under the prefix | correct |
+
+**Item 1 verified end-to-end** by driving the REAL generated client (the module
+the four pages import) against both servers with `setBaseUrl()` configured as
+`main.tsx` configures it: 5/5 calls covering all four pages route correctly in
+both modes — `/followup/api/...` lit, `/api/...` dark. One call returns upstream
+500 `deleted_client`; that reproduces identically on `main` and is a Google-side
+OAuth client problem, not routing (see Open items).
+
+**Item 9:** all four generated outgoing URLs (both OAuth `redirect_uri`s, both
+callback Locations) carry exactly one prefix segment.
+
+**Blast radius held.** Predicted 8 files, 8 touched. All three named traps were
+avoided; the one that materialized (missing SPA build) was caught by the audit
+and fixed. No database, cron, doctrine, or dependency changes. No email
+dispatched — `app.ts` was booted directly in every smoke, so `startCronJobs()`
+never ran. The running workflow was never touched; ports 5411/5412/5413 were
+used and all were shut down individually by PID.
 
 ### 2026-07-31 — Bundle 1: URL centralization — DONE
 

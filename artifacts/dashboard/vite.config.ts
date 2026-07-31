@@ -19,7 +19,13 @@ if (Number.isNaN(port) || port <= 0) {
   throw new Error(`Invalid PORT value: "${rawPort}"`);
 }
 
-const basePath = process.env.BASE_PATH || "/";
+// Bundle 2: Vite requires `base` to end with "/", and every client call site
+// appends WITHOUT a leading slash (`${BASE_PATH}api/stats`). Normalize both
+// accepted spellings — "/followup" and "/followup/" — to the trailing-slash
+// form so the two conventions cannot drift. "/" is unchanged, so an unset
+// BASE_PATH produces exactly the base this config produced before.
+const rawBasePath = process.env.BASE_PATH || "/";
+const basePath = rawBasePath.endsWith("/") ? rawBasePath : `${rawBasePath}/`;
 
 export default defineConfig({
   base: basePath,
