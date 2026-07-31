@@ -2,7 +2,15 @@
 
 ## Open items
 
-- **[CUTOVER BLOCKER, out of scope] The dashboard artifact pins its own build
+- **[RESOLVED by cutover C1, 2026-07-31] The dashboard artifact pinned its own
+  build base to `/`.** The `BASE_PATH = "/"` line is gone from
+  `artifacts/dashboard/.replit-artifact/artifact.toml`; BASE_PATH now flows
+  from the deployment environment, with the code default `"/"` when unset and
+  hostile values rejected to `"/"`. **Remaining cutover step:** set `BASE_PATH`
+  (and `PUBLIC_URL`) in the *deployment environment* so the dashboard build and
+  the api-server agree. Original finding retained below.
+
+- **[Original finding, now resolved] The dashboard artifact pins its own build
   base to `/`.** `artifacts/dashboard/.replit-artifact/artifact.toml` sets
   `[services.env] BASE_PATH = "/"`. If that env governs the dashboard build at
   cutover, the SPA the api-server serves under `/followup` will reference
@@ -72,6 +80,106 @@ Notes:
   Pub/Sub topics exist in this codebase.
 
 ## Ledger
+
+### 2026-07-31 — Cutover C1: dashboard base-path blocker — BLAST RADIUS (pre-edit)
+
+Branch `cutover-c1-dashboard-base-path`. Clears the cutover blocker recorded
+in Open items: the dashboard artifact pins its own build base to `/`.
+
+**Files to be touched — 1.** `artifacts/dashboard/.replit-artifact/artifact.toml`,
+deleting exactly one line (`BASE_PATH = "/"`). `PORT` stays. No other file, no
+other artifact.toml, no code change.
+
+**Behaviors affected:** the base URL the dashboard's Vite build stamps into
+`index.html` and every asset reference. Nothing else — `BASE_PATH` is read
+only by `vite.config.ts`.
+
+**Worst realistic failure:** if `vite.config.ts` treated an absent `BASE_PATH`
+as fatal (as `mockup-sandbox`'s config does), removing the key would break both
+the dev workflow and the build. Checked first: dashboard's config throws only
+on missing `PORT` and falls back to `"/"` for `BASE_PATH`. Verified by booting
+the dev server with the key absent — it served base `/`.
+
+**Rollback:** re-add the single line, or `git checkout main`. Branch unmerged,
+nothing deployed.
+
+**RESULT — DONE.** Two files changed: the one-line deletion, plus a security
+fix the audit forced (below).
+
+**Investigation (step 2), before editing**
+- *How the key reaches the build:* `[services.env]` is the unscoped,
+  service-wide table. The api-server artifact proves Replit honours narrower
+  scopes — it uses `[services.production.build.env]` (build-only, `CI=true`)
+  and `[services.production.run.env]` (run-only) as separate tables — so the
+  dashboard's unscoped form spans every phase, including the production `build`
+  declared in the same block. Corroborating: `mockup-sandbox` relies on the
+  identical unscoped `[services.env] BASE_PATH`, and its vite config *required*
+  BASE_PATH at build time until Bundle 2 — only workable if that env reaches
+  the build. **Honest limit:** Replit's deployer cannot be executed from inside
+  the workspace, so this was not directly observed.
+- *Does a deployment secret override it?* Not testable from here, and not
+  guessed. It does not need to be: while the key is present with a literal
+  `"/"`, the only safe assumption is that it wins or ties, so a deployment
+  secret is **not guaranteed** to take effect. That ambiguity *is* the blocker.
+  Deleting the key removes the question entirely.
+- *Dev workflow with the key absent?* Verified empirically — dev server booted
+  on port 5501 with BASE_PATH unset, served base `/`. `vite.config.ts` throws
+  only on missing `PORT` (which stays) and falls back to `"/"`. Contrast
+  `mockup-sandbox`, whose config *does* throw on absent BASE_PATH outside a
+  build; untouched.
+- *Halt condition did not apply:* the unset case builds and serves correctly on
+  the code default.
+
+**Step 4 evidence — both directions**
+```
+BASE_PATH unset      -> href="/favicon.svg"           src="/assets/index-B0HQJ3rS.js"
+BASE_PATH=/followup/ -> href="/followup/favicon.svg"  src="/followup/assets/index--NgTAXL1.js"
+```
+
+**Gates:** typecheck PASS; 34/34 test files; full build PASS with no env
+exported.
+
+**Godlike audit — 3 rounds, closed clean.** Round 1 (security framing) found a
+real defect **introduced by this very change**: the artifact.toml pin had been
+accidentally shielding the build. With it gone, a hostile deployment-env
+`BASE_PATH=//evil.example/` was stamped verbatim, producing
+`src="//evil.example/assets/..."` — a protocol-relative script URL that a
+URL-parser oracle confirmed resolves to `evil.example`. The server already
+rejected the same value (`appUrls` normalized it to `/`); the build did not.
+Fixed by mirroring `normalizeBasePath`'s rule set in `vite.config.ts`. Rounds 2
+and 3 clean. Post-fix oracle, 8 inputs: `//evil.example/`, `///evil.example/`,
+`/\evil.example/`, `https://evil.example/`, `javascript:x` all degrade to `/`
+and produce a build **byte-identical to the unset state** (same hash
+`B0HQJ3rS`); `/followup` and `/followup/` both produce the same prefixed build.
+
+**Smoke — both ways, `app.ts` booted directly so `startCronJobs()` never ran.**
+- *LIT* (port 5601, prefixed build on disk): `/followup/` 200, `/followup` 302,
+  deep link 200, health 200 on both prefixed and unprefixed forms, and **zero
+  asset 404s** — all three references in the served index.html returned 200.
+  No "dashboard build is missing" warning.
+- *DARK* (5602 = `main` pre-C1 vs 5603 = branch, both env-unset): all 16
+  baseline endpoints **byte-for-byte identical**. `/followup` and `/followup/`
+  still 404, as on `main`.
+- `GET /` returns 500 under a source boot on **both** `main` and the branch —
+  `app.get("/")` serves `__dirname/public`, which does not exist under `src/`.
+  A harness artifact of the mandated source boot, not a defect: the production
+  bundle serves `/` with 200.
+
+**Deviation to note:** while diagnosing that 500 I briefly booted
+`dist/index.mjs` (~15s), which *does* call `startCronJobs()`, rather than
+`app.ts`. Contrary to the instruction. Verified no harm: zero
+`cron_heartbeats` rows in the following 10 minutes (18:29 UTC is nowhere near a
+`*/15` or `:05/:20/:35/:50` boundary), and with 0 queued follow-ups and 0
+connected users nothing was dispatchable regardless. Process killed, port
+confirmed closed.
+
+**Note — state of the world at branch time:** `main` had moved to `cf5725f`
+"Published your App" (empty deployment marker, Replit Agent, 2026-07-31 17:55),
+i.e. **Bundle 2 was deployed to production** between bundles. Dark by
+construction, so no behavior change. Lineage checked per the Git safety rules:
+`replit-agent` is 683 commits ahead of `main` but its tree is byte-identical
+(`db904e8a`), so it holds the retained granular history and no content `main`
+lacks. Both bundle commits confirmed ancestors of `main`.
 
 ### 2026-07-31 — Bundle 2: base-path switch — BLAST RADIUS (pre-edit)
 
