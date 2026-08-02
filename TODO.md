@@ -2,6 +2,54 @@
 
 ## Open items
 
+- **[Repair L1, ACCEPTED RISK] A cached 308 outlives the prefix.** The legacy
+  redirect in `api-server/src/app.ts` is a 308, which is permanent and which
+  browsers and shared caches may keep. Rollback for this migration is "unset
+  the two env vars" — a client holding a cached 308 for `/pipeline` would keep
+  bouncing to `/followup/pipeline`, which 404s once the prefix is withdrawn.
+  308 was chosen deliberately (it preserves the method, and the roadmap calls
+  the old address a permanent move); Bundle 2 chose 302 for the bare-prefix
+  redirect for exactly the opposite reason. **If a rollback ever happens,
+  expect this and tell users to hard-refresh.** The client-side redirect —
+  which is what actually fires for real browsers — is not cached at all.
+
+- **[Repair L1, verify out-of-band] The two Google OAuth redirect URIs must be
+  allowlisted.** Production is live-emitting
+  `https://tools.mobupps.net/followup/api/auth/callback` and
+  `…/followup/api/gmail/callback`. The
+  Google Cloud console cannot be read from the workspace. Keep the legacy
+  `https://followupper.mobupps.net/api/{auth,gmail}/callback` entries
+  allowlisted until the legacy host is retired.
+
+- **[Pre-existing, out of scope] Doubled-slash paths 404.** `//api/sync` — what
+  a trailing slash on the add-on's `BACKEND_URL` produces — returns 404, and so
+  does `//followup/pipeline`. Express does not match a doubled slash to a
+  mount. Verified identical on `main`, in dark mode and in lit mode, so L1 did
+  not introduce it; `legacyRedirectTarget()` only ensures such a path is not
+  turned into a *misleading* redirect. If an add-on ever reports 404s, check
+  `BACKEND_URL` for a trailing slash first.
+
+- **[Pre-existing, out of scope] A stale pre-cutover index.html cannot
+  self-heal.** If a browser holds a cached copy of the old base-`/`
+  `index.html`, it references the pre-cutover asset hash, which now 404s. The
+  L1 client redirect lives *inside* that bundle, so it never runs. Only a hard
+  refresh recovers. Same class as the 2026-07-29 caching note in `app.ts`; the
+  dashboard static artifact's cache headers are platform-controlled.
+
+- **[Repair L1, by design] The api-server's own API test console is
+  unreachable while the prefix is active.** `artifacts/api-server/public/
+  index.html` was served at `/`; the legacy 308 now sends `/` into the app. In
+  production it was already shadowed by the dashboard's static artifact, so
+  nothing user-visible changed. It returns in dark mode.
+
+- **[Observation, no action] Login moves a user from the legacy host to the
+  gateway host.** The OAuth `redirect_uri` is absolute on
+  `tools.mobupps.net`, so a session started at `followupper.mobupps.net/
+  followup/` finishes at `tools.mobupps.net/followup/`. Auth is `localStorage`
+  and therefore per-origin: a user already logged in on the legacy host stays
+  logged in there, and logs in fresh on the gateway host once. This is the
+  intended end state, not a defect.
+
 - **[RESOLVED by cutover C1, 2026-07-31] The dashboard artifact pinned its own
   build base to `/`.** The `BASE_PATH = "/"` line is gone from
   `artifacts/dashboard/.replit-artifact/artifact.toml`; BASE_PATH now flows
@@ -62,13 +110,14 @@
 ## External registrations discovered
 
 These register this app's URL with an external service. **None were changed.**
+"Value today" re-measured live on 2026-08-02 (Repair L1), post-cutover.
 
 | # | Where | File:line | What registers | Value today |
 |---|---|---|---|---|
-| 1 | Google Cloud OAuth (login flow) | `artifacts/api-server/src/routes/auth.ts:23-29` | Redirect URI `<origin>/api/auth/callback` sent to Google; must be allowlisted in the Cloud console | `https://followupper.mobupps.net/api/auth/callback` |
-| 2 | Google Cloud OAuth (Gmail flow) | `artifacts/api-server/src/routes/gmail-auth.ts:33-39` | Redirect URI `<origin>/api/gmail/callback` sent to Google; must be allowlisted in the Cloud console | `https://followupper.mobupps.net/api/gmail/callback` |
-| 3 | Apps Script add-on → backend | `addon/Config.gs:11` | Add-on calls the backend at the `BACKEND_URL` Script Property (fallback `http://localhost:3000`). Set in the Apps Script project, not in this repo. | Script Property, not in code |
-| 4 | Deployment env (canonical address) | `.replit:33` (`[userenv.shared] APP_URL`) | Supplies the origin both OAuth redirect URIs are built from | `https://followupper.mobupps.net` |
+| 1 | Google Cloud OAuth (login flow) | `artifacts/api-server/src/routes/auth.ts:23-29` | Redirect URI `<origin>/api/auth/callback` sent to Google; must be allowlisted in the Cloud console | **`https://tools.mobupps.net/followup/api/auth/callback`** — read off the live `/api/auth/google`. Was `https://followupper.mobupps.net/api/auth/callback` pre-cutover |
+| 2 | Google Cloud OAuth (Gmail flow) | `artifacts/api-server/src/routes/gmail-auth.ts:33-39` | Redirect URI `<origin>/api/gmail/callback` sent to Google; must be allowlisted in the Cloud console | **`https://tools.mobupps.net/followup/api/gmail/callback`** — same `PUBLIC_URL` origin. Was `https://followupper.mobupps.net/api/gmail/callback` pre-cutover |
+| 3 | Apps Script add-on → backend | `addon/Config.gs:11` | Add-on calls the backend at the `BACKEND_URL` Script Property (fallback `http://localhost:3000`). Set in the Apps Script project, not in this repo. The address is **not** hardcoded anywhere in `addon/`. | Script Property, not in code. **Both plausible values work** post-cutover, verified with live requests: `https://followupper.mobupps.net` (→ `/api/…`, the first-class mount) and `https://tools.mobupps.net/followup` (→ `/followup/api/…`) |
+| 4 | Deployment env (canonical address) | `.replit:33` (`[userenv.shared] APP_URL`) | Origin fallback; `PUBLIC_URL` now takes precedence over it | `.replit` still carries `https://followupper.mobupps.net`; the deployment env supplies `PUBLIC_URL=https://tools.mobupps.net/followup`, which wins |
 
 Notes:
 - 1 and 2 are the only outbound registrations built from code. Both derive
@@ -80,6 +129,247 @@ Notes:
   Pub/Sub topics exist in this codebase.
 
 ## Ledger
+
+### 2026-08-02 — Repair L1: legacy address survival, post-cutover — BLAST RADIUS (pre-edit)
+
+Branch `cutover-l1-legacy-addresses`. The prefix is **already live in
+production** (`BASE_PATH=/followup/`,
+`PUBLIC_URL=https://tools.mobupps.net/followup`). This repair makes the
+unprefixed legacy address survive it.
+
+**Lineage check (Git safety rule 1), before branching.** Checked out `main`
+(`bd06214`, 2026-08-02). `replit-agent` (`14ebbb0`) is 686 commits ahead by
+count, but `git rev-parse` shows both tips resolve to the SAME tree
+`c1095fc1`, and `main` is an ancestor of it — it carries the retained granular
+history and no content `main` lacks. `main` is 3 commits ahead of
+`origin/main`. `main` is the newest lineage; branched from it.
+
+**Files to be touched — 3** (2 modified, 1 modified test)
+
+| File | Change |
+|---|---|
+| `artifacts/dashboard/src/main.tsx` | pre-mount redirect: unprefixed location → prefixed, before `createRoot` |
+| `artifacts/api-server/src/app.ts` | legacy-path 308 to the prefixed path (gated on `PREFIXED`); comment lock on the unprefixed `/api` mount |
+| `artifacts/api-server/src/tests/test-base-path.ts` | L1 contract cases: legacy survival lit, darkness unchanged, no redirect loop |
+
+Deliberately NOT touched: `.replit`, either `artifact.toml` (platform routing
+is not observable from the workspace — see the state report below), the
+add-on sources (`addon/` hardcodes no address), and the Google Cloud console
+(out-of-band, recorded in External registrations).
+
+**Behaviors affected**
+- What a browser sees at the unprefixed address (today: a blank page).
+- What the api-server returns for unprefixed non-`/api` paths (today: 404
+  from a direct hit; in production those paths never reach it).
+- Nothing on the `/api` surface: the unprefixed mount is already first-class
+  and stays byte-identical. That is what the add-on, both OAuth callbacks and
+  the platform startup health check use.
+
+**Worst realistic failure — four named traps**
+1. **Redirect loop.** A legacy→prefix redirect that also matches paths already
+   under the prefix redirects to itself and takes the whole app down.
+   Mitigation: an explicit segment-boundary `isUnder()` guard, asserted in the
+   unit tests and in the lit smoke (308 target must never re-enter the rule).
+2. **Shadowing `/api`.** If the legacy redirect is registered before, or
+   without excluding, `/api`, every add-on POST becomes a redirect — and
+   `UrlFetchApp` follows redirects but the platform health check would flap.
+   Mitigation: registered AFTER both `/api` mounts, plus an explicit `/api`
+   exclusion, plus a test that every add-on path still returns its handler's
+   status and not a 3xx.
+3. **A cached 308 outliving the prefix.** 308 is permanent and browsers cache
+   it. Rollback for this migration is "unset the two env vars" — a browser
+   holding a cached 308 for `/pipeline` would keep bouncing to
+   `/followup/pipeline`, which 404s once the prefix is withdrawn. This is the
+   same reasoning that made Bundle 2 choose 302 over 301 for the bare-prefix
+   redirect. **308 is used here as instructed** (it is what preserves the
+   method, and the roadmap calls the old address a permanent redirect); the
+   caveat is recorded in Open items, and the client-side redirect — which is
+   what actually fires for real browsers — is not cached at all.
+4. **Breaking the dark path.** Every change is gated: the server rule on
+   `PREFIXED`, the client rule on a build-time `BASE_PATH !== "/"`. With both
+   env vars unset the two files must produce byte-identical behavior, which
+   the DARK smoke checks against a `main` worktree.
+
+**Rollback:** unset `BASE_PATH`/`PUBLIC_URL` (both changes self-disable with
+no code change), or `git revert` the merge. Nothing is deployed by this work.
+
+### 2026-08-02 — Repair L1: legacy address survival, post-cutover — DONE
+
+Predicted 3 files, touched 3. Not deployed; ready to publish.
+
+**Production state BEFORE the repair, measured live (read-only GETs).** Two
+addresses front the same deployment: `https://followupper.mobupps.net` (this
+app's own domain, still attached) and `https://tools.mobupps.net/followup`
+(the gateway, reverse-proxying it). In front of Express the Replit artifact
+router splits on `paths`: `/api` + `/followup` → api-server, `/__mockup` →
+mockup-sandbox, and **`/` → the dashboard's own STATIC artifact**
+(`paths=["/"]`, rewrite `/*` → `/index.html`).
+
+| Unprefixed request | Before | Verdict |
+|---|---|---|
+| `GET /` | 200 index.html — and it is the `/followup/`-based build, **byte-identical** to what `/followup/` serves. Assets resolve. Then wouter mounts `base="/followup"` against location `/`, nothing matches → **blank page**, clean 200, no console error | BROKEN |
+| `GET /pipeline`, `/accounts`, `/anti-ghosting` | 200, same 765-byte index.html via the static artifact's rewrite → same blank page | BROKEN |
+| `GET /api/*` | reaches the unconditional `app.use("/api", router)`. `/api/healthz` 200; all 9 add-on paths 401 on a wrong key, i.e. handler reached; POST bodies forwarded on both addresses | works |
+| `GET /api/auth/callback` | 302 → `https://tools.mobupps.net/followup/?login_error=…` | works |
+| `GET /api/gmail/callback` | 302 → `/followup/?oauth_error=…` (relative) | works |
+| `GET /followup`, `/followup/…` | 302 → `/followup/`, then 200 | works |
+
+Only the browser surface was broken. **Every machine caller was already
+intact** — the unprefixed `/api` mount Bundle 2 deliberately kept is what
+carried them. On the api-server alone (source boot, no platform router) the
+unprefixed browser paths 404 and `/` serves the pre-prefix API test console;
+in production that is masked by the static artifact.
+
+**Caller inventory (step 3), before any code**
+- *(a) Apps Script add-on* — 9 URLs, all `BACKEND_URL + "/api/…"`: POST
+  `/api/sync`, `/api/queue`, `/api/queue-batch`, `/api/cancel`; GET
+  `/api/stats`, `/api/prospects?replied=0`,
+  `/api/prospects?vertical=…&replied=0`, `/api/followups?status=queued`,
+  `/api/prospect/by-thread/<threadId>`. Auth: `apiRequest_()`
+  (`addon/Config.gs:17-42`) sends `x-api-key` from the `API_KEY` Script
+  Property; the server compares it to `ADDON_API_KEY`
+  (`routes/doctrine.ts:29-44`) and 401s on mismatch. **The address is NOT
+  hardcoded** — `addon/Config.gs:11` reads the `BACKEND_URL` Script Property
+  (fallback `http://localhost:3000`). To change it: Apps Script project →
+  Project Settings → Script Properties → `BACKEND_URL`. **No change needed:**
+  both plausible values work, verified with live POSTs —
+  `https://followupper.mobupps.net` (→ `/api/…`) and
+  `https://tools.mobupps.net/followup` (→ `/followup/api/…`).
+- *(b) Fixed-URL third-party callbacks* — two, both Google OAuth, both built
+  from `PUBLIC_URL`. Production is live-emitting
+  `redirect_uri=https://tools.mobupps.net/followup/api/auth/callback` (read
+  off the live `/api/auth/google`); the Gmail counterpart is
+  `…/followup/api/gmail/callback`. Both must be allowlisted in the Google
+  Cloud console — out-of-band, see External registrations. No webhooks, no
+  Gmail `users.watch`, no Pub/Sub topics exist anywhere in the codebase.
+- *(c) Links in outgoing email/notifications* — **none.** Zero `http(s)://`
+  in `weeklyDigest.ts`, `followupGenerator.ts`, `contextFollowupGenerator.ts`,
+  `antiGhostingFollowupGenerator.ts`, `gmailClient.ts`; every
+  `publicUrl()`/`appPath()`/`redirectPath()` call site is an OAuth redirect
+  URI or an HTTP `Location`. The add-on cards contain no `OpenLink` widgets.
+  **Nothing with a stale address is sitting in an inbox.**
+
+**What was changed**
+
+| File | Change |
+|---|---|
+| `dashboard/src/main.tsx` | `redirectLegacyAddress()` before `createRoot` — the repair that actually fires for real browsers |
+| `api-server/src/lib/appUrls.ts` | `legacyRedirectTarget()` + private `isUnderPrefix()`: one implementation of the decision, shared by the server and the tests |
+| `api-server/src/app.ts` | 308 middleware (gated on `PREFIXED`); comment lock on the unprefixed `/api` mount |
+| `api-server/src/tests/test-base-path.ts` | +12 L1 cases (36 total in the file) |
+
+**Design decision — the client redirect is the load-bearing one.** The broken
+paths are answered by the dashboard's static artifact and never reach Express,
+so no server rule can fix them. The 308 is the backstop for anything
+addressing the api-server directly. Both were built because the platform
+routing is not observable from the workspace and must not be the single point
+of failure.
+
+**Design decision — the redirect stays on the host it started on.**
+`location.replace("/followup/…")` is same-origin, so a user on the legacy host
+lands on `followupper.mobupps.net/followup/…`, not the gateway. Auth is
+`localStorage`, which is per-origin: sending them cross-host would silently
+log them out. (They migrate to the gateway host at their next login anyway —
+the OAuth `redirect_uri` is absolute on `tools.mobupps.net`.)
+
+**Gates**
+
+| Gate | Result |
+|---|---|
+| typecheck | PASS |
+| tests | 789/789 across 34 files (was 777; +12 L1 cases) |
+| build, no `PORT`/`BASE_PATH`/`PUBLIC_URL` exported | PASS, exit 0 |
+
+**Godlike audit — 5 rounds, closed clean on round 5.**
+- *Round 1 (technical), 2 findings, both fixed.* (i) The comment and test name
+  claimed a trailing-slash `BACKEND_URL` ("//api/sync") was "still treated as
+  an API path". Measured: it 404s either way, because Express does not match a
+  doubled slash to the `/api` mount — identically on `main`, in dark mode and
+  in lit mode. The normalization prevents a *misleading redirect*, not a
+  failure; both now say exactly that. (ii) `isUnderPrefix` was exported with no
+  external consumer while its sibling `safeRootedPath` is module-private —
+  made private so callers cannot make half a decision.
+- *Round 2 (security), clean.* Encoded CRLF in path and query stays encoded in
+  `Location`, no injected header. With `Accept: text/html` the redirect body
+  keeps the URL percent-encoded — no raw `<script>`. Traversal
+  (`/../../../etc/passwd`, `%2f` variants) followed **through** the new hop
+  discloses no file. Every hostile path resolves back to this origin via a
+  URL-parser oracle, never string shape.
+- *Round 3 (end-user), clean.* Back button: `replace()` not `assign()`, so
+  Back does not return to the blank page. `login_code` survives in the query.
+  No flash of an empty shell — render is skipped entirely when redirecting.
+- *Round 4 (added), 1 finding, fixed.* The `prefix === "/"` branch of
+  `isUnderPrefix` is unreachable from its only caller, and its comment claimed
+  it was what kept the dark path inert. Darkness is enforced by
+  `legacyRedirectTarget`'s early return; the comment now says so and the
+  branch is kept only as a correct default.
+- *Round 5 (added), fully clean.* Gates and both smokes re-run on the final
+  code.
+
+**Traps — all four named pre-edit, plus one found during the audit**
+1. *Redirect loop* — avoided; segment-boundary `isUnderPrefix`, asserted by an
+   idempotence test (the rule's own target must return `null`) and in the lit
+   smoke (every legacy path reaches 200 in exactly **1 hop**).
+2. *Shadowing `/api`* — avoided; registered after both `/api` mounts plus an
+   explicit exclusion. Smoke: 0 of the `/api` probes answer 3xx.
+3. *Cached 308 outliving the prefix* — real, accepted, recorded in Open items.
+4. *Breaking the dark path* — avoided; see the darkness evidence below.
+5. **Found in round 4 — gateway prefix-stripping.** If the gateway proxied
+   `tools.mobupps.net/followup/*` to the app's root, the 308 would rewrite
+   `/pipeline` → `/followup/pipeline` → stripped back to `/pipeline` → an
+   **infinite loop in production**. Ruled out empirically, two ways: bare
+   `https://tools.mobupps.net/followup` returns 302 → `/followup/`, which only
+   an api-server that sees the literal `/followup` can emit; and
+   `…/followup/assets/index--NgTAXL1.js` returns 200 while
+   `…/assets/index--NgTAXL1.js` returns 404. The gateway forwards the full
+   path.
+
+**Darkness evidence — the rollback path**
+- *Server:* all **36** probes on a branch server and a `main` server booted
+  side by side, both env-unset, are **byte-for-byte identical** (md5
+  `db11b7b9…`, ports normalized). `/pipeline` and `/accounts` still 404,
+  `/followup` still 404, `/` still serves the API test console.
+- *Client:* the dark bundle was diffed against a dark bundle built from
+  `main`'s `main.tsx` in place. Common prefix 714,032 of 714,315 bytes; the
+  **entire** divergence is `function YC(){return!1}` plus an always-false
+  guard — Vite constant-folds `BASE_PATH === "/"` and drops the body. The dark
+  bundle contains **zero** occurrences of `location.replace`. The guarded code
+  (`setBaseUrl` + `createRoot`) is byte-identical to `main`'s.
+
+**SMOKE — LIT (`BASE_PATH=/followup/`, `PUBLIC_URL=https://tools.mobupps.net/followup`,
+process env only, never written to Replit Secrets): 31/31.**
+
+| Check | Result |
+|---|---|
+| `/`, `/pipeline`, `/accounts`, `/anti-ghosting`, `/context/pipeline` | 308 → prefixed, **1 hop**, final 200 |
+| 308 preserves METHOD | proven end to end: the access log shows hop 1 `POST /l1-post-probe`, hop 2 arriving as `POST /followup/l1-post-probe` |
+| query preserved | `/?login_code=abc&x=1` → `/followup/?login_code=abc&x=1` |
+| all 9 add-on paths + both OAuth callbacks + `/api/healthz` | reach their handler; **0** answer 3xx |
+| prefix-lookalikes `/followupper`, `/followups` | correctly redirected, not mistaken for prefixed |
+| already-prefixed paths | never redirect (loop guard) |
+| hostile paths (`//evil.example`, `/%5C…`, encoded CRLF, traversal) | Location never leaves this origin |
+| assets referenced by the served SPA | 3/3 resolve, **zero 404s** |
+| missing asset | honest 404, not index.html 200 |
+| CORS preflight (`OPTIONS`) | 204 from `cors()` before the rule, identical in both modes |
+
+**The shipped LIT bundle was executed, not just inspected.** The emitted
+function was extracted verbatim from `index-85ZvAqfs.js` and run in Node
+against a 14-path corpus with a stubbed `window.location`: `/` → `/followup/`,
+`/pipeline?a=1#row-7` → `/followup/pipeline?a=1#row-7`, `/followupper` →
+`/followup/followupper`, `/followup/*` → render in place, and every hostile
+input resolves back to this origin.
+
+**Blast radius held.** No database, cron, doctrine, add-on, `.replit`,
+`artifact.toml` or dependency changes. No email dispatched — `app.ts` was
+booted directly in every smoke, so `startCronJobs()` never ran. No workflow
+was running and none was touched; ports 5711/5712/5713 were used and all were
+shut down by PID.
+
+**Deviation to note.** Steps 2 and 3 required the *actual* production state,
+which cannot be read from the workspace, so I made unauthenticated read-only
+`GET`s to the live app (plus four `POST`s carrying a deliberately wrong API
+key, which 401 at the auth middleware before any handler work). No
+authenticated call, no state change, nothing deployed.
 
 ### 2026-07-31 — Cutover C1: dashboard base-path blocker — BLAST RADIUS (pre-edit)
 

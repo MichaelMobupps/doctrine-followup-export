@@ -260,7 +260,187 @@ test.describe("bare-prefix redirect", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 4. SECURITY — Bundle 1's two defects must not recur in the switched state
+// 4. REPAIR L1 — legacy address survival
+//
+// The prefix is live in production while the unprefixed address is still
+// reachable, so both must work at once. Two rules cooperate and they must
+// agree: the server 308 (legacyRedirectTarget, exercised directly here) and
+// the client pre-mount redirect in dashboard/src/main.tsx.
+// ---------------------------------------------------------------------------
+
+/** Every path the Apps Script add-on calls. addon/*.gs, verbatim. */
+const ADDON_PATHS = [
+  "/api/sync",
+  "/api/queue",
+  "/api/queue-batch",
+  "/api/cancel",
+  "/api/stats",
+  "/api/prospects",
+  "/api/followups",
+  "/api/prospect/by-thread/abc123",
+];
+
+/** The other unprefixed machine callers: OAuth callbacks + platform health. */
+const MACHINE_PATHS = [
+  "/api/auth/callback",
+  "/api/gmail/callback",
+  "/api/auth/google",
+  "/api/gmail/auth",
+  "/api/healthz",
+];
+
+/** Browser paths that exist only at the legacy address. */
+const LEGACY_BROWSER_PATHS = ["/", "/pipeline", "/accounts", "/anti-ghosting", "/favicon.svg"];
+
+/**
+ * MIRROR of the client rule in dashboard/src/main.tsx. Kept here because the
+ * dashboard has no test runner, and pinned by the agreement test below: if
+ * either side's boundary logic drifts, that test fails rather than the two
+ * quietly disagreeing about which paths are "already prefixed".
+ *
+ * `clientBase` is main.tsx's BASE_PATH (trailing slash); `routerBase` is its
+ * ROUTER_BASE (no trailing slash).
+ */
+function clientRedirectTarget(
+  clientBase: string,
+  pathname: string,
+  search = "",
+  hash = "",
+): string | null {
+  if (clientBase === "/") return null;
+  const routerBase = clientBase.replace(/\/$/, "");
+  if (pathname === routerBase || pathname.startsWith(clientBase)) return null;
+  return `${routerBase}${pathname}${search}${hash}`;
+}
+
+test.describe("repair L1: legacy address survival", () => {
+  test.it("dark mode has no rule at all — every path is left alone", async () => {
+    const m = await loadWith({});
+    for (const p of [...LEGACY_BROWSER_PATHS, ...ADDON_PATHS, ...MACHINE_PATHS, "/followup/x"]) {
+      assert.equal(m.legacyRedirectTarget(p), null, `dark mode must not redirect ${p}`);
+    }
+    assert.equal(clientRedirectTarget("/", "/pipeline"), null);
+  });
+
+  test.it("lit mode sends legacy BROWSER paths to the prefixed path", async () => {
+    const m = await loadWith({ BASE_PATH: LIT_BASE, PUBLIC_URL: LIT_PUBLIC });
+    assert.equal(m.legacyRedirectTarget("/"), "/followup/");
+    assert.equal(m.legacyRedirectTarget("/pipeline"), "/followup/pipeline");
+    assert.equal(m.legacyRedirectTarget("/accounts"), "/followup/accounts");
+    assert.equal(m.legacyRedirectTarget("/favicon.svg"), "/followup/favicon.svg");
+  });
+
+  test.it("lit mode NEVER redirects a machine caller — the /api mount stays first-class", async () => {
+    const m = await loadWith({ BASE_PATH: LIT_BASE, PUBLIC_URL: LIT_PUBLIC });
+    for (const p of [...ADDON_PATHS, ...MACHINE_PATHS]) {
+      assert.equal(m.legacyRedirectTarget(p), null, `${p} must reach its handler, not a 308`);
+    }
+  });
+
+  test.it("a doubled-slash API path is never redirected away from the /api mount", async () => {
+    // A trailing slash on the add-on's BACKEND_URL produces "//api/sync".
+    // Tested raw it fails the "/api" membership test and would be 308'd to
+    // "/followup//api/sync". It still 404s either way — Express does not match
+    // a doubled slash to the mount, on main and in dark mode alike — so this
+    // pins "no misleading redirect", not "the misconfiguration works".
+    const m = await loadWith({ BASE_PATH: LIT_BASE });
+    for (const p of ADDON_PATHS) {
+      assert.equal(m.legacyRedirectTarget(`/${p}`), null, `//${p} must not be redirected`);
+    }
+  });
+
+  test.it("already-prefixed paths are left alone — no redirect loop", async () => {
+    const m = await loadWith({ BASE_PATH: LIT_BASE });
+    for (const p of ["/followup", "/followup/", "/followup/pipeline", "/followup/api/stats"]) {
+      assert.equal(m.legacyRedirectTarget(p), null, `loop risk at ${p}`);
+    }
+  });
+
+  test.it("the rule is idempotent — its own target never re-enters it", async () => {
+    const m = await loadWith({ BASE_PATH: LIT_BASE });
+    for (const p of LEGACY_BROWSER_PATHS) {
+      const first = m.legacyRedirectTarget(p);
+      assert.notEqual(first, null, `${p} should redirect once`);
+      assert.notEqual(first, p, `self-redirect loop at ${p}`);
+      assert.equal(m.legacyRedirectTarget(first as string), null, `second hop at ${first}`);
+    }
+  });
+
+  test.it("a prefix-lookalike is NOT mistaken for an already-prefixed path", async () => {
+    // "/followupper" startsWith "/followup". A substring test would skip it and
+    // leave exactly the blank page this repair exists to remove.
+    const m = await loadWith({ BASE_PATH: LIT_BASE });
+    assert.equal(m.legacyRedirectTarget("/followupper"), "/followup/followupper");
+    assert.equal(m.legacyRedirectTarget("/followups"), "/followup/followups");
+  });
+
+  test.it("client and server agree on every path", async () => {
+    const m = await loadWith({ BASE_PATH: LIT_BASE });
+    const corpus = [
+      ...LEGACY_BROWSER_PATHS,
+      ...ADDON_PATHS,
+      ...MACHINE_PATHS,
+      "/followup",
+      "/followup/",
+      "/followup/pipeline",
+      "/followupper",
+      "/followups",
+      "/context/pipeline",
+    ];
+    for (const p of corpus) {
+      const server = m.legacyRedirectTarget(p);
+      const client = clientRedirectTarget(LIT_BASE, p);
+      if (p.startsWith("/api")) {
+        // The only deliberate divergence: /api is server-only. The client rule
+        // never sees these paths — no SPA bundle is loaded at an API URL.
+        assert.equal(server, null, `${p}`);
+        continue;
+      }
+      assert.equal(client, server, `client/server disagree on ${p}`);
+    }
+  });
+
+  test.it("query and hash survive the client redirect", async () => {
+    // The login callback hands the code back in the query string. Dropping it
+    // turns a working login into a silent bounce to the sign-in screen.
+    assert.equal(
+      clientRedirectTarget(LIT_BASE, "/", "?login_code=abc&x=1"),
+      "/followup/?login_code=abc&x=1",
+    );
+    assert.equal(
+      clientRedirectTarget(LIT_BASE, "/pipeline", "?a=1", "#row-7"),
+      "/followup/pipeline?a=1#row-7",
+    );
+  });
+
+  test.it("no legacy target can leave this origin", async () => {
+    const m = await loadWith({ BASE_PATH: LIT_BASE });
+    for (const p of ["//evil.example", "///evil.example/p", "/\\evil.example", "//", "////x"]) {
+      const server = m.legacyRedirectTarget(p);
+      if (server !== null) {
+        assert.equal(resolvedHost(server), "good.example", `server target escaped: ${server}`);
+        assert.ok(!server.startsWith("//"), `protocol-relative: ${server}`);
+      }
+      const client = clientRedirectTarget(LIT_BASE, p);
+      if (client !== null) {
+        assert.equal(resolvedHost(client), "good.example", `client target escaped: ${client}`);
+        assert.ok(!client.startsWith("//"), `protocol-relative: ${client}`);
+      }
+    }
+  });
+
+  test.it("a hostile BASE_PATH disables the rule instead of arming it", async () => {
+    for (const bp of ["//evil.example", "https://evil.example", "/\\evil.example", "javascript:x"]) {
+      const m = await loadWith({ BASE_PATH: bp });
+      // normalizeBasePath degrades these to "/", which is the dark state.
+      assert.equal(m.BASE_PATH, "/");
+      assert.equal(m.legacyRedirectTarget("/pipeline"), null, `armed by hostile BASE_PATH ${bp}`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5. SECURITY — Bundle 1's two defects must not recur in the switched state
 // ---------------------------------------------------------------------------
 
 test.describe("security: no protocol-relative output, no open redirect", () => {

@@ -164,6 +164,70 @@ function safeRootedPath(path: string): string {
 }
 
 /**
+ * Is `pathname` the prefix itself, or beneath it?
+ *
+ * Compared on SEGMENT boundaries, never as a bare `startsWith`. "/followup"
+ * is a prefix of the string "/followupper", so a substring test would claim
+ * that a genuinely unprefixed route already lives under the mount and skip
+ * the repair for it. The same class of bug bit Bundle 2's one-prefix oracle,
+ * which counted "/followup" inside the real route "/followups".
+ *
+ * A `prefix` of "/" answers "everything is under it", which is the only
+ * coherent reading of a root mount. That branch is NOT what keeps the dark
+ * path inert — legacyRedirectTarget() returns early on BASE_PATH "/" and this
+ * is never reached with it. Darkness lives at the caller; this is a correct
+ * default so the function cannot mislead a future one.
+ *
+ * Module-private, like safeRootedPath: the only supported entry point is
+ * legacyRedirectTarget(), so callers cannot make half a decision.
+ */
+function isUnderPrefix(pathname: string, prefix: string): boolean {
+  if (prefix === "/") return true;
+  return pathname === prefix || pathname.startsWith(`${prefix}/`);
+}
+
+/**
+ * Repair L1 — where an unprefixed legacy request should be sent, or `null`
+ * when it must be left exactly as it is.
+ *
+ * Three refusals, in order, and each one is load-bearing:
+ *
+ *   1. BASE_PATH "/" — the rule does not exist when the prefix is not active.
+ *      Rollback is "unset the env vars", so this branch is what makes the
+ *      rolled-back app byte-identical rather than merely similar.
+ *   2. Already under the prefix — without this the rule matches its own
+ *      target and every request becomes an infinite redirect. Bundle 2's
+ *      bare-prefix redirect hit the sibling form of this trap.
+ *   3. Under "/api" — the unprefixed API mount is FIRST-CLASS and must stay
+ *      that way. It is what the Apps Script add-on, both Google OAuth
+ *      callbacks and the platform startup health check call. Redirecting a
+ *      POST is not equivalent to serving it: plenty of senders drop the body
+ *      or the method on a 3xx, and a health check that 3xxs reads as
+ *      unhealthy on some platforms.
+ *
+ * The path is normalized through safeRootedPath BEFORE the two membership
+ * tests, not after. A caller that joins a trailing-slash base URL to a rooted
+ * path sends "//api/sync"; tested raw, that fails the "/api" test and this
+ * rule would 308 it to "/followup//api/sync".
+ *
+ * Be precise about what the normalization does and does NOT buy. "//api/sync"
+ * still 404s: Express does not match a doubled slash to the "/api" mount, and
+ * it 404s identically on main and in dark mode, so that is pre-existing rather
+ * than something this rule introduces (recorded in TODO.md Open items). What
+ * the normalization prevents is converting that honest 404 into a redirect
+ * pointing even further from the mount the caller was aiming at.
+ */
+export function legacyRedirectTarget(pathname: string): string | null {
+  if (BASE_PATH === "/") return null;
+
+  const rooted = safeRootedPath(pathname);
+  if (isUnderPrefix(rooted, BASE_PATH)) return null;
+  if (isUnderPrefix(rooted, "/api")) return null;
+
+  return `${BASE_PATH}${rooted}`;
+}
+
+/**
  * Absolute URL to a rooted in-app path, built on the outbound origin.
  * Used for values handed to third parties (Google OAuth redirect URIs).
  */
