@@ -22,13 +22,21 @@
   redirect — which is what actually fires for real browsers — is not cached at
   all.
 
-- **[Repair L1a, deliberate gap] No test pins the redirect STATUS CODE.** The
-  unit tests cover `legacyRedirectTarget()`, which returns a path; the status
-  lives in `app.ts` and only the live smoke observes it, so flipping 307 back
-  to 308 — or to 302, which would silently downgrade a POST to a GET — would
-  pass every gate. Pinning it needs a booted app, which `test-base-path.ts`
-  deliberately avoids ("no DB, no network"). Left alone because L1a's scope was
-  one digit; worth an api-server-level HTTP test if one is ever added.
+- **[RESOLVED by L1b, 2026-08-02] No test pins the redirect STATUS CODE.**
+  `api-server/src/tests/test-legacy-redirect-http.ts` boots the real app over
+  real HTTP with the prefix active and asserts 307 plus end-to-end method
+  preservation. Proven to bite by mutation: 307→308 fails 2 cases, 307→302 and
+  307→301 fail 3 each — including the method case, because a client downgrades
+  the POST to a GET. Original finding retained below.
+
+- **[Original finding, now resolved] No test pins the redirect STATUS CODE.**
+  The unit tests cover `legacyRedirectTarget()`, which returns a path; the
+  status lives in `app.ts` and only the live smoke observes it, so flipping 307
+  back to 308 — or to 302, which would silently downgrade a POST to a GET —
+  would pass every gate. Pinning it needs a booted app, which
+  `test-base-path.ts` deliberately avoids ("no DB, no network"). Left alone
+  because L1a's scope was one digit; worth an api-server-level HTTP test if one
+  is ever added.
 
 - **[Repair L1, verify out-of-band] The two Google OAuth redirect URIs must be
   allowlisted.** Production is live-emitting
@@ -146,6 +154,154 @@ Notes:
   Pub/Sub topics exist in this codebase.
 
 ## Ledger
+
+### 2026-08-02 — Repair L1b: pin the redirect status code — BLAST RADIUS (pre-edit)
+
+Branch `cutover-l1b-pin-status`. Closes the gap L1a recorded in Open items:
+nothing in the repo pins the status code, so a change to 302 or 308 passes
+every gate.
+
+**Lineage check (Git safety rule 1), directional form.** On `main` at
+`5088adb`. **`main` moved since L1a and it was not me:** Replit Agent created
+an empty "Published your App" marker at 17:18 UTC on top of `cf6c06e`. So L1
+and L1a are now DEPLOYED — verified live, the legacy address serves
+`index-85ZvAqfs.js`, the build containing the pre-mount redirect, and the
+deployed tree carries `res.redirect(307, …)`. Local `main` is 1 commit ahead
+of `origin/main` (that marker, unpushed). `replit-agent` holds no content
+`main` lacks. Branched from `5088adb`.
+
+**Note for the L1a ledger, still true:** the published build has 307 and never
+had 308, so "the risk was retired before it could be taken" holds — the deploy
+landed after L1a merged, not between L1 and L1a.
+
+**Files to be touched — 2** (1 new, 1 doc)
+
+| File | Change |
+|---|---|
+| `api-server/src/tests/test-legacy-redirect-http.ts` | NEW — boots the real app over real HTTP with the prefix active, asserts 307 and end-to-end method preservation |
+| `TODO.md` | this entry, the ledger entry, and retiring the Open item |
+
+**No production code is touched by this order.** Zero behavior change by
+construction; the entire risk is that the new test destabilises the gate.
+
+**Behaviors affected:** the test suite only.
+
+**Worst realistic failure — four ways a booting test can poison the gate, all
+pre-identified**
+1. **Env leak into the other 34 test files.** This test must set `BASE_PATH`
+   *before* `app.ts` is imported, because `appUrls` reads env at module load.
+   If the runner shared one process, that would flip `test-base-path.ts`'s dark
+   cases into lit mode and the darkness guarantee would silently stop being
+   tested. Verified empirically rather than assumed: a two-file canary proved
+   `node --test` gives each FILE its own process (file B could not see file
+   A's env var). Also forces a dynamic `await import("../app")` — a static
+   import is hoisted and would run before the assignment.
+2. **Touching the real database.** `@workspace/db` THROWS at import unless
+   `DATABASE_URL` is set, and `app.ts` imports the whole router tree. The test
+   sets a deliberately unroutable dummy `DATABASE_URL`, so it is hermetic: the
+   pool is lazy, nothing queries, and if anything ever did the test would fail
+   loudly instead of quietly reading production data.
+3. **Hanging the gate.** `logger.ts` attaches a `pino-pretty` transport unless
+   `NODE_ENV=production` — a worker thread that can outlive the test. The test
+   sets `NODE_ENV=production` (grepped first: that variable is read in exactly
+   one place in the whole api-server, the logger) plus `LOG_LEVEL=silent`, and
+   closes its server in an `after` hook.
+4. **Port collision with the running workflow.** Listens on port 0 and reads
+   the assigned ephemeral port, so it can never contend for a fixed one.
+
+**Rollback:** delete the new file. No production code to revert.
+
+### 2026-08-02 — Repair L1b: pin the redirect status code — DONE
+
+Predicted 2 files, touched 2. **Zero production code changed** — `git status`
+shows one new test file and `TODO.md`. Not deployed; ready to publish.
+
+**What it pins.** `test-base-path.ts` covers `legacyRedirectTarget()`, which
+returns a PATH — it cannot see the status `app.ts` sends with it. Both
+regression routes were therefore invisible to the gate: back to 308 (permanent,
+client-cached, unreachable by an env-unset rollback — the reason L1a existed),
+or to 302 (lets a client rewrite a POST into a GET and drop the body, while
+still looking fine in a browser address bar).
+
+**The test is proven to bite, by mutation.** A test that cannot fail is
+decoration, so each regression was actually introduced and run:
+
+| Mutation | Result |
+|---|---|
+| `307 → 308` | **2 of 4 fail** — the status cases. The method case correctly still passes: 308 does preserve the method; it is the permanence that is wrong |
+| `307 → 302` | **3 of 4 fail** — status, *and* the second hop arrives as `GET`, catching the silent body-drop |
+| `307 → 301` | **3 of 4 fail** — same |
+| unmodified | 4 of 4 pass |
+
+`app.ts` was restored from a pre-mutation copy and confirmed byte-identical to
+`HEAD` afterwards.
+
+**The four cases**
+1. `POST` to a legacy path → 307, `Location: /followup/l1b-probe?q=1` (query
+   preserved).
+2. The same POST followed to completion → the server records exactly
+   `["POST /l1b-probe?q=1", "POST /followup/l1b-probe?q=1"]`. The status code
+   is a promise to the client; this checks the promise is kept end to end,
+   using a `prependListener("request")` recorder in front of the app rather
+   than trusting the code.
+3. `GET` legacy path → 307 too, so nobody "fixes" a failure by special-casing
+   one method.
+4. `POST /api/…` → **not** a redirect. The exclusion that makes any redirect
+   here safe; asserted as "not 3xx" rather than a specific code so it does not
+   depend on `ADDON_API_KEY` being present.
+
+**Gates**
+
+| Gate | Result |
+|---|---|
+| typecheck | PASS |
+| tests | **793/793 across 35 files** (789 + 4 new) |
+| build, no `PORT`/`BASE_PATH`/`PUBLIC_URL` exported | PASS, exit 0 |
+
+**Godlike audit — 2 rounds, closed clean on round 2.**
+- *Round 1, 2 findings, both fixed.* (i) The recorder wrapped the app behind a
+  `as unknown as http.RequestListener` double cast. Replaced with
+  `http.createServer(app)` + `prependListener("request", …)`, which typechecks
+  with no cast at all and additionally records BEFORE the app handles the
+  request rather than after. Re-verified it still passes and still catches the
+  302 mutation. (ii) The header comment claimed `NODE_ENV` is read in exactly
+  one place in the api-server. True of our code, **not** of Express, which
+  reads it too (`app.get("env")`, dev-mode stack traces). Corrected in place.
+- *Round 2 (added), clean.* Gates re-run on the final code.
+
+**The four named traps, all held**
+1. *Env leak into the other 34 files* — the test must set `BASE_PATH` before
+   `app.ts` is imported. Proven safe by a dedicated two-file canary: file B
+   could not see an env var file A set at module scope, so `node --test` gives
+   each FILE its own process. **Worth stating precisely: the suite passing is
+   NOT independent evidence of this**, because `test-base-path.ts`'s own
+   `loadWith()` deletes those keys before every import and would mask a leak.
+   The canary is the evidence. Forced the dynamic `await import("../app")` —
+   a static import is hoisted and would run before the assignments.
+2. *Touching the real database* — `@workspace/db` throws at import unless
+   `DATABASE_URL` is set, and `app.ts` pulls in the whole router tree. Set to
+   an unroutable dummy (port 1). The pool is lazy and nothing on these paths
+   queries; if anything ever did, the test fails loudly rather than quietly
+   reading production.
+3. *Hanging the gate* — `pino-pretty` is a transport worker outside
+   production. `NODE_ENV=production` + `LOG_LEVEL=silent`, server closed in an
+   `after` hook. The file exits 0 on its own, checked under `timeout`.
+4. *Port collision with the running workflow* — listens on port 0 and reads
+   the assigned port.
+
+**Blast radius held.** No production code, no database, cron, doctrine,
+add-on, dashboard, `.replit` or dependency changes. No email dispatched — the
+test boots `app.ts`, never `index.ts`, so `startCronJobs()` cannot run. No
+workflow was running and none was touched; the test binds only ephemeral ports.
+
+**State of the world at branch time.** `main` moved without me: Replit Agent
+published the app at 17:18 UTC (`5088adb`, an empty marker on top of L1a). So
+L1 and L1a are LIVE. Verified against production: the legacy address now
+serves `index-85ZvAqfs.js`, the bundle containing the pre-mount redirect, so
+the blank-page defect is fixed in production; `/api/healthz`, `/followup/`,
+`/followup/pipeline` and the gateway all return 200, and the add-on paths
+still answer 401 to a wrong key. The deployed tree carries `307` and never
+carried `308`.
 
 ### 2026-08-02 — Repair L1a: legacy redirect 308 → 307 — BLAST RADIUS (pre-edit)
 
