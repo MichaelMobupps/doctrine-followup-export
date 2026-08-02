@@ -264,7 +264,7 @@ test.describe("bare-prefix redirect", () => {
 //
 // The prefix is live in production while the unprefixed address is still
 // reachable, so both must work at once. Two rules cooperate and they must
-// agree: the server 308 (legacyRedirectTarget, exercised directly here) and
+// agree: the server 307 (legacyRedirectTarget, exercised directly here) and
 // the client pre-mount redirect in dashboard/src/main.tsx.
 // ---------------------------------------------------------------------------
 
@@ -333,13 +333,13 @@ test.describe("repair L1: legacy address survival", () => {
   test.it("lit mode NEVER redirects a machine caller — the /api mount stays first-class", async () => {
     const m = await loadWith({ BASE_PATH: LIT_BASE, PUBLIC_URL: LIT_PUBLIC });
     for (const p of [...ADDON_PATHS, ...MACHINE_PATHS]) {
-      assert.equal(m.legacyRedirectTarget(p), null, `${p} must reach its handler, not a 308`);
+      assert.equal(m.legacyRedirectTarget(p), null, `${p} must reach its handler, not a 307`);
     }
   });
 
   test.it("a doubled-slash API path is never redirected away from the /api mount", async () => {
     // A trailing slash on the add-on's BACKEND_URL produces "//api/sync".
-    // Tested raw it fails the "/api" membership test and would be 308'd to
+    // Tested raw it fails the "/api" membership test and would be 307'd to
     // "/followup//api/sync". It still 404s either way — Express does not match
     // a doubled slash to the mount, on main and in dark mode alike — so this
     // pins "no misleading redirect", not "the misconfiguration works".

@@ -208,7 +208,7 @@ function isUnderPrefix(pathname: string, prefix: string): boolean {
  * The path is normalized through safeRootedPath BEFORE the two membership
  * tests, not after. A caller that joins a trailing-slash base URL to a rooted
  * path sends "//api/sync"; tested raw, that fails the "/api" test and this
- * rule would 308 it to "/followup//api/sync".
+ * rule would 307 it to "/followup//api/sync".
  *
  * Be precise about what the normalization does and does NOT buy. "//api/sync"
  * still 404s: Express does not match a doubled slash to the "/api" mount, and

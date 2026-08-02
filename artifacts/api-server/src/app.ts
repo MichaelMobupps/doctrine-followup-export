@@ -87,10 +87,12 @@ app.use("/api", healthRouter);
 //   - the platform startup health check, which artifact.toml declares as the
 //     LITERAL path "/api/healthz".
 //
-// A 308 would satisfy a browser but not these: senders routinely drop the
-// body or downgrade the method on a redirect, and a health check that answers
-// 3xx is not reliably read as healthy. The prefixed mount below is ADDITIVE —
-// both forms are served, neither forwards to the other.
+// A redirect would satisfy a browser but not these: senders routinely drop
+// the body or downgrade the method on a 3xx, and a health check that answers
+// 3xx is not reliably read as healthy. That holds for 307 and 308 alike — the
+// method-preserving codes bind the CLIENT, and these clients are not ours to
+// fix. The prefixed mount below is ADDITIVE — both forms are served, and
+// neither forwards to the other.
 // ---------------------------------------------------------------------------
 app.use("/api", router);
 
@@ -112,21 +114,31 @@ if (PREFIXED) {
 // ---------------------------------------------------------------------------
 // Repair L1: legacy address survival for BROWSER paths.
 //
-//   GET /pipeline?x=1   ->  308  /followup/pipeline?x=1
+//   GET /pipeline?x=1   ->  307  /followup/pipeline?x=1
 //
 // Registered here on purpose: AFTER both /api mounts, so an API request can
 // never be turned into a redirect, and BEFORE the api-server's own static
 // dir, so the legacy root "/" is redirected into the app rather than
 // answering with the pre-prefix API test console.
 //
-// 308, not 302: it preserves the method and the body, and the roadmap treats
-// the old address as a permanent move. The cost is that browsers cache it —
-// see the Open items note in TODO.md, because rollback for this migration is
-// "unset the env vars" and a cached 308 outlives that. The client-side
-// pre-mount redirect in dashboard/src/main.tsx is what actually fires for
-// real browsers today (the platform routes these paths to the dashboard's
-// static artifact, so they never reach Express in production); this rule is
-// the backstop for anything addressing the api-server directly.
+// 307, not 302: 302 lets a client downgrade the method to GET, and 307 is the
+// status that forbids that — method and body are preserved.
+//
+// 307, not 308 (L1a): the two are identical on method preservation, which is
+// the only property this rule needs, but 308 is PERMANENT and caches keep it.
+// Rollback for this migration is "unset the env vars and redeploy", and that
+// cannot reach a redirect already cached in someone's browser — they would
+// keep bouncing to /followup/pipeline, which 404s once the prefix is gone.
+// Same reasoning Bundle 2 used to pick 302 over 301 for the bare-prefix
+// redirect above. The roadmap does call the old address a permanent move, but
+// permanence belongs in the migration's final step, not in a repair that has
+// to stay reversible.
+//
+// The client-side pre-mount redirect in dashboard/src/main.tsx is what
+// actually fires for real browsers today (the platform routes these paths to
+// the dashboard's static artifact, so they never reach Express in
+// production); this rule is the backstop for anything addressing the
+// api-server directly.
 //
 // Every exclusion, the loop guard and the path normalization live in
 // legacyRedirectTarget() so that this middleware and the unit tests exercise
@@ -141,7 +153,7 @@ if (PREFIXED) {
     }
     const queryStart = req.originalUrl.indexOf("?");
     const query = queryStart === -1 ? "" : req.originalUrl.slice(queryStart);
-    res.redirect(308, `${target}${query}`);
+    res.redirect(307, `${target}${query}`);
   });
 }
 

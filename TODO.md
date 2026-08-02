@@ -2,16 +2,33 @@
 
 ## Open items
 
-- **[Repair L1, ACCEPTED RISK] A cached 308 outlives the prefix.** The legacy
-  redirect in `api-server/src/app.ts` is a 308, which is permanent and which
-  browsers and shared caches may keep. Rollback for this migration is "unset
-  the two env vars" — a client holding a cached 308 for `/pipeline` would keep
-  bouncing to `/followup/pipeline`, which 404s once the prefix is withdrawn.
-  308 was chosen deliberately (it preserves the method, and the roadmap calls
-  the old address a permanent move); Bundle 2 chose 302 for the bare-prefix
-  redirect for exactly the opposite reason. **If a rollback ever happens,
-  expect this and tell users to hard-refresh.** The client-side redirect —
-  which is what actually fires for real browsers — is not cached at all.
+- **[RESOLVED by L1a, 2026-08-02] A cached 308 outlives the prefix.** The
+  legacy redirect is now a **307**: identical method-and-body preservation,
+  temporary rather than permanent, so nothing survives in a client cache that
+  an env-unset rollback cannot reach. L1 was never published, so no client was
+  ever served the 308 — the risk was retired before it could be taken. Neither
+  redirect in `app.ts` is permanent now: the bare-prefix one is 302 and the
+  legacy one is 307. Original finding retained below.
+
+- **[Original finding, now resolved] A cached 308 outlives the prefix.** The
+  legacy redirect in `api-server/src/app.ts` is a 308, which is permanent and
+  which browsers and shared caches may keep. Rollback for this migration is
+  "unset the two env vars" — a client holding a cached 308 for `/pipeline`
+  would keep bouncing to `/followup/pipeline`, which 404s once the prefix is
+  withdrawn. 308 was chosen deliberately (it preserves the method, and the
+  roadmap calls the old address a permanent move); Bundle 2 chose 302 for the
+  bare-prefix redirect for exactly the opposite reason. **If a rollback ever
+  happens, expect this and tell users to hard-refresh.** The client-side
+  redirect — which is what actually fires for real browsers — is not cached at
+  all.
+
+- **[Repair L1a, deliberate gap] No test pins the redirect STATUS CODE.** The
+  unit tests cover `legacyRedirectTarget()`, which returns a path; the status
+  lives in `app.ts` and only the live smoke observes it, so flipping 307 back
+  to 308 — or to 302, which would silently downgrade a POST to a GET — would
+  pass every gate. Pinning it needs a booted app, which `test-base-path.ts`
+  deliberately avoids ("no DB, no network"). Left alone because L1a's scope was
+  one digit; worth an api-server-level HTTP test if one is ever added.
 
 - **[Repair L1, verify out-of-band] The two Google OAuth redirect URIs must be
   allowlisted.** Production is live-emitting
@@ -129,6 +146,135 @@ Notes:
   Pub/Sub topics exist in this codebase.
 
 ## Ledger
+
+### 2026-08-02 — Repair L1a: legacy redirect 308 → 307 — BLAST RADIUS (pre-edit)
+
+Branch `cutover-l1a-307`. Retires the one accepted risk L1 shipped with.
+
+**Lineage check (Git safety rule 1), before branching.** On `main`
+(`e1766f1`), equal to `origin/main`. Note the check L1 used —
+"`replit-agent`'s tree equals `main`'s tree" — is now STALE and reports a
+false alarm, because `main` advanced with the L1 commit while `replit-agent`
+did not. The question the rule actually asks is whether another branch holds
+content `main` lacks. Re-checked in the correct direction: `git diff
+replit-agent main` is exactly the five L1 files and nothing else, and
+`replit-agent`'s tree equals `main`'s PARENT (`bd06214`). So `replit-agent` is
+behind in content, not ahead, and still carries only the retained granular
+history. `main` is the newest lineage; branched from it.
+
+**Reasoning.** 308 is a PERMANENT redirect, and browsers and shared caches may
+keep it indefinitely. Rollback for this whole migration is "unset the two env
+vars and redeploy" — but a cached 308 is client-side state that the rollback
+cannot reach. A client holding one for `/pipeline` would keep bouncing itself
+to `/followup/pipeline`, which 404s the moment the prefix is withdrawn, and no
+server-side action would clear it. 307 is the temporary sibling: **identical**
+method-and-body preservation semantics, which is the only property the repair
+needs, without the permanence. This is the same reasoning Bundle 2 applied
+when it chose 302 over 301 for the bare-prefix redirect; L1 diverged from it
+and is now brought back in line.
+
+**Files to be touched — 4** (1 behavioral line, the rest comment-only)
+
+| File | Change |
+|---|---|
+| `api-server/src/app.ts` | `res.redirect(308, …)` → `res.redirect(307, …)`. **The only behavioral change in this order.** Plus the four comment lines naming 308 |
+| `api-server/src/lib/appUrls.ts` | one comment line naming 308 |
+| `api-server/src/tests/test-base-path.ts` | three comment/assert-message lines naming 308 |
+| `TODO.md` | this entry, the ledger entry, and retiring the accepted-risk Open item |
+
+Comments are updated in the same change on purpose: leaving them saying "308"
+would make the code contradict its own documentation, which is how the next
+person reintroduces the permanence.
+
+**Behaviors affected:** the status code of the legacy → prefixed redirect, and
+nothing else. Not the target, not the query handling, not which paths match,
+not the `/api` exclusion, not the client-side redirect, not the dark path
+(the whole rule stays gated on `PREFIXED`).
+
+**Worst realistic failure:** 307 and 308 are not interchangeable for every
+client. 308 was standardised later (RFC 7538) than 307 (RFC 7231), so if
+anything, 307 has the broader support — but a client that treats an unknown
+3xx as a hard error would be a regression. The mitigating fact is that the
+only callers reaching this rule are browsers: `/api` is excluded, so no
+machine caller can ever receive it. Verified in the smoke rather than assumed:
+the POST probe must still arrive at the prefixed path as a POST.
+
+**Rollback:** change the digit back, or `git revert`. Unsetting the env vars
+still disables the whole rule. Nothing is deployed by this work.
+
+### 2026-08-02 — Repair L1a: legacy redirect 308 → 307 — DONE
+
+Predicted 4 files, touched 4. One behavioral character; everything else is
+documentation kept true. Not deployed; ready to publish.
+
+```
+-    res.redirect(308, `${target}${query}`);
++    res.redirect(307, `${target}${query}`);
+```
+
+**Why 307 is the right code, not a compromise.** 307 and 308 are the same
+guarantee about the method — both forbid the client from rewriting a POST into
+a GET, which is the only property this rule needs. They differ only in
+permanence, and permanence is precisely the property that made the rule
+unsafe: a 308 is cached client-side, and no server-side rollback can reach a
+client's cache. 302 was not an option: it *permits* the method downgrade.
+
+**The risk was retired before it was taken.** L1 was merged but never
+published — `git log e1766f1..main` contains no "Published your App" commit —
+so the deployment has never emitted a 308 and no client anywhere holds one
+cached. L1a lands before the first deploy that would have created one, which
+is what makes this a clean retirement rather than a partial one.
+
+**Gates**
+
+| Gate | Result |
+|---|---|
+| typecheck | PASS |
+| tests | 789/789 across 34 files (unchanged — no test asserts a status; see Open items) |
+| build, no `PORT`/`BASE_PATH`/`PUBLIC_URL` exported | PASS, exit 0 |
+
+**Godlike audit — 2 rounds, closed clean on round 2.**
+- *Round 1, 2 findings.* (i) **Recorded, deliberately not fixed:** nothing in
+  the repo pins the status code, so a regression to 308 or 302 would pass
+  every gate — but pinning it needs a booted app, which the unit-test file
+  deliberately avoids, and this order's scope was one digit. Logged in Open
+  items. (ii) **Fixed:** the reflowed comment in the `/api` mount lock left a
+  ragged two-line wrap; rejoined.
+- *Round 2 (added), clean.* Diff re-read, gates re-run, both smokes re-run on
+  the final code.
+
+**SMOKE — LIT (5721), 31/31, plus the method proof this order asked for**
+
+| Check | Result |
+|---|---|
+| raw `POST /l1a-post-probe?q=1` | **307**, `Location: /followup/l1a-post-probe?q=1` |
+| the POST **arrives** as a POST | access log, both hops: `POST /l1a-post-probe` then `POST /followup/l1a-post-probe` — the method survived the redirect |
+| raw `GET`, raw `PUT` | 307, correct prefixed target |
+| `/`, `/pipeline`, `/accounts`, `/favicon.svg`, `/followupper` | 307 → prefixed, 1 hop, final 200 |
+| no 308 anywhere on the LIT surface | confirmed |
+| everything else from the L1 suite | unchanged: 9 add-on paths + both OAuth callbacks + `/api/healthz` reach handlers with **0** answering 3xx; loop guard holds; hostile paths stay on-origin; 3/3 assets resolve; missing asset still an honest 404 |
+
+**SMOKE — DARK (5722) vs `main`/L1 (5723): byte-for-byte identical across all
+36 probes.** Expected — the rule is gated on `PREFIXED` — and verified rather
+than assumed. Also re-compared against the ORIGINAL pre-L1 baseline captured
+during L1: **`cmp` reports the 44 recorded lines identical**, so the dark path
+is still exactly what it was before either repair. In dark mode `/` is still
+200 (API test console), `/pipeline` and `/accounts` still 404, and no legacy
+path answers 3xx.
+
+**Blast radius held.** No database, cron, doctrine, add-on, dashboard,
+`.replit`, `artifact.toml` or dependency changes; the client-side redirect was
+not touched. No email dispatched — `app.ts` booted directly in every smoke, so
+`startCronJobs()` never ran. No workflow was running and none was touched;
+ports 5721/5722/5723 were used and all were shut down by PID.
+
+**Lineage note worth keeping.** The shorthand L1 used for Git safety rule 1 —
+"`replit-agent`'s tree equals `main`'s tree" — went stale the moment `main`
+took a commit `replit-agent` lacked, and reported a false alarm at the start of
+this order. The durable form of the check is directional: *does another branch
+hold content `main` lacks?* Answered with `git diff replit-agent main` (only
+the five L1 files) and by confirming `replit-agent`'s tree equals `main`'s
+PARENT. Use the directional form from here on.
 
 ### 2026-08-02 — Repair L1: legacy address survival, post-cutover — BLAST RADIUS (pre-edit)
 
