@@ -302,10 +302,14 @@ router.post("/admin/salvage", async (req: Request, res: Response) => {
           mode,
         });
 
+        // F-3.6a: operator-triggered salvage — overrides the retry policy,
+        // but queueStageForProspect still refuses an auth-dead owner (it
+        // resolves that itself when the option is omitted).
         const { queued } = await queueStageForProspect(
           s.prospect.id,
           s.nextStage,
           scheduledAt,
+          { automatic: false },
         );
         if (queued) queued_new++;
       } catch (err) {

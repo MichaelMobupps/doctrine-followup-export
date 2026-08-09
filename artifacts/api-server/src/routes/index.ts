@@ -27,6 +27,9 @@ import adminDailyBudgetRouter from "./admin-daily-budget";
 import adminCompanyCascadeRouter from "./admin-company-cascade";
 // Admin suppression-list controls.
 import adminSuppressionRouter from "./admin-suppression";
+// F-3.6a: admin read surface over cron_heartbeats — written since Phase 7n,
+// readable by nothing until this order. Closes the F-D4 liveness gap.
+import adminCronHeartbeatsRouter from "./admin-cron-heartbeats";
 // B9b: AntiGhosting Followuper marking flow.
 import antiGhostingRouter from "./anti-ghosting";
 
@@ -64,5 +67,6 @@ router.use(adminGlobalControlsRouter);
 router.use(adminDailyBudgetRouter);
 router.use(adminCompanyCascadeRouter);
 router.use(adminSuppressionRouter);
+router.use(adminCronHeartbeatsRouter);
 
 export default router;

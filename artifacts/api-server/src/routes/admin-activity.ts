@@ -32,6 +32,9 @@ import { and, eq, gte, lte, desc, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 import { requireAdmin } from "../middlewares/requireAdmin";
+// F-3.6a: the retry budget, so the "held" count means the same thing here as
+// it does in the policy that produces it.
+import { MAX_AUTO_RETRIES } from "../lib/retryPolicy";
 
 const router = Router();
 
@@ -191,6 +194,38 @@ router.get("/admin/activity", async (req: Request, res: Response) => {
       .from(followupsTable)
       .where(eq(followupsTable.status, "generating")))[0];
 
+    // Q7b (F-3.6a) — failed rows, by reason, live.
+    //
+    // Before this order these counts were structurally meaningless: a failed
+    // row was revived and wiped by the next auto-queue pass within 15
+    // minutes, so the whole fleet showed two of them on 2026-08-09 while six
+    // accounts were failing every send they attempted. Now failures persist,
+    // and this is where an operator sees them.
+    //
+    // `held` is the subset the next automatic sweep will NOT pick up as
+    // things stand: retries spent, or a reason the policy refuses. Note the
+    // `auth_dead` rows in it are held only while their owner's grant is
+    // dead — those resume by themselves on reconnect, and leave this census
+    // when they do. `stranded` and `retries_exhausted` are the ones that
+    // genuinely want a human.
+    const failedRows = await db
+      .select({
+        failure_reason: followupsTable.failureReason,
+        count: sql<number>`count(*)::int`,
+        held: sql<number>`count(*) filter (where ${followupsTable.retryCount} >= ${MAX_AUTO_RETRIES} or ${followupsTable.failureReason} in ('stranded', 'auth_dead'))::int`,
+      })
+      .from(followupsTable)
+      .where(eq(followupsTable.status, "failed"))
+      .groupBy(followupsTable.failureReason);
+
+    const failures = {
+      total: failedRows.reduce((acc, r) => acc + r.count, 0),
+      held: failedRows.reduce((acc, r) => acc + r.held, 0),
+      by_reason: Object.fromEntries(
+        failedRows.map((r) => [r.failure_reason ?? "unclassified", r.count]),
+      ) as Record<string, number>,
+    };
+
     // Q8 — full user list for filter UI dropdown (independent of window).
     // B7u: paused_by_admin in users response so the dashboard can show
     // pause/resume buttons in the correct state.
@@ -273,6 +308,9 @@ router.get("/admin/activity", async (req: Request, res: Response) => {
         app: appFilter,
       },
       active_generations: activeRow?.count ?? 0,
+      // F-3.6a: live failed-row census. Not window-filtered — a failure that
+      // has been sitting for a week is exactly the one worth seeing.
+      failures,
       totals: {
         events: totalsRow.events,
         followups: totalsRow.followups,
@@ -300,6 +338,11 @@ export default router;
   "window": { "since": "...", "until": "..." },
   "filter": { "user_id": null, "app": null },
   "active_generations": 0,
+  "failures": {
+    "total": 3,
+    "held": 3,
+    "by_reason": { "stranded": 2, "auth_dead": 1 }
+  },
   "totals": {
     "events": 2,
     "followups": 1,

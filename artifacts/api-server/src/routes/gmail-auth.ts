@@ -16,6 +16,8 @@ import { HARD_FOLLOWUP_CAP } from "../lib/followupLimits";
 // same-origin RELATIVE today and stay relative, unlike the login callback
 // in auth.ts which prefixes the configured public origin.
 import { publicUrl, appPath } from "../lib/appUrls";
+// F-3.6a: the connection-health vocabulary. Pure; see lib/connectionHealth.ts.
+import { connectionState, authDeadMessage } from "../lib/connectionHealth";
 
 const router = Router();
 
@@ -82,6 +84,12 @@ const ACCOUNT_SELECT = {
   // Activity page. Surfacing it here lets the dashboard warn the
   // operator on their own pages.
   pausedByAdmin: usersTable.pausedByAdmin,
+  // F-3.6a: the auth-dead state. Six accounts reported CONNECTED here on
+  // 2026-08-09 while Google refused every one of their grants; this is the
+  // column that stops that lie, and the two derived fields below are what
+  // the Accounts page actually renders.
+  authDeadAt: usersTable.authDeadAt,
+  authDeadReason: usersTable.authDeadReason,
 } as const;
 
 router.get("/gmail/auth", authMiddleware, async (req: Request, res: Response) => {
@@ -178,10 +186,19 @@ router.get("/gmail/callback", async (req: Request, res: Response) => {
           googleRefreshToken: tokens.refresh_token,
           isConnected: true,
           name: name || existing[0].name,
+          // F-3.6a: a successful reconnect clears the auth-dead state
+          // immediately. Waiting for the next sync tick to notice would
+          // leave the operator staring at "dead since …" for up to 15
+          // minutes after doing exactly what the message asked them to do.
+          authDeadAt: null,
+          authDeadReason: null,
           updatedAt: new Date(),
         })
         .where(sql`LOWER(${usersTable.email}) = ${email}`);
-      logger.info({ email }, "Reconnected Gmail account via OAuth");
+      logger.info(
+        { email, clearedAuthDead: Boolean(existing[0].authDeadAt) },
+        "Reconnected Gmail account via OAuth",
+      );
     } else {
       await db.insert(usersTable).values({
         email,
@@ -203,7 +220,16 @@ router.get("/gmail/callback", async (req: Request, res: Response) => {
 router.get("/gmail/accounts", authMiddleware, async (_req: Request, res: Response) => {
   try {
     const users = await db.select(ACCOUNT_SELECT).from(usersTable).orderBy(usersTable.createdAt);
-    res.json({ accounts: users });
+    // F-3.6a: derive the state and the sentence server-side so the dashboard,
+    // the add-on and any future client all say the same thing. `isConnected`
+    // is left exactly as it was for backward compatibility — an old add-on
+    // build keeps working — and the new truth rides alongside it.
+    const accounts = users.map((u) => ({
+      ...u,
+      connectionState: connectionState(u),
+      authDeadMessage: authDeadMessage(u.authDeadAt),
+    }));
+    res.json({ accounts });
   } catch (err) {
     logger.error({ err }, "Failed to list accounts");
     res.status(500).json({ error: "Failed to list accounts" });
@@ -222,6 +248,12 @@ router.delete("/gmail/accounts/:id", authMiddleware, async (req: Request, res: R
       .set({
         googleRefreshToken: null,
         isConnected: false,
+        // F-3.6a: an explicit disconnect clears auth-dead too. There is no
+        // grant left to be dead, and connectionState() gives disconnect
+        // precedence anyway — leaving the columns set would only put stale
+        // "dead since …" data behind a state that no longer reads it.
+        authDeadAt: null,
+        authDeadReason: null,
         updatedAt: new Date(),
       })
       .where(eq(usersTable.id, userId));
