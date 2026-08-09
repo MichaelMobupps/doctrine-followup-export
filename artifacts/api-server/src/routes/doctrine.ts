@@ -466,7 +466,7 @@ router.post("/queue", async (req: Request, res: Response) => {
 
     for (const [pid, scheduledAt] of schedule) {
       try {
-        const { queued: didQueue } = await queueStageForProspect(pid, stage, new Date(scheduledAt));
+        const { queued: didQueue } = await queueStageForProspect(pid, stage, new Date(scheduledAt), { automatic: false });
         if (didQueue) {
           queued++;
           if (!earliest || scheduledAt < earliest) earliest = scheduledAt;
@@ -525,7 +525,7 @@ router.post("/queue-batch", async (req: Request, res: Response) => {
 
     for (const [pid, scheduledAt] of schedule) {
       try {
-        const { queued: didQueue } = await queueStageForProspect(pid, stage, new Date(scheduledAt));
+        const { queued: didQueue } = await queueStageForProspect(pid, stage, new Date(scheduledAt), { automatic: false });
         if (didQueue) {
           queued++;
           if (!earliest || scheduledAt < earliest) earliest = scheduledAt;
@@ -1255,7 +1255,7 @@ router.post("/prospect/resume-bulk", async (req: Request, res: Response) => {
             mode: user?.followupMode === "draft_in_gmail" ? "draft_in_gmail" : "auto_send",
           });
 
-          const { queued: didQueue } = await queueStageForProspect(p.id, nextStage, scheduledAt);
+          const { queued: didQueue } = await queueStageForProspect(p.id, nextStage, scheduledAt, { automatic: false });
           if (didQueue) queued_new++;
         }
       }
@@ -1336,7 +1336,7 @@ router.post("/prospect/:id/resume", async (req: Request, res: Response) => {
           mode: user?.followupMode === "draft_in_gmail" ? "draft_in_gmail" : "auto_send",
         });
 
-        const { queued: didQueue } = await queueStageForProspect(prospectId, nextStage, scheduledAt);
+        const { queued: didQueue } = await queueStageForProspect(prospectId, nextStage, scheduledAt, { automatic: false });
         if (didQueue) queued_stage = nextStage;
       }
     }

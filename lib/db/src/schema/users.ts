@@ -59,6 +59,33 @@ export const usersTable = pgTable("users", {
   // entirely (no auto-queueing, no processing of queued follow-ups).
   // Existing queued rows are left in place and resume when unpaused.
   pausedByAdmin: boolean("paused_by_admin").notNull().default(false),
+
+  // F-3.6a: the auth-dead state. DISTINCT from isConnected.
+  //
+  // isConnected=false means "there is no grant" — the user disconnected, or
+  // never connected. auth_dead_at means "a grant exists and Google refuses
+  // it": invalid_grant / invalid_client / unauthorized_client. Before this
+  // column the two were indistinguishable, so six accounts whose grants died
+  // around 2026-07-31 kept reporting CONNECTED, kept auto-queueing, and
+  // burned 75% of a week's LLM spend generating follow-ups that could never
+  // be sent (F-D4, 2026-08-09).
+  //
+  // Kept as a separate nullable timestamp rather than flipping isConnected
+  // so that (a) the operator sees WHY and SINCE WHEN, not just "gone", and
+  // (b) the refresh token is preserved — the grant is dead, not withdrawn,
+  // and nothing here should discard evidence.
+  //
+  // NULL = healthy. Non-null = dead since that instant. Any successful sync
+  // pass or probe for the user clears it, so a transient misclassification
+  // self-heals on the next 15-minute tick.
+  authDeadAt: timestamp("auth_dead_at", { withTimezone: true }),
+  // WHICH grant failure it was, as a CLOSED vocabulary —
+  // "unauthorized_client" | "invalid_grant" | "invalid_client" |
+  // "deleted_client" | "auth_rejected". Never the raw provider string:
+  // classifyAuthReason() in api-server's lib/connectionHealth.ts maps the
+  // error onto that set before it is ever stored, so nothing an external
+  // system controls reaches this column or the page that renders it.
+  authDeadReason: text("auth_dead_reason"),
   followupMode: text("followup_mode").$type<FollowupMode>().notNull().default("auto_send"),
   draftStageTiming: jsonb("draft_stage_timing").$type<StageTiming[]>().notNull().default(DEFAULT_DRAFT_STAGE_TIMING),
   // Phase 3c: one-time confirmation gate for the first switch to Draft mode.
@@ -80,6 +107,11 @@ export const usersTable = pgTable("users", {
 }, (table) => [
   uniqueIndex("idx_users_email").on(table.email),
   index("idx_users_connected").on(table.isConnected),
+  // F-3.6a: read on every due-query pass. Declared here so drizzle-kit does
+  // NOT diff it as undeclared and churn a DROP/CREATE on every Republish —
+  // see the same note on cron_heartbeats. The startup migration creates
+  // exactly this shape (plain, not partial); the two must stay identical.
+  index("idx_users_auth_dead").on(table.authDeadAt),
 ]);
 
 export const insertUserSchema = createInsertSchema(usersTable).omit({ id: true, createdAt: true, updatedAt: true });

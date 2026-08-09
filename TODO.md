@@ -2,6 +2,51 @@
 
 ## Open items
 
+- **[F-3.6a, out of scope — DELETE, do not harden] The zero-users legacy sync
+  branch.** `runAllUsersSync()` falls back to `syncForLegacyUser()` when NO
+  user is `is_connected`. That path swallows every per-message ingest error
+  with a log line (`gmailSync.ts:1009-1012`), returns no `failed` count, and
+  hands back `perUser: []` — so the cron's failure detector finds nothing and
+  writes `outcome: "ok"` with `details.synced = 0`. It is the original
+  ok-with-synced:0 shape, still armed: `GOOGLE_REFRESH_TOKEN` and
+  `SENDER_EMAIL` are both set in the deployment. Dormant today (12 connected
+  users). F-3.6a was told to record it rather than harden it. **The fix is
+  deletion, not instrumentation** — the multi-user path has had per-message
+  isolation, a `failed` counter and per-user outcomes since the sync
+  hardening, and there is no scenario in which falling back to one shared
+  env-var mailbox is the desired behaviour for a twelve-person team.
+
+- **[F-3.6a, out of scope, found by the smoke] A prospect with
+  `user_id = NULL` still sends through the legacy env-var mailbox.** The
+  first run of `smoke-f36a.ts` seeded a null-user prospect expecting it to be
+  skipped. It was not: a legacy row has no user, so `gmail` stays undefined,
+  `senderEmail` falls back to `process.env.SENDER_EMAIL`, and
+  `sendFollowupReply` falls back to `GOOGLE_REFRESH_TOKEN`. The row went to
+  Google and returned "Invalid thread_id value" — nothing was delivered, but
+  a real vendor call left a smoke that claimed to make none. In production
+  both variables are set, so any null-user prospect that becomes due today
+  will be **sent from michael.a.g@, not from its owner**. Same family as the
+  item above and it should die with it. F-3.6a fixed only its own smoke (the
+  script now deletes the three variables before importing anything).
+
+- **[F-3.6a, out of scope] `queueStageForProspect` ignores `cycle`.** Its
+  lookup filters `(prospect_id, stage)` with `.limit(1)` and no `ORDER BY`,
+  while the unique constraint has been `(prospect_id, cycle, stage)` since
+  B9a. For an AntiGhosting prospect on cycle 2, the row it finds may be the
+  cycle-1 row — and if that row is `sent`, the function returns
+  `{queued:false}` and the cycle-2 stage is never queued. Doctrine and
+  Context are unaffected (everything is cycle 1). Pre-existing; F-3.6a
+  touched the failed-row branch of this function and deliberately did not
+  widen into the cycle question.
+
+- **[F-3.6a, observation] `cron_heartbeats` is created by `drizzle-kit push`,
+  not by `runStartupMigrations`.** Every other table the server depends on is
+  created by the startup migration; this one predates that file. It exists in
+  both real databases, so the new read endpoint works — but a fresh database
+  brought up by boot alone would not have it, and the endpoint would 500.
+  Deliberately not "fixed": adding a second definition of a table `push`
+  already owns is how the index churn documented on `cron_heartbeats` starts.
+
 - **[RESOLVED by L1a, 2026-08-02] A cached 308 outlives the prefix.** The
   legacy redirect is now a **307**: identical method-and-body preservation,
   temporary rather than permanent, so nothing survives in a client cache that
@@ -154,6 +199,260 @@ Notes:
   Pub/Sub topics exist in this codebase.
 
 ## Ledger
+
+### 2026-08-09 — F-3.6a: truth and flow — BLAST RADIUS (pre-edit)
+
+Branch `followupper-f36a-truth-and-flow`, from `main` at `918d996`. Built from
+the F-D4 verdict of the same day. Nothing F-D4 rated healthy is touched:
+windows, caps, bounce handling, durability and the send/generate pipeline
+itself are untouched.
+
+**Lineage check (Git safety rule 1), directional form.** `main` is level with
+`origin/main` (0/0). `git diff <branch> main` for every ref: `replit-agent`
+holds 7 lines main lacks and they are the *superseded* TODO Open-item wording
+that L1b replaced; `snapshot-2026-07-30` / `backup-old-shallow-history` /
+`gitsafe-backup/main` hold `backup.sql`, `sync-dev-db.sql` and the
+pre-Bundle-1 hardcoded URL literals — the same set PA-1 recorded on 08-05 as
+deliberate replacement, not loss. The `bundle-*` / `cutover-*` branches are
+all strict ancestors of today's work. **No ref holds newer content main
+lacks.**
+
+**Files to be touched — 19** (9 new, 10 edited)
+
+| File | Change |
+|---|---|
+| `lib/db/src/schema/users.ts` | +2 columns: `authDeadAt`, `authDeadReason` |
+| `lib/db/src/schema/followups.ts` | +3 columns: `retryCount`, `failureReason`, `errorHistory` |
+| `api-server/src/lib/startupMigrations.ts` | +6 idempotent statements for the above |
+| `api-server/src/lib/connectionHealth.ts` | NEW — pure connection-state machine (no db import) |
+| `api-server/src/lib/retryPolicy.ts` | NEW — pure retry decision + error-history append (no db import) |
+| `api-server/src/lib/dueEligibility.ts` | NEW — pure due-batch eligibility predicate (no db import) |
+| `api-server/src/lib/strandedGenerating.ts` | NEW — pure stranded classifier (no db import) |
+| `api-server/src/lib/heartbeatView.ts` | NEW — pure query parse + details redaction (no db import) |
+| `api-server/src/lib/authProbe.ts` | NEW — one cheap Gmail profile read, injectable |
+| `api-server/src/services/gmailSync.ts` | mark / clear auth-dead from the per-user outcome |
+| `api-server/src/services/scheduler.ts` | due-query exclusion; retry policy replaces the amnesia revive; stranded rows get teeth |
+| `api-server/src/routes/gmail-auth.ts` | surface auth-dead on `/gmail/accounts`; reconnect clears it |
+| `api-server/src/routes/admin-cron-heartbeats.ts` | NEW — admin-authed heartbeat read |
+| `api-server/src/routes/admin-activity.ts` | +failed-row counts on the admin surface |
+| `api-server/src/routes/index.ts` | mount the new router |
+| `api-server/src/lib/deployRecovery.ts` | NEW — the two named deploy-time passes |
+| `api-server/src/index.ts` | call the deploy-time recovery after listen |
+| `dashboard/src/pages/accounts.tsx` | plain-words dead-grant badge + reconnect line |
+| `api-server/src/tests/*` | 5 NEW hermetic suites |
+
+**Schema deltas — 6 statements, every one additive, nullable-or-defaulted, and
+invisible to the previous code**
+
+| Statement | Rollback |
+|---|---|
+| `ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_dead_at TIMESTAMPTZ` | `DROP COLUMN`, or leave — pre-F-3.6a code never selects it |
+| `ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_dead_reason TEXT` | same |
+| `ALTER TABLE followups ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0` | same |
+| `ALTER TABLE followups ADD COLUMN IF NOT EXISTS failure_reason TEXT` | same |
+| `ALTER TABLE followups ADD COLUMN IF NOT EXISTS error_history JSONB` | same |
+| `CREATE INDEX IF NOT EXISTS idx_users_auth_dead ON users(auth_dead_at) WHERE auth_dead_at IS NOT NULL` | `DROP INDEX` |
+
+No column is dropped, renamed, retyped or made NOT NULL without a default, so
+a code rollback needs no schema rollback: the previous build simply stops
+reading five columns it never knew about. This is the same property the
+migration rules have required since B7u.
+
+**Behaviors affected**
+
+1. A user whose grant Google rejects gets a distinct `auth_dead` state — not a
+   disconnect — and stops generating until it heals.
+2. A failed follow-up keeps its status, error and generated content; revival
+   becomes a bounded policy (≤2 automatic retries) instead of a 15-minute wipe.
+3. The due query stops handing slots to held rows.
+4. Rows stranded in `generating` past 6h become failed-with-reason instead of
+   freezing their campaign forever.
+5. `cron_heartbeats` becomes readable by an admin.
+
+**Worst realistic failure — seven ways this could go wrong, each pre-mitigated**
+
+1. **The due-query join silently drops legacy rows.** `prospects.user_id` is
+   nullable. An INNER JOIN to `users` would stop processing every user-less
+   row without a single error. Mitigation: LEFT JOIN plus
+   `user_id IS NULL OR (not paused AND not auth-dead)`, and the starvation
+   fixture carries a null-user row that must survive.
+2. **Auth-dead marks a healthy account.** A transient Gmail 5xx or a quota
+   error misread as an auth failure would pause a working sender. Mitigation:
+   the mark uses `isAuthError()` — the predicate already in production, matching
+   only `invalid_grant|invalid_client|unauthorized_client` — and *any*
+   successful sync or probe for that user clears the state on the next tick, so
+   a false positive self-heals within 15 minutes and costs no send.
+3. **Retries exhaust and rows stick forever.** If `retry_count` were bumped on
+   a non-failure path, every row would reach the cap and stop. Mitigation: the
+   counter increments only on the failed→queued transition, the decision is a
+   pure function with its own suite, and a row at the cap is *visible* on the
+   admin surface rather than silent — which is the whole point of the order.
+4. **Error history grows without bound.** A pathological loop could append
+   forever. Mitigation: the history is capped at the most recent 10 entries.
+5. **The heartbeat endpoint leaks.** `details.perUser` carries user emails and
+   raw provider error strings. Mitigation: an explicit redaction pass over
+   token-shaped keys and values, on top of the double gate every `/api/admin`
+   route already has (ADDON_API_KEY *then* ADMIN_API_KEY).
+6. **The deploy-time probe slows or breaks boot.** Mitigation: it runs
+   fire-and-forget *after* `listen()`, sequentially, each user in its own
+   try/catch, and can only ever mark — never send, never generate, never
+   delete.
+7. **Stranded recovery fails healthy in-flight work.** A generation legitimately
+   takes minutes. Mitigation: the 6h RH-1 threshold is unchanged, and the write
+   is a CAS matching `status='generating'` AND the age predicate, so a row that
+   completed between read and write is never touched.
+
+**Not touched, deliberately:** user 8's two July DB-error `failed` rows (the
+order leaves them); the legacy zero-users sync branch (recorded as an open item
+to delete, not hardened); windows, caps, user 10's personal window; the OAuth
+client and anything in Google Cloud.
+
+**Rollback:** `git revert` the merge. The five columns and one index stay and
+are ignored. The only data this order writes are (a) `auth_dead_at` marks,
+which a reconnect or a healthy sync clears, and (b) the stranded `generating`
+rows moved to `failed`, which is strictly more recoverable than the frozen
+state they are in now.
+
+### 2026-08-09 — F-3.6a: truth and flow — DONE
+
+Branch `followupper-f36a-truth-and-flow`. **Predicted 19 rows / ~24 files;
+touched 27** (14 new, 13 edited). The three beyond the prediction:
+`lib/authProbe.ts` and `lib/deployRecovery.ts` were folded into the "9 new"
+count as one row each and are listed there; the genuine addition is
+`src/scripts/smoke-f36a.ts`, the live smoke — the ritual requires one and the
+repo keeps smokes in `src/scripts/`, so it is committed rather than thrown
+away.
+
+**Gates.** typecheck ✅ · **934 assertions across 41 files, 0 failures** ✅ ·
+build ✅ (api-server esbuild + dashboard vite). The 934 includes 141 new ones
+in five suites.
+
+**What shipped, against the five scoped items**
+
+| Item | As built |
+|---|---|
+| 1. Auth truth | `users.auth_dead_at` / `auth_dead_reason` — a THIRD state, not a disconnect. Marked by the sync's Phase C and by the send path (`IS NULL`-guarded so the first date survives). Cleared by positive proof of health only. Surfaced as `connectionState` + `authDeadMessage` on `/api/gmail/accounts`, and as an AUTH-DEAD badge + "Gmail connection dead since <date> — reconnect" + a Reconnect button on the Accounts page. Auto-queue, the due query and `queueStageForProspect` all refuse a dead account. Reconnect and disconnect both clear it. |
+| 2. Failures keep evidence | `retry_count`, `failure_reason`, `error_history`. `decideFailedRowAction` allows **2** automatic retries, then holds the row `failed` and visible. `auth_dead` rows are not retried at all and spend no strike; `stranded` is terminal. Revival preserves errorMessage, both generated fields, and the Gmail ids — only status, scheduledAt, retryCount and errorHistory move. Counted on `/api/admin/activity` as `failures.{total,held,by_reason}`. |
+| 3. Scheduler flow | Held users excluded at SELECT time via a **LEFT** join (`user_id IS NULL OR (not paused AND not auth-dead)`). Ordering and the 20-row batch unchanged. |
+| 4. Stranded gets teeth | `generating` past 6h → `failed` + reason `stranded`, evidence written, CAS'd on status AND age. Campaign unfreezes; the row is never auto-retried. |
+| 5. Heartbeats readable | `GET /api/admin/cron-heartbeats` — latest N plus a per-tick `seconds_since_last` / `ticks_24h` / `errors_24h` rollup. Two keys (ADDON then ADMIN). Every `details` payload redacted. |
+
+**The state machine, as built.** `connectionState()` returns exactly one of
+`connected` / `auth_dead` / `disconnected`; **disconnect wins over
+auth-dead** (no grant left to be dead). Transitions take a THREE-way signal,
+and that split is the load-bearing part: `auth_failure` (isAuthError matched)
+marks dead; `healthy` (the ingest phase completed, so Gmail demonstrably
+answered) clears; `inconclusive` (any other error — a DB write, the
+summarizer) changes nothing in **either** direction. Treating "not an auth
+error" as health would clear a genuinely dead grant on the first database
+hiccup. Six cases, only two of which write: an already-dead account is not
+rewritten (the first date is the actionable one and rewriting churns the row
+every 15 minutes), and a healthy account writes nothing at all.
+
+**Retry policy, as built**
+
+| Row state | Automatic sweep | Human (buttons, salvage, resume) |
+|---|---|---|
+| `failed`, reason `send_error`, retries 0–1 | retry, strike spent | retry |
+| `failed`, reason `send_error`, retries ≥ 2 | **hold** `retries_exhausted` | retry (override) |
+| `failed`, reason `auth_dead`, owner still dead | **hold** `auth_dead` | **hold** — not overridable |
+| `failed`, reason `auth_dead`, owner healed | retry, **no strike spent** | retry |
+| `failed`, reason `stranded` | **hold** `stranded_needs_human` | retry (override, after checking the thread) |
+| `cancelled` | revived and cleared, exactly as before | same |
+
+`auth_dead` is the one hold a human cannot push through, because pressing the
+button harder does not make a refused token work — and a reconnect clears the
+state, and therefore the guard, instantly.
+
+**Deploy-time effect, predicted**
+
+- The probe pass marks the six accounts F-D4 named — denise(3), murat(5),
+  kirk(6), marissa(8), nino(13), kevin.cowen(15) — AUTH-DEAD on first boot,
+  each with the reason Google gave. They stop generating immediately. On the
+  evidence of the F-D4 week that stops ~196 unsendable generations and
+  ~$4.45 of ~$5.95 weekly LLM spend, and the six stop reporting CONNECTED.
+- The stranded pass moves the rows frozen since 2026-07-21 (`28338`) and
+  07-28 (`34334`) — three by the unfiltered count, the third on an archived
+  prospect — from invisible-`generating` to visible-`failed`/`stranded`,
+  unfreezing those campaigns without resending anything.
+- Marissa's 15 rows stop occupying 15 of every 20 due slots. Nothing of hers
+  is cancelled; it all comes back when she is resumed.
+- User 8's two July DB-error rows are untouched, as the order required:
+  `retry_count` defaults to 0, and no auto-queue pass reaches an
+  admin-paused account.
+
+**Ritual: audit rounds.** Five rounds; the first four found something, the
+fifth was clean.
+
+1. **Orphaned doc block** — `markUserAuthDead`'s comment had detached and was
+   sitting above a different function. Reattached.
+2. **A duplicate-email hole the order did not name.** The catch classified
+   every non-auth throw as `send_error`, which is retryable — including a
+   throw from the status write that runs AFTER `sendFollowupReply` has
+   already delivered. Retrying that row puts a second copy in a client's
+   inbox. Fixed by recording a `gmailArtifactId` the moment anything reaches
+   Gmail and classifying such failures `stranded`, which the policy refuses.
+   Extracted as `classifyProcessingFailure()` and covered by 6 new cases.
+   Strictly better than before either way — that row used to be revived every
+   15 minutes, unbounded.
+3. **`failures.held` overstated.** `auth_dead` rows are held only while their
+   owner is dead. Left as-is (it self-corrects on reconnect) but the comment
+   now says so instead of implying they need a human.
+4. **Index churn.** The drizzle declaration was a plain index and the
+   migration created a PARTIAL one. That mismatch is exactly what the
+   `cron_heartbeats` comment records being bitten by — drizzle-kit diffs it
+   as undeclared and churns a DROP/CREATE on every Republish. Migration
+   changed to plain so the two are identical, and the smoke asserts it.
+   Also: `auth_dead_reason` was documented as "free text from the provider"
+   when `classifyAuthReason()` in fact maps it onto a closed five-value set
+   before storage. The comment was wrong in a security-relevant direction and
+   is corrected.
+5. Clean. No `console.log`, no `debugger`, no secret values, no stray `any`
+   beyond the two the dashboard already uses for this account type.
+
+**Ritual: mutation proof.** `test-due-starvation.ts` — 21 cases, green.
+Reintroducing the defect three ways, each reverted immediately:
+
+| Mutation | Result |
+|---|---|
+| force `excludeHeld = false` (delete the held-user exclusion) | **5 fail** |
+| `isUserHeld` returns `userPausedByAdmin` only (drop the auth-dead half) | **2 fail** |
+| `isUserHeld` returns true for a null `user_id` (the INNER JOIN) | **3 fail** |
+
+The fixture is the 2026-08-09 queue at scale: 15 admin-paused rows dated
+07-30→08-03, 5 cascade-paused, 159 healthy behind them. Under the old rules
+it selects 20 and can process 5 — **75% of every pass thrown away, the same
+15 rows, for ever**. Under the new ones: 20 selected, 20 processable.
+
+**Ritual: smoke.** `src/scripts/smoke-f36a.ts` against an isolated
+`f36a_smoke` database (dropped afterwards), started from a **pre-F-3.6a
+schema** so the migration itself was exercised. 33 checks, all passing, in
+both modes.
+
+The first run **failed 5 checks and made a real Gmail call**, and that is the
+most useful thing the smoke did. A fixture prospect with `user_id = NULL`
+does not hit the "Gmail credentials unavailable" guard — a legacy row has no
+user, so the send falls through to `GOOGLE_REFRESH_TOKEN` + `SENDER_EMAIL`,
+which are set in this workspace. It reached Google and came back "Invalid
+thread_id value". Nothing was delivered and no production data was touched
+(isolated database, fake thread ids), but a smoke that claimed to make no
+vendor call made one. The script now deletes those three variables before it
+imports anything, so it is safe by construction rather than by remembering.
+The underlying production behaviour is recorded in Open items — it is the
+legacy-fallback family, and it should be deleted, not hardened.
+
+**Not touched, as required:** windows, caps, bounce handling, user 10's
+personal window, the OAuth client, the legacy sync branch, user 8's two July
+rows.
+
+**Rollback:** revert the merge. The five columns and the index stay and are
+ignored by the previous build. The only data written are auth-dead marks
+(cleared by a reconnect or a healthy sync) and the stranded rows moved to
+`failed`, which is strictly more recoverable than the frozen state they are
+in now.
+
+**Not deployed.** No publish, no secret change, no production database was
+written by this order.
 
 ### 2026-08-02 — Repair L1b: pin the redirect status code — BLAST RADIUS (pre-edit)
 
@@ -1014,3 +1313,505 @@ was restarted. **This endpoint list is the Bundle 2 baseline:**
 (a join emitting a protocol-relative URL) was found twice by the audit and
 fixed before merge. No database, scheduler, doctrine, or dependency changes.
 `source-code/` untouched; no mirror sync run.
+
+## Provenance audit PA-1 — 2026-08-05
+
+**Verdict: no content has been lost.** Every ref, dangling commit, backup
+directory and dated bundle in this repo was compared against HEAD; every
+difference is accounted for by a recorded commit or a stated policy. Evidence
+limits are listed at the end — none of them is evidence of loss.
+
+### The history-wipe event, reconstructed
+
+- `main` was recreated from scratch on **2026-07-30** as a single snapshot
+  commit `858102c` ("Snapshot 2026-07-30 - fresh history; database dumps
+  excluded"). The pre-amend twin `9f49ade` says why: "previous remote deleted,
+  shallow local history unrecoverable". The old clone was **shallow** —
+  `.git/shallow` pins the boundary at `962d47d` (2026-04-08, "add db backup").
+- The old lineage **survives in full** at `backup-old-shallow-history` =
+  local `snapshot-2026-07-30` = `gitsafe-backup/main` = `da507e9`
+  (2026-07-29 12:53, 342 commits, 2026-04-08 → 2026-07-29).
+- The platform deploy chain (`replit-agent`, 699 commits) **bridges the wipe**:
+  `1b29bc1` (2026-07-31) merges `7630f53` (old-lineage publish) with `cf5725f`
+  (new-lineage publish); `git merge-base replit-agent backup-old-shallow-history`
+  = `da507e9`. The old tree never became unreachable.
+
+### Wipe-boundary diff (the core test)
+
+`git diff da507e9 858102c`: **3 deletions, 0 additions, 1 modification.**
+Deleted: `backup.sql` (−524), `ql "$DATABASE_URL" -c "` (−314, shell-mishap
+junk file), `sync-dev-db.sql` (−36). Modified: `.gitignore` (adds exactly those
+two dump names). Both dumps still exist on disk, untracked. Everything else in
+the old tip's tree entered the snapshot byte-for-byte.
+
+`git diff da507e9 HEAD` (old tip vs today): 38 files, +2498/−978. The 978
+deletions = 874 (the three files above) + ~104 lines of Bundle 1/2/C1/L1
+refactor churn (verified against `git diff origin/snapshot-2026-07-30 HEAD`
+= −104). No app content dropped.
+
+### Per-ref content test (every ref → HEAD, insertions/deletions)
+
+| Ref | vs HEAD | Disposition |
+|---|---|---|
+| backup-old-shallow-history (`da507e9`) | +2498/−978 | fully accounted above |
+| origin/snapshot-2026-07-30 (`858102c`) | +2495/−104 | post-snapshot work only |
+| replit-agent (`1e8049f`) | +303/−7 | HEAD adds L1b test + TODO; deploy lag, expected |
+| bundle-1 / bundle-2 / cutover-c1 / l1 / l1a | net insertions only | ancestors of main |
+| cutover-l1b-pin-status | empty | = HEAD |
+| dangling `845543a`, `79a3619` (2026-05-08 stashes) | — | stash residue; identical file-set landed in `4d413fe` same day |
+| dangling `9f49ade` | same as da507e9 case | pre-amend snapshot twin |
+
+### Path test (every path that ever existed vs HEAD)
+
+1766 paths have ever been tracked on any ref; 1444 exist at HEAD; **322 gone**
+(full list at the end). Every one is: (a) transient patch-staging
+(`_inbox/`, `_apply_staging/`, `pi-hardening/`, `opus48-ag/`,
+`followuper-batch/`, `writer-fallback-chain/`, `structural-lint-batch/`,
+`cascade-qa/`), (b) `.bak` patch backups, (c) stale `source-code/` mirror
+layout (the mirror is a one-way export written by `source-code/sync.sh`; it is
+not what runs), or (d) a deliberate deletion recorded by a commit:
+`followups.tsx` + `prospects.tsx` (pipeline refactor `4d413fe`, 2026-05-08),
+`doctrine-integration/doctrineFollowupLabel.ts` (`f9a290a`, 2026-06-24),
+`lib/db/drizzle/*` (`725f93f`, 2026-05-17),
+`smoke-cache-languages.ts` (`2e96be7`, 2026-06-24).
+**No path disappeared without a recording commit.**
+
+### Peak-line test
+
+All 12 key source files are at their historical maximum line count at HEAD:
+doctrine.ts 1872, anti-ghosting.ts 1772, followupGenerator.ts 671,
+followupPrompts.ts 417, scheduler.ts 1417, gmailSync.ts 1222,
+timingEngine.ts 242, emailSummarizer.ts 305, competitorLibraryData.ts 50683,
+followupExemplarsData.ts 22496, pipeline.tsx 1882, cron.ts 396.
+No file is smaller than it ever was.
+
+### Bundle inventory (step 13) and reconstruction (steps 14–16)
+
+Root zips: batch-resume-bulk (2026-05-11), opus48-antighosting-bundle-v2
+(05-31), cascade-qa-bundle (06-03), pi-hardening (06-04), structural-lint-batch
+(06-10), gemini-model-switch (06-10), doctrine-followup-fixes-round2 (06-11),
+-round4 (06-11), dff-smoke-bundle (06-22), dff-native-script-bundle (06-22),
+payload.zip (06-22). attached_assets: ~60 batch zips 2026-05-08 → 05-19 plus
+followuper-bounce-archive-pause (06-02). Backup dirs: `.ship-backups/`
+(05-31), `backups/dff-exemplar-competitor-2026-06-22*`,
+`_apply_backup_20260602-*`. **No July-dated bundle exists in this repo** —
+the newest archive is 2026-06-22. July work is evidenced in git only
+(old-lineage commits Jul 1–29), all contained in HEAD.
+
+Extracted and diffed vs HEAD: opus48-antighosting-v2 (May 31),
+followuper-bounce-archive-pause (Jun 2), structural-lint-batch (Jun 10),
+dff-native-script-bundle (Jun 22), payload.zip (Jun 22). Result: **zero
+payload paths absent at HEAD, zero functions/constants/routes missing**, every
+file at HEAD strictly newer than or equal to its bundle version.
+`bounceDetection.ts` and `globalPause.ts` are byte-identical to the Jun 2
+bundle. The Jun 2 gmailSync dedup guard survives improved (knownIds prefilter,
+gmailSync.ts:302–372).
+
+### Symptom anchors (Phase 5)
+
+- **v4 lint stages — present, newest ever.** doctrineLint.ts + nativenessV4.ts
+  created 2026-05-14 (five-commit sequence ending `d1461bc` volume
+  plausibility); structuralLint.ts 06-10; competitorScriptLint.ts 06-22;
+  spamRiskLint.ts **07-23** (newest stage). All wired in followupGenerator.ts
+  heal loop (`:527–537`; spam lint import `:23`, call `:535`). File contents at
+  HEAD identical to the old tip.
+- **Discourse marker autofix — never regressed because never wired.**
+  `discourseMarkerAutofix.ts` (2026-05-14) is imported only by
+  `test-discourse-autofix-v4r4.ts` — and `git log --all -S` proves **no commit
+  on any ref ever wired it** into a service or route. Detection
+  (`doctrineLint.ts:414`) + LLM rewrite is, and always was, the design.
+- **Volume calibration — present, unchanged since creation** (2026-05-14),
+  wired at doctrineLint.ts:450–487 and critic criterion 14
+  (followupPrompts.ts:282).
+- **Nativeness — at peak**: nativenessV3.ts 1229 lines, nativenessV4.ts 1559
+  lines, both identical to old tip.
+- **Send caps — never changed → rollback disproven for this symptom.**
+  30/hour, 200/day defaults (sendBudget.ts:55–56) identical since creation
+  2026-05-08. Bulk send-now cap lowered 100→25 on 2026-05-08 (current 25 is
+  the newer value). HARD_FOLLOWUP_CAP=3 unchanged since 06-09.
+  DEFAULT_CAP_USD=500 unchanged since 06-21.
+- **Scheduling window — never changed → rollback disproven.** 8–18 UTC,
+  Mon–Fri defaults identical since 2026-05-08 (timingEngine.ts:97–114,
+  scheduleWindow.ts:19,53–61).
+- **Bounce handling — newest ever.** bounceDetection.ts unchanged since
+  creation 2026-06-02; hard-bounce suppression (gmailSync.ts:529) and pre-send
+  suppression gate (scheduler.ts:230–247) present. `maxHealingIterations`
+  3→2 on 2026-06-24 (`5cfd63d`); current 2 is the newest value.
+
+### What is deployed (Phase 3)
+
+Repo evidence: last platform publish `1e8049f`, 2026-08-02 17:18:06, tree
+identical to main@`5088adb` — L1 + L1a live, **L1b (test-only) merged but
+unpublished**, exactly matching ROADMAP. Local `dist/` is a dev build from
+17:37 that day, not the deployed artifact. `/api/healthz` returns only
+`{status:"ok"}` — no build identity.
+
+### Evidence limits — what the repo cannot settle, and what would
+
+1. **Pre-2026-04-08 commit history**: never in this clone (shallow) and the
+   old origin was deleted. Content as of 04-08 is present (`962d47d` tree);
+   its earlier evolution is not. Would settle: the deleted upstream repo, if
+   Replit support can recover it.
+2. **That the VM actually serves build `1e8049f`**: would settle: Replit
+   Deployments pane build log (commit + timestamp), or adding a version
+   endpoint.
+3. **Add-on deployed version**: `addon/.clasp.json` scriptId is a placeholder.
+   Would settle: Apps Script console version history.
+4. **Env-side rollback mimicry**: deployment secret values are not readable
+   here. Flags that can mimic a rollback: STRUCTURAL_LINT_ENABLED,
+   SPAM_LINT_ENABLED, SPAM_GATE_MODE/ENABLED, SEND_HOUR_START/END,
+   DOCTRINE_HOURLY/DAILY_SEND_CAP, DOCTRINE_DAILY_BUDGET_USD,
+   WRITER_/CRITIC_/SUMMARIZER_PROVIDER, GEMINI_*_MODEL/THINKING,
+   WRITER_EXEMPLAR_COUNT, WRITER_COMPETITOR_COUNT, FOLLOWUP_ACK_LLM_CONFIRM,
+   ADV_SKIP_REWRITE, PROMPT_CACHE_TTL, BASE_PATH. Would settle: the
+   deployment's Secrets pane compared against these code defaults.
+
+### Fragility notes (no action taken, per order)
+
+- The old lineage's survival rests on `backup-old-shallow-history` and the
+  `gitsafe-backup` remote. A tag on `da507e9` would make it robust against
+  branch deletion. Not done in this order.
+- Dangling commits `845543a`/`79a3619`/`9f49ade` are unreachable and will die
+  in a future `git gc`; their content is confirmed redundant.
+- Observed in passing (pre-existing states, not regressions): a duplicate
+  legacy bounce handler in gmailSync.ts (~:1035–1077); doctrine.ts:25–26 keeps
+  a local "0 = unlimited" cap convention that followupLimits.ts says was
+  removed; the 8/18/Mon–Fri defaults are hardcoded in four places.
+
+### Full path set (step 6): 322 paths ever tracked, absent at HEAD
+
+```
+_apply_staging/artifacts/api-server/src/cron.ts
+_apply_staging/artifacts/api-server/src/lib/adminAccess.ts
+_apply_staging/artifacts/api-server/src/lib/bounceDetection.ts
+_apply_staging/artifacts/api-server/src/lib/emailNormalize.ts
+_apply_staging/artifacts/api-server/src/lib/globalPause.ts
+_apply_staging/artifacts/api-server/src/lib/pipelineUserPicker.ts
+_apply_staging/artifacts/api-server/src/lib/startupMigrations.ts
+_apply_staging/artifacts/api-server/src/lib/suppression.ts
+_apply_staging/artifacts/api-server/src/middlewares/requireAdmin.ts
+_apply_staging/artifacts/api-server/src/routes/admin-activity-report.ts
+_apply_staging/artifacts/api-server/src/routes/admin-activity.ts
+_apply_staging/artifacts/api-server/src/routes/admin-global-controls.ts
+_apply_staging/artifacts/api-server/src/routes/admin-prospect-kill.ts
+_apply_staging/artifacts/api-server/src/routes/admin-salvage.ts
+_apply_staging/artifacts/api-server/src/routes/admin-suppression.ts
+_apply_staging/artifacts/api-server/src/routes/admin-user-controls.ts
+_apply_staging/artifacts/api-server/src/routes/admin-user-kill.ts
+_apply_staging/artifacts/api-server/src/routes/anti-ghosting.ts
+_apply_staging/artifacts/api-server/src/routes/auth.ts
+_apply_staging/artifacts/api-server/src/routes/context.ts
+_apply_staging/artifacts/api-server/src/routes/doctrine.ts
+_apply_staging/artifacts/api-server/src/routes/index.ts
+_apply_staging/artifacts/api-server/src/services/gmailClient.ts
+_apply_staging/artifacts/api-server/src/services/gmailSync.ts
+_apply_staging/artifacts/api-server/src/services/scheduler.ts
+_apply_staging/artifacts/api-server/src/services/weeklyDigest.ts
+_apply_staging/artifacts/api-server/src/tests/test-admin-access.ts
+_apply_staging/artifacts/api-server/src/tests/test-bounce-detection.ts
+_apply_staging/artifacts/api-server/src/tests/test-nativeness-v4.ts
+_apply_staging/artifacts/api-server/src/tests/test-pipeline-user-picker.ts
+_apply_staging/artifacts/api-server/src/tests/test-suppression.ts
+_apply_staging/artifacts/dashboard/src/App.tsx
+_apply_staging/artifacts/dashboard/src/components/api-key-provider.tsx
+_apply_staging/artifacts/dashboard/src/components/layout.tsx
+_apply_staging/artifacts/dashboard/src/components/pipeline-user-picker.tsx
+_apply_staging/artifacts/dashboard/src/components/prospect-kill-control.tsx
+_apply_staging/artifacts/dashboard/src/hooks/use-admin.ts
+_apply_staging/artifacts/dashboard/src/hooks/use-manager-options.ts
+_apply_staging/artifacts/dashboard/src/pages/admin-activity.tsx
+_apply_staging/artifacts/dashboard/src/pages/anti-ghosting-pipeline.tsx
+_apply_staging/artifacts/dashboard/src/pages/context-pipeline.tsx
+_apply_staging/artifacts/dashboard/src/pages/pipeline.tsx
+_apply_staging/lib/db/src/schema/app-settings.ts
+_apply_staging/lib/db/src/schema/cron-heartbeats.ts
+_apply_staging/lib/db/src/schema/index.ts
+_apply_staging/lib/db/src/schema/prospects.ts
+_apply_staging/lib/db/src/schema/suppressed-addresses.ts
+artifacts/api-server/scripts/smoke-cache-languages.ts
+artifacts/api-server/src/cron.ts.batch3b.bak
+artifacts/api-server/src/routes/doctrine.ts.batch3b.bak
+artifacts/api-server/src/services/gmailClient.ts.batch3b.bak
+artifacts/api-server/src/services/gmailSync.ts.batch3b.bak
+artifacts/api-server/src/services/scheduler.ts.batch3b.bak
+artifacts/api-server/src/services/timingEngine.ts.batch3b.bak
+artifacts/dashboard/src/pages/followups.tsx
+artifacts/dashboard/src/pages/prospects.tsx
+backup.sql
+budget_apply_v2/apply.sh
+budget_apply_v2/_backup-20260621112346/lib/usageTracker.ts
+budget_apply_v2/_backup-20260621112346/routes/index.ts
+budget_apply_v2/_backup-20260621112346/services/emailSummarizer.ts
+budget_apply_v2/_backup-20260621112346/services/replySentiment.ts
+budget_apply_v2/_backup-20260621112346/services/scheduler.ts
+budget_apply_v2/payload.zip
+budget_apply_v2/_stage/api-server/src/lib/dailyBudgetMath.ts
+budget_apply_v2/_stage/api-server/src/lib/dailyBudget.ts
+budget_apply_v2/_stage/api-server/src/routes/admin-daily-budget.ts
+budget_apply_v2/_stage/api-server/src/tests/dailyBudget.test.ts
+budget_apply_v2/_stage/patch.py
+budget-daily-cap-v2.zip
+clean-ship/apply_edits.py
+clean-ship/backup-20260609220708/artifacts/api-server/src/cron.ts
+clean-ship/backup-20260609220708/artifacts/api-server/src/services/antiGhostingFollowupGenerator.ts
+clean-ship/backup-20260609220708/artifacts/api-server/src/services/antiGhostingFollowupPrompts.ts
+clean-ship/backup-20260609220708/artifacts/api-server/src/services/followupPrompts.ts
+clean-ship/install.sh
+company-cascade-ship/payload.zip
+company-cascade-ship/ship.sh
+company-cascade-ship.zip
+critic-cleanup/apply.py
+critic-cleanup/backup/lib/gemini.ts.bak
+critic-cleanup/backup/scripts/smoke-critic.ts.bak
+critic-cleanup/backup/services/criticProvider.ts.bak
+critic-cleanup/payload/scripts/smoke-critic.ts
+critic-cleanup/restore.sh
+critic-cleanup/run.sh
+critic-cleanup.zip
+critic-cost-report/payload/scripts/critic-cost-report.ts
+critic-cost-report/report-run.sh
+critic-cost-report.zip
+critic-gemini-models/apply.py
+critic-gemini-models/backup/lib/pricing.ts.bak
+critic-gemini-models/backup/scripts/critic-cost-report.ts.bak
+critic-gemini-models/restore.sh
+critic-gemini-models/run.sh
+critic-gemini-models.zip
+critic-nokey-sonnet/apply.py
+critic-nokey-sonnet/backup/scripts/smoke-critic.ts.bak
+critic-nokey-sonnet/backup/services/criticProvider.ts.bak
+critic-nokey-sonnet/payload/scripts/smoke-critic.ts
+critic-nokey-sonnet/restore.sh
+critic-nokey-sonnet/run.sh
+critic-nokey-sonnet.zip
+critic-proid-fix/apply.py
+critic-proid-fix/backup/lib/pricing.ts.bak
+critic-proid-fix/backup/scripts/critic-cost-report.ts.bak
+critic-proid-fix/restore.sh
+critic-proid-fix/run.sh
+critic-proid-fix.zip
+critic-sonnet-fallback-real/apply.py
+critic-sonnet-fallback-real/backup/lib/anthropic.ts.bak
+critic-sonnet-fallback-real/backup/scripts/smoke-critic.ts.bak
+critic-sonnet-fallback-real/backup/services/criticProvider.ts.bak
+critic-sonnet-fallback-real/payload/scripts/smoke-critic.ts
+critic-sonnet-fallback-real/restore.sh
+critic-sonnet-fallback-real/run.sh
+critic-sonnet-fallback-real.zip
+dff-exemplar-competitor-bundle.zip
+dff-synthetic-verify-bundle.zip
+doctrine-followup-fixes-round2-hotfix.zip
+doctrine-followup-fixes-round3.zip
+doctrine-followup-fixes.zip
+doctrine-integration/doctrineFollowupLabel.ts
+fix-adminprovider.zip
+fix-batch/apply_edits.py
+fix-batch/backup-20260609212356/artifacts/api-server/src/services/followupGenerator.ts
+fix-batch/backup-20260609212356/artifacts/api-server/src/services/followupPrompts.ts
+fix-batch/install.sh
+_fixes2/apply-fixes.sh
+_fixes2/patches/api-server.patch
+_fixes2/patches/dashboard.patch
+_fixes2/README.md
+_fixes3/apply-fixes.sh
+_fixes3/patches/api-server.patch
+_fixes3/patches/dashboard.patch
+_fixes3/README.md
+_fixes4/apply-fixes.sh
+_fixes4/patches/dashboard.patch
+_fixes4/README.md
+_fixes/apply-fixes.sh
+_fixes/patches/api-server.patch
+_fixes/patches/dashboard.patch
+_fixes/README.md
+followuper-30d-cap-cost.zip
+followuper-address-suppression.zip
+followuper-archived-view-bounce-badge.zip
+followuper-batch/apply_edits.py
+followuper-batch/backup-20260609204111/artifacts/api-server/src/cron.ts
+followuper-batch/backup-20260609204111/artifacts/api-server/src/lib/anthropic.ts
+followuper-batch/backup-20260609204111/artifacts/api-server/src/routes/anti-ghosting.ts
+followuper-batch/backup-20260609204111/artifacts/api-server/src/routes/context.ts
+followuper-batch/backup-20260609204111/artifacts/api-server/src/routes/gmail-auth.ts
+followuper-batch/backup-20260609204111/artifacts/api-server/src/services/antiGhostingFollowupGenerator.ts
+followuper-batch/backup-20260609204111/artifacts/api-server/src/services/contextFollowupGenerator.ts
+followuper-batch/backup-20260609204111/artifacts/api-server/src/services/followupGenerator.ts
+followuper-batch/backup-20260609204111/artifacts/api-server/src/services/scheduler.ts
+followuper-batch/backup-20260609204111/artifacts/dashboard/src/pages/accounts.tsx
+followuper-batch/backup-20260609204111/lib/db/src/schema/prospects.ts
+followuper-batch/install.sh
+followuper-batch/new-files/followupLimits.ts
+followuper-batch/new-files/test-followup-limits.ts
+followuper-bounce-archive-pause.zip
+followuper-clean-ship.zip
+followuper-doctrine-v1.zip
+followuper-hardening-gate-cron.zip
+followuper-no-fabricated-numbers.zip
+followuper-sync-dev-db.zip
+gemini-critic-adversarial/adversarial-run.sh
+gemini-critic-adversarial/payload/scripts/adversarial-critic.ts
+gemini-critic-adversarial.zip
+gemini-critic-batch/payload/apply.py
+gemini-critic-batch/payload/lib/gemini.ts
+gemini-critic-batch/payload/services/criticProvider.ts
+gemini-critic-batch/run.sh
+gemini-critic-batch.zip
+gemini-critic-retry/payload/lib/gemini.ts
+gemini-critic-retry/payload/scripts/smoke-critic.ts
+gemini-critic-retry/retry-run.sh
+gemini-critic-retry.zip
+gemini-critic-smoke/payload/scripts/smoke-critic.ts
+gemini-critic-smoke/smoke-run.sh
+gemini-critic-smoke.zip
+gemini-model-switch/apply.py
+gemini-model-switch/backup/lib/gemini.ts.bak
+gemini-model-switch/backup/lib/pricing.ts.bak
+gemini-model-switch/backup/scripts/smoke-critic.ts.bak
+gemini-model-switch/backup/services/criticProvider.ts.bak
+gemini-model-switch/payload/scripts/smoke-critic.ts
+gemini-model-switch/restore.sh
+gemini-model-switch/run.sh
+_hf/apply-fixes.sh
+_hf/patches/db.patch
+_hf/README.md
+_inbox/batch7c/apply-batch7c.mjs
+_inbox/batch7c/audit-batch7c.mjs
+_inbox/batch7c-doctrine-filter.zip
+_inbox/batch7c/README.md
+_inbox/batch7d/apply-batch7d.mjs
+_inbox/batch7d/audit-batch7d.mjs
+_inbox/batch7d/files/dashboard/pages/context-activity.tsx
+_inbox/batch7d/files/dashboard/pages/context-inspector.tsx
+_inbox/batch7d/files/dashboard/pages/context-pipeline.tsx
+_inbox/batch7d/files/dashboard/pages/picker.tsx
+_inbox/batch7d-picker-theme-switcher.zip
+_inbox/batch7d/README.md
+_inbox/batch7e/apply-batch7e.mjs
+_inbox/batch7e/audit-batch7e.mjs
+_inbox/batch7e-context-pipeline.zip
+_inbox/batch7e-hotfix1/apply-batch7e-hotfix1.mjs
+_inbox/batch7e-hotfix1-asc-import.zip
+_inbox/batch7e/README.md
+_inbox/batch7f/apply-batch7f.mjs
+_inbox/batch7f/audit-batch7f.mjs
+_inbox/batch7f-context-activity-log.zip
+_inbox/batch7f/README.md
+_inbox/batch7g/apply-batch7g.mjs
+_inbox/batch7g/audit-batch7g.mjs
+_inbox/batch7g-context-inspector-backend.zip
+_inbox/batch7g/README.md
+_inbox/batch7h/apply-batch7h.mjs
+_inbox/batch7h/audit-batch7h.mjs
+_inbox/batch7h-context-inspector-frontend.zip
+_inbox/batch7h/README.md
+_inbox/batch7i/apply-batch7i.mjs
+_inbox/batch7i/audit-batch7i.mjs
+_inbox/batch7i/README.md
+_inbox/batch7i-sidebar-activity-per-product.zip
+_inbox/batch7j/apply-batch7j.mjs
+_inbox/batch7j/audit-batch7j.mjs
+_inbox/batch7j/README.md
+_inbox/batch7j-vertical-hide-stats-parity.zip
+_inbox/batch7k/apply-batch7k.mjs
+_inbox/batch7k/audit-batch7k.mjs
+_inbox/batch7k/README.md
+_inbox/batch7k-sync-autoqueue.zip
+_inbox/batch7l/apply-batch7l.mjs
+_inbox/batch7l/audit-batch7l.mjs
+_inbox/batch7l-context-safety-parity.zip
+_inbox/batch7l/README.md
+_inbox/batch7m/apply-batch7m.mjs
+_inbox/batch7m/audit-batch7m.mjs
+_inbox/batch7m-pipeline-stage-indicator.zip
+_inbox/batch7m/README.md
+_inbox/batch7n/apply-batch7n.mjs
+_inbox/batch7n/audit-batch7n.mjs
+_inbox/batch7n-cron-heartbeat.zip
+_inbox/batch7n/migrate-batch7n.sql
+_inbox/batch7n/README.md
+lib/db/drizzle/0000_relax_prospects_uq.sql
+lib/db/drizzle/meta/0000_snapshot.json
+lib/db/drizzle/meta/_journal.json
+opus48-ag/CHANGES.md
+opus48-ag/payload/api-server/lib/anthropic.ts
+opus48-ag/payload/api-server/lib/pricing.ts
+opus48-ag/payload/api-server/routes/admin-activity-report.ts
+opus48-ag/payload/api-server/routes/admin-activity.ts
+opus48-ag/payload/api-server/routes/anti-ghosting.ts
+opus48-ag/payload/api-server/services/antiGhostingFollowupGenerator.ts
+opus48-ag/payload/api-server/services/contextFollowupGenerator.ts
+opus48-ag/payload/api-server/services/followupGenerator.ts
+opus48-ag/payload/dashboard/App.tsx
+opus48-ag/payload/dashboard/components/layout.tsx
+opus48-ag/payload/dashboard/pages/admin-activity.tsx
+opus48-ag/payload/dashboard/pages/anti-ghosting-activity.tsx
+opus48-ag/ship.sh
+pi-hardening/AUDIT.md
+pi-hardening/install.sh
+pi-hardening/patch.py
+pi-hardening/promptInjection.test.ts
+pi-hardening/promptInjection.ts
+pi-hardening/README.txt
+pi-hardening/RELAY_VERIFICATION_PROMPT.md
+pi-hardening/uninstall.sh
+"ql \"$DATABASE_URL\" -c \""
+reddit_followupper_v1_1.zip
+source-code/api-server/cron.ts.batch3b.bak
+source-code/api-server/routes/doctrine.ts.batch3b.bak
+source-code/api-server/services/followupPrompts.ts.reddit.bak
+source-code/api-server/services/gmailClient.ts.batch3b.bak
+source-code/api-server/services/gmailSync.ts.batch3b.bak
+source-code/api-server/services/scheduler.ts.batch3b.bak
+source-code/api-server/services/timingEngine.ts.batch3b.bak
+source-code/api-server/src/app.ts
+source-code/api-server/src/cron.ts
+source-code/api-server/src/index.ts
+source-code/api-server/src/lib/constants.ts
+source-code/api-server/src/lib/logger.ts
+source-code/api-server/src/lib/verticalClassifier.ts
+source-code/api-server/src/routes/auth.ts
+source-code/api-server/src/routes/doctrine.ts
+source-code/api-server/src/routes/email-inspector.ts
+source-code/api-server/src/routes/gmail-auth.ts
+source-code/api-server/src/routes/health.ts
+source-code/api-server/src/routes/index.ts
+source-code/api-server/src/scripts/createLabels.ts
+source-code/api-server/src/scripts/seed.ts
+source-code/api-server/src/services/emailSummarizer.ts
+source-code/api-server/src/services/followupGenerator.ts
+source-code/api-server/src/services/followupPrompts.ts
+source-code/api-server/src/services/gmailClient.ts
+source-code/api-server/src/services/gmailSync.ts
+source-code/api-server/src/services/scheduler.ts
+source-code/api-server/src/services/timingEngine.ts
+source-code-csd-v1.1.zip
+source-code-csd-v1.zip
+source-code/dashboard/pages/followups.tsx
+source-code/dashboard/pages/prospects.tsx
+source-code/dashboard/src/pages/prospects.tsx
+source-code/doctrine-integration/doctrineFollowupLabel.ts
+source-code-rh1.zip
+structural-lint-batch/apply.py
+structural-lint-batch/backup/followupGenerator.ts.bak
+structural-lint-batch/payload/lib/structuralLint.ts
+structural-lint-batch/payload/tests/test-structural-lint.ts
+structural-lint-batch/restore.sh
+structural-lint-batch/run.sh
+sync-dev-db.sql
+writer-fallback-chain/apply.sh
+writer-fallback-chain/AUDIT.md
+writer-fallback-chain/BLAST_RADIUS.md
+writer-fallback-chain/payload.zip
+writer-fallback-chain.zip
+```
+
+## Blast radius — diagnostic order F-D3 (2026-08-05)
+
+Read-only history audit ("were these behaviours ever different?"). Read: all
+refs, reflog, dangling commits, file contents at eleven epochs. Wrote exactly
+two files: `diagnostic.md` (full findings) and this entry. No source, DB,
+secrets, deploys, or workflow touched. Headline: zero confirmed rollbacks;
+send caps / window / bounce / structural-toggle / autofix wiring have had one
+value ever (visible history starts 2026-04-08), so production deviations are
+configuration, per-user DB settings, or the separately-deployed add-on — see
+diagnostic.md §6-7 for the Secrets-pane checklist and add-on discriminator.

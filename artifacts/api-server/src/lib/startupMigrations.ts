@@ -286,6 +286,38 @@ const STATEMENTS: string[] = [
   // after the first run no rows match.
   // ──────────────────────────────────────────────────────────────────
   `UPDATE users SET max_followups = 3 WHERE max_followups > 3 OR max_followups < 1`,
+
+  // ──────────────────────────────────────────────────────────────────
+  // F-3.6a: truth and flow.
+  //
+  // Six statements, every one additive and either nullable or defaulted, so
+  // a code rollback needs no schema rollback — the previous build simply
+  // stops reading columns it never knew about. Same property B7u's
+  // paused_by_admin has had since it shipped.
+  // ──────────────────────────────────────────────────────────────────
+
+  // users.auth_dead_at / auth_dead_reason — the auth-dead state, distinct
+  // from is_connected. NULL = healthy. See schema/users.ts for why this is
+  // not a disconnect.
+  `ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_dead_at TIMESTAMPTZ`,
+  `ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_dead_reason TEXT`,
+  // Read on every due-query pass. Deliberately a PLAIN index, byte-for-byte
+  // matching the declaration in lib/db/src/schema/users.ts. A partial index
+  // here (WHERE auth_dead_at IS NOT NULL) would be marginally tidier and
+  // would also make drizzle-kit diff it as undeclared and churn a
+  // DROP/CREATE on every Republish — the exact trap cron-heartbeats.ts
+  // records having been caught by. On a fifteen-row table the difference is
+  // nil; the churn is not.
+  `CREATE INDEX IF NOT EXISTS idx_users_auth_dead ON users(auth_dead_at)`,
+
+  // followups.retry_count / failure_reason / error_history — bounded retry
+  // policy replacing the 15-minute amnesia revive. Existing rows start at
+  // retry_count 0, which is correct: none of them has been retried under a
+  // policy, and the two July DB-error rows of user 8 stay exactly where they
+  // are (their owner is admin-paused, so no auto-queue pass reaches them).
+  `ALTER TABLE followups ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE followups ADD COLUMN IF NOT EXISTS failure_reason TEXT`,
+  `ALTER TABLE followups ADD COLUMN IF NOT EXISTS error_history JSONB`,
 ];
 
 export async function runStartupMigrations(): Promise<void> {
@@ -294,7 +326,7 @@ export async function runStartupMigrations(): Promise<void> {
       await pool.query(stmt);
     }
     logger.info(
-      "B7r/B7u/B9a + bounce/archive + company-cascade migrations applied (followup_usage, users.paused_by_admin, prospects.cycle/parent_prospect_id/pause_reason/bounce_type/paused_at/archived/archived_at/reply_class/cascade_paused_by_prospect_id/reply_classified_msg_id, followups.cycle + unique-constraint swap, users.anti_ghosting_label, thread_messages, app_settings, suppressed_addresses, partial indexes)",
+      "B7r/B7u/B9a + bounce/archive + company-cascade + F-3.6a migrations applied (followup_usage, users.paused_by_admin, prospects.cycle/parent_prospect_id/pause_reason/bounce_type/paused_at/archived/archived_at/reply_class/cascade_paused_by_prospect_id/reply_classified_msg_id, followups.cycle + unique-constraint swap, users.anti_ghosting_label, thread_messages, app_settings, suppressed_addresses, users.auth_dead_at/auth_dead_reason, followups.retry_count/failure_reason/error_history, partial indexes)",
     );
   } catch (err) {
     logger.error({ err }, "B9a: startup migration failed (AntiGhosting flow will not function correctly until resolved)");

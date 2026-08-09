@@ -11,6 +11,8 @@ import { logger } from "./lib/logger";
 import { startCronJobs } from "./cron";
 // B7r: startup migrations import (currently: ensure followup_usage table exists).
 import { runStartupMigrations } from "./lib/startupMigrations";
+// F-3.6a: deploy-time auth-dead backfill + stranded-generating recovery.
+import { runDeployRecovery } from "./lib/deployRecovery";
 
 if (Intl.DateTimeFormat().resolvedOptions().timeZone !== "UTC") {
   // The TZ env var should pin Node's date math, but if Intl reports
@@ -41,7 +43,7 @@ if (Number.isNaN(port) || port <= 0) {
 // could time out otherwise). recordUsageBestEffort() is already
 // best-effort, so the rare window where the table is not yet
 // present just results in warnings, not failed sends.
-runStartupMigrations().catch((err) =>
+const migrationsDone = runStartupMigrations().catch((err) =>
   logger.error({ err }, "B7r: startup migration kickoff failed (non-fatal)"),
 );
 
@@ -55,6 +57,23 @@ const server = app.listen(port, (err) => {
   logger.info("This is a headless API — the UI lives in the Gmail Add-on");
 
   startCronJobs();
+
+  // F-3.6a: the two named deploy-time recovery passes. AFTER listen() and
+  // fire-and-forget, so a slow OAuth exchange can never hold up the platform
+  // health check. Read-only probe plus a status move; neither sends,
+  // generates, nor deletes. See lib/deployRecovery.ts.
+  //
+  // Chained off the migration promise, NOT started in parallel with it: the
+  // backfill reads users.auth_dead_at, and that column is created by the
+  // migration above. Racing them would have the first boot after this order
+  // ships fail on "column does not exist" — recoverably, but the backfill
+  // would then not happen until the next restart, which is exactly the pass
+  // that has to run once.
+  migrationsDone
+    .then(() => runDeployRecovery())
+    .catch((err) =>
+      logger.error({ err }, "F-3.6a: deploy-time recovery kickoff failed (non-fatal)"),
+    );
 });
 
 process.on("SIGTERM", () => {

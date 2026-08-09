@@ -215,6 +215,7 @@ export default function Accounts() {
             isExpanded={expandedId === account.id}
             onToggle={() => setExpandedId(expandedId === account.id ? null : account.id)}
             onDisconnect={() => handleDisconnect(account.id)}
+            onReconnect={handleConnect}
             apiKey={apiKey || ""}
             onSettingsSaved={() => refetch()}
           />
@@ -499,6 +500,7 @@ function AccountCard({
   isExpanded,
   onToggle,
   onDisconnect,
+  onReconnect,
   apiKey,
   onSettingsSaved,
 }: {
@@ -506,6 +508,10 @@ function AccountCard({
   isExpanded: boolean;
   onToggle: () => void;
   onDisconnect: () => void;
+  // F-3.6a: starts the same OAuth flow as the page-level Connect Gmail
+  // button. Present so the "— reconnect" instruction has a control next to
+  // it rather than sending the operator hunting up the page.
+  onReconnect: () => void;
   apiKey: string;
   onSettingsSaved: () => void;
 }) {
@@ -639,6 +645,19 @@ function AccountCard({
     }
   };
 
+  // F-3.6a: connection health, as the server decided it. Read through `as any`
+  // for the same reason pausedByAdmin is — the Orval-generated account type is
+  // regenerated from the OpenAPI spec, and widening that spec is a separate
+  // change with its own blast radius. `connectionState` is the authority;
+  // `authDeadAt` is the fallback if an older server build is answering.
+  const acct = account as any;
+  const authDead: boolean =
+    acct.connectionState === "auth_dead" || (Boolean(acct.authDeadAt) && account.isConnected);
+  const authDeadMessage: string =
+    typeof acct.authDeadMessage === "string" && acct.authDeadMessage
+      ? acct.authDeadMessage
+      : "Gmail connection dead — reconnect";
+
   return (
     <Card className="overflow-hidden">
       <div className="p-5 flex items-center justify-between">
@@ -648,7 +667,20 @@ function AccountCard({
               <h3 className="font-semibold text-[13px]" style={{ color: "var(--text-primary)" }}>
                 {account.name || account.email}
               </h3>
-              {account.isConnected ? (
+              {/* F-3.6a: three states, not two. Until this order an account
+                  whose Gmail grant Google refuses still rendered CONNECTED —
+                  on 2026-08-09 six of twelve did, while none of them could
+                  send a thing. AUTH-DEAD is its own badge and it must win
+                  over CONNECTED, because "connected" was the lie. */}
+              {authDead ? (
+                <span
+                  className="text-[11px] font-mono font-medium px-2 py-0.5 rounded"
+                  style={{ background: "var(--danger-muted)", color: "var(--danger)" }}
+                  title="Google is refusing this account's Gmail grant. No follow-ups are queued, generated or sent for it until it is reconnected."
+                >
+                  AUTH-DEAD
+                </span>
+              ) : account.isConnected ? (
                 <span
                   className="text-[11px] font-mono font-medium px-2 py-0.5 rounded"
                   style={{ background: "var(--success-muted)", color: "var(--success)" }}
@@ -677,10 +709,29 @@ function AccountCard({
               )}
             </div>
             <p className="text-[12px] mt-0.5" style={{ color: "var(--text-secondary)" }}>{account.email}</p>
+            {/* F-3.6a: the sentence, in plain words, under the address. The
+                server builds it (lib/connectionHealth.authDeadMessage) so
+                every client says the same thing. Rendered as text — it is
+                data from an external system and never markup. */}
+            {authDead && (
+              <p className="text-[12px] mt-1" style={{ color: "var(--danger)" }}>
+                {authDeadMessage}
+              </p>
+            )}
           </div>
         </div>
 
         <div className="flex items-center gap-2">
+          {/* F-3.6a: the instruction says "reconnect", so the control sits
+              next to it. Same OAuth flow as the page-level Connect Gmail
+              button — the callback matches on the address and clears the
+              auth-dead state on the way through. */}
+          {authDead && (
+            <Button size="sm" onClick={onReconnect} className="gap-1.5">
+              <Plus className="h-3.5 w-3.5" />
+              Reconnect
+            </Button>
+          )}
           <Button variant="secondary" size="sm" onClick={onToggle} className="gap-1.5">
             Settings
             {isExpanded ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}

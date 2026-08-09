@@ -23,6 +23,9 @@ import { cancelActiveFollowupsForProspects, queueNextFollowupStageForProspect } 
 import { classifyReplySentiment } from "./replySentiment";
 import { cascadeCompanyPauseOnPositiveReply } from "./companyCascade";
 import { CASCADE_MIN_CONFIDENCE, CASCADE_ELIGIBLE_APPS } from "../lib/replyClassification";
+// F-3.6a: the auth-dead state machine and the shared auth-error predicate.
+// Pure; see lib/connectionHealth.ts.
+import { nextAuthState, signalFromSyncOutcome, isAuthError } from "../lib/connectionHealth";
 
 function inferProduct(vertical: string): string {
   if (vertical === "retargeting") return "retargeting";
@@ -780,10 +783,11 @@ export interface PerUserSyncOutcome {
   authFailure?: boolean;
 }
 
-function isAuthError(err: unknown): boolean {
-  const msg = err instanceof Error ? `${err.message} ${JSON.stringify((err as any).response?.data ?? "")}` : String(err);
-  return /invalid_grant|invalid_client|unauthorized_client/i.test(msg);
-}
+// F-3.6a: the predicate moved to lib/connectionHealth.ts so the sync pass,
+// the deploy-time probe and the tests share one copy. Re-exported here
+// because callers inside this module (and its tests) referenced it by this
+// name since the per-user sync hardening shipped.
+export { isAuthError };
 
 /**
  * Thrown by syncEmails() when an all-users pass is already in flight.
@@ -864,7 +868,14 @@ async function runAllUsersSync(): Promise<{
     return { synced: 0, repliesDetected: 0, perUser: [] };
   }
 
-  const rows: Array<{ user: SyncUserRow; gmail: ReturnType<typeof getGmailForUser>; outcome: PerUserSyncOutcome }> = [];
+  const rows: Array<{
+    user: SyncUserRow;
+    gmail: ReturnType<typeof getGmailForUser>;
+    outcome: PerUserSyncOutcome;
+    // F-3.6a: the account's auth-dead state as it stood when this pass
+    // started, so the transition can be decided without re-reading the row.
+    authDeadAt: Date | null;
+  }> = [];
   for (const user of connectedUsers) {
     if (!user.googleRefreshToken) continue;
     const syncUser: SyncUserRow = {
@@ -882,6 +893,7 @@ async function runAllUsersSync(): Promise<{
       user: syncUser,
       gmail: getGmailForUser({ refreshToken: syncUser.googleRefreshToken, email: syncUser.email, name: syncUser.name }),
       outcome: { userId: user.id, email: user.email, synced: 0, repliesDetected: 0 },
+      authDeadAt: user.authDeadAt ?? null,
     });
   }
 
@@ -917,6 +929,57 @@ async function runAllUsersSync(): Promise<{
       logger.error(
         { err, userId: row.user.id, email: row.user.email, authFailure: row.outcome.authFailure },
         "Reply scan failed for user",
+      );
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // F-3.6a: Phase C — reconcile each account's auth-dead state.
+  //
+  // Runs AFTER both work phases so it sees the whole pass, and never throws:
+  // an account's health flag is worth strictly less than the sync results
+  // that were already gathered, so a failure here logs and moves on.
+  //
+  // This is the only place a grant is marked dead or alive by the cron. The
+  // deploy-time backfill (deployRecovery.ts) uses the same state machine
+  // against a direct probe.
+  // ─────────────────────────────────────────────────────────────────────
+  const now = new Date();
+  for (const row of rows) {
+    try {
+      const signal = signalFromSyncOutcome(row.outcome);
+      const transition = nextAuthState({
+        currentAuthDeadAt: row.authDeadAt,
+        signal,
+        reason: row.outcome.ingestError || row.outcome.replyError,
+        now,
+      });
+      if (!transition.changed) continue;
+
+      await db
+        .update(usersTable)
+        .set({
+          authDeadAt: transition.authDeadAt,
+          authDeadReason: transition.authDeadReason,
+          updatedAt: now,
+        })
+        .where(eq(usersTable.id, row.user.id));
+
+      if (transition.authDeadAt) {
+        logger.error(
+          { userId: row.user.id, email: row.user.email, reason: transition.authDeadReason },
+          "F-3.6a: Gmail grant marked AUTH-DEAD — this account will not generate or send until it is reconnected",
+        );
+      } else {
+        logger.info(
+          { userId: row.user.id, email: row.user.email },
+          "F-3.6a: Gmail grant healthy again — auth-dead cleared, follow-ups resume",
+        );
+      }
+    } catch (err) {
+      logger.error(
+        { err, userId: row.user.id, email: row.user.email },
+        "F-3.6a: failed to reconcile auth-dead state (sync results are unaffected)",
       );
     }
   }
