@@ -2,6 +2,26 @@
 
 ## Open items
 
+- **[F-3.6b, 2026-08-10] The push to `origin` was REFUSED — no GitHub
+  credential exists in this workspace, and the order's contingency points at a
+  repo-local fix that is not recorded anywhere in this file.** F-3.6b is
+  merged to local `main` (`8dc57f6`) with the rollback tag
+  `pre-f-36b-main-tip` at `ac54213`; local `main` is **5 commits ahead of
+  `origin/main`** (the two pre-existing empty "Published your App" markers,
+  plus this order's two commits and the merge). `git push` fails with
+  *"Invalid username or token. Password authentication is not supported for
+  Git operations."*
+  What is actually configured: `origin` is
+  `https://github.com/MichaelMobupps/doctrine-followup-export` with **no
+  credential helper** in either the repo config or the Replit global config
+  (`/run/replit/user/57158411/.config/git/config`, which carries only
+  `init.defaultBranch` and `user.*`); `gh` is installed but not logged in;
+  no token is present in the environment. Nothing was invented and no
+  credential was written — Michael owns secrets. **Michael pushes**, or
+  authorises a credential, and the tag needs pushing too:
+  `git push origin refs/tags/pre-f-36b-main-tip && git push origin main`.
+  When the fix is made, record it here so the next order's contingency is real.
+
 - **[F-3.6b] `startupMigrations.ts` still does not create the four BASE
   tables.** `users`, `prospects`, `followups` and `oauth_nonces` are created by
   `drizzle-kit push` alone. Every other table the server needs is now created
