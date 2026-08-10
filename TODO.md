@@ -5,12 +5,20 @@
 - **[F-3.6b, 2026-08-10] The push to `origin` was REFUSED — no GitHub
   credential exists in this workspace, and the order's contingency points at a
   repo-local fix that is not recorded anywhere in this file.** F-3.6b is
-  merged to local `main` (`8dc57f6`) with the rollback tag
-  `pre-f-36b-main-tip` at `ac54213`; local `main` is **5 commits ahead of
-  `origin/main`** (the two pre-existing empty "Published your App" markers,
-  plus this order's two commits and the merge). `git push` fails with
+  merged to local `main` (`8dc57f6`, and the follow-on proof at `28bb64d`)
+  with the rollback tag
+  `pre-f-36b-main-tip` at `ac54213`; local `main` is **9 commits ahead of
+  `origin/main`** (this record included: the two pre-existing empty "Published
+  your App" markers, this order's two commits and its merge, the follow-on
+  proof commit and its merge, and this entry). `git push` fails with
   *"Invalid username or token. Password authentication is not supported for
   Git operations."*
+  **Re-verified 2026-08-10 by the follow-on session** with `git push --dry-run
+  origin main` — same refusal. `GIT_ASKPASS` is set to `replit-git-askpass`,
+  which does resolve on `PATH`
+  (`/nix/store/…-replit-runtime-path/bin/replit-git-askpass`) but supplies no
+  credential GitHub will accept, so the variable being set is not evidence of
+  a working one.
   What is actually configured: `origin` is
   `https://github.com/MichaelMobupps/doctrine-followup-export` with **no
   credential helper** in either the repo config or the Replit global config
