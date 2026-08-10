@@ -1,5 +1,5 @@
 import cron from "node-cron";
-import { syncEmails, SyncAlreadyRunningError } from "./services/gmailSync";
+import { syncEmails, SyncAlreadyRunningError, NoConnectedAccountsError } from "./services/gmailSync";
 import { processDueFollowups, autoQueueAllCampaigns, stallDraftedFollowups, archiveStalePausedCampaigns, detectStrandedGeneratingFollowups, pauseExpiredCampaigns, pauseOverCapCampaigns } from "./services/scheduler";
 // CSD v1: daily prune of company-shared drafts past retention.
 import { pruneSharedDrafts } from "./services/companyDraftCache";
@@ -51,6 +51,16 @@ export function startCronJobs(): void {
           // still running. Record the skip so tick cadence stays auditable.
           details.skipped = err.message;
           logger.warn(err.message + " — skipping this tick");
+        } else if (err instanceof NoConnectedAccountsError) {
+          // F-3.6b: the loudest thing this tick can say. Zero connected
+          // accounts used to be answered by the legacy env-var mailbox, or
+          // by `ok` with `synced: 0` — the shape that hid total sync death
+          // for months (D2). It is `error`, not `partial`: nothing is
+          // degraded, everything is down.
+          outcome = "error";
+          details.noConnectedAccounts = true;
+          details.syncError = err.message;
+          logger.error({ err }, "NO CONNECTED ACCOUNTS — sync did not run");
         } else {
           outcome = "partial";
           details.syncError = err instanceof Error ? err.message : String(err);

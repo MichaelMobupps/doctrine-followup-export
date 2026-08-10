@@ -152,9 +152,17 @@ export const prospectsTable = pgTable("prospects", {
   index("idx_prospects_batch").on(table.batchLabel),
   index("idx_prospects_sent").on(table.sentAt),
   index("idx_prospects_user").on(table.userId),
-  // Phase 7a: per-product filter index. Most queries (sync, dispatcher,
-  // pipeline list) will scope to a single app value.
-  index("idx_prospects_app").on(table.app),
+  // F-3.6b: `idx_prospects_app` — a Phase 7a single-column index on `app` —
+  // was declared here and existed in NEITHER database; nothing has ever
+  // created it. The column itself is filtered on constantly (29 sites, 1
+  // GROUP BY, 0 sorts), but the index below has `app` as its LEADING column,
+  // so a B-tree prefix scan already serves every `app = ?` predicate. Verified
+  // on production, read-only, 2026-08-10: EXPLAIN on `app='anti_ghosting'`,
+  // `app='context'` and `GROUP BY app` all choose
+  // idx_prospects_app_replied_paused. A second copy of the same prefix would
+  // never be preferred, so the declaration was stale rather than pending, and
+  // it is deleted rather than created. No database changes.
+  //
   // B9a: dispatcher hot-path covering index. The cron scheduler iterates
   // (app, replied=0, followupPaused=false) every cycle to find prospects
   // due for a follow-up. With three apps now and reengagement adding

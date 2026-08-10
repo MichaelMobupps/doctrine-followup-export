@@ -13,6 +13,8 @@ import { logger } from "../lib/logger";
 import { assessSpamRisk, spamGateEnabled } from "../lib/spamRiskLint";
 // 2026-07-16 main-screen-hang fix: unbounded-list guard for /followups + /prospects.
 import { rejectUnboundedList } from "../lib/listGuards";
+// F-3.6b: the send identity. Owner or refusal — there is no env fallback.
+import { resolveSendIdentity } from "../lib/ownerIdentity";
 // Test mode fully removed — TEST_MODE_LABEL constant is no longer referenced.
 
 // Phase 7c: app-scoping. Every prospect query in this file gates on
@@ -857,23 +859,29 @@ router.post("/followups/:id/approve", async (req: Request, res: Response) => {
     const item = rows[0];
     const { sendFollowupReply, getGmailForUser } = await import("../services/gmailClient");
 
-    let senderEmail = "";
-    let senderName = "";
-    let gmail = undefined;
+    // F-3.6b: the identity is the owner's or there is none. This route never
+    // read the env fallback itself, but it passed `gmail: undefined` when it
+    // could not resolve an owner, and `sendFollowupReply` fell back to
+    // `GOOGLE_REFRESH_TOKEN` — so approving a follow-up on an ownerless
+    // prospect delivered it from the shared mailbox. The client is now a
+    // required argument, and the refusal says which of the two cases it is.
+    const owner = item.userId
+      ? (await db.select().from(usersTable).where(eq(usersTable.id, item.userId)).limit(1))[0]
+      : null;
+    const identity = resolveSendIdentity({ userId: item.userId, owner });
 
-    if (item.userId) {
-      const users = await db.select().from(usersTable).where(eq(usersTable.id, item.userId)).limit(1);
-      if (users[0]?.googleRefreshToken && users[0]?.isConnected) {
-        senderEmail = users[0].email;
-        senderName = users[0].name || users[0].email.split("@")[0];
-        gmail = getGmailForUser({ refreshToken: users[0].googleRefreshToken, email: users[0].email });
-      }
-    }
-
-    if (!senderEmail) {
-      res.status(400).json({ error: "No sender credentials available" });
+    if (!identity.ok) {
+      res.status(400).json({
+        error: identity.reason === "owner_missing"
+          ? "This prospect has no owning account, so there is no Gmail grant to send from. Assign an owner first."
+          : "No sender credentials available",
+        reason: identity.reason,
+      });
       return;
     }
+
+    const { senderEmail, senderName } = identity;
+    const gmail = getGmailForUser({ refreshToken: identity.refreshToken, email: senderEmail });
 
     const body = req.body.body || item.generatedBody;
     const subject = req.body.subject || item.generatedSubject;

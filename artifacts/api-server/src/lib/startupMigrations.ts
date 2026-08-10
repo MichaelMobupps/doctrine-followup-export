@@ -318,6 +318,42 @@ const STATEMENTS: string[] = [
   `ALTER TABLE followups ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE followups ADD COLUMN IF NOT EXISTS failure_reason TEXT`,
   `ALTER TABLE followups ADD COLUMN IF NOT EXISTS error_history JSONB`,
+
+  // ──────────────────────────────────────────────────────────────────
+  // F-3.6b: cron_heartbeats moves into the startup migration.
+  //
+  // Every other table the server depends on is created here; this one was
+  // created by `drizzle-kit push` alone because it predates this file. It
+  // exists in dev and production, so nothing has ever noticed — but a
+  // database brought up by boot alone would not have it and
+  // GET /api/admin/cron-heartbeats, the F-3.6a liveness surface, would 500
+  // on the one occasion an operator most needs it.
+  //
+  // F-3.6a declined to add it, on the grounds that a second definition of a
+  // table `push` already owns is how index churn starts. That risk is real
+  // and it is answered by matching the LIVE shape exactly rather than by
+  // staying out: the statements below were written from a read-only
+  // information_schema / pg_indexes dump of BOTH databases on 2026-08-10, so
+  // a fresh database lands on a byte-identical table and there is nothing for
+  // a diff to churn. Note `fired_at DESC` — the real index carries it and the
+  // drizzle declaration in lib/db/src/schema/cron-heartbeats.ts does not.
+  // The declaration is deliberately left alone: it describes what both
+  // databases already have closely enough that the publish diff is empty
+  // today, and rewriting it to chase the sort direction would risk exactly
+  // the churn this comment is about. Recorded in TODO Open items instead.
+  //
+  // IF NOT EXISTS on both, so on dev and production this is a no-op.
+  // ──────────────────────────────────────────────────────────────────
+  `CREATE TABLE IF NOT EXISTS cron_heartbeats (
+    id SERIAL PRIMARY KEY,
+    tick_name TEXT NOT NULL,
+    fired_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    outcome TEXT NOT NULL,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    details JSONB
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_cron_heartbeats_tick_fired_at
+     ON cron_heartbeats(tick_name, fired_at DESC)`,
 ];
 
 export async function runStartupMigrations(): Promise<void> {
@@ -326,7 +362,7 @@ export async function runStartupMigrations(): Promise<void> {
       await pool.query(stmt);
     }
     logger.info(
-      "B7r/B7u/B9a + bounce/archive + company-cascade + F-3.6a migrations applied (followup_usage, users.paused_by_admin, prospects.cycle/parent_prospect_id/pause_reason/bounce_type/paused_at/archived/archived_at/reply_class/cascade_paused_by_prospect_id/reply_classified_msg_id, followups.cycle + unique-constraint swap, users.anti_ghosting_label, thread_messages, app_settings, suppressed_addresses, users.auth_dead_at/auth_dead_reason, followups.retry_count/failure_reason/error_history, partial indexes)",
+      "B7r/B7u/B9a + bounce/archive + company-cascade + F-3.6a + F-3.6b migrations applied (followup_usage, users.paused_by_admin, prospects.cycle/parent_prospect_id/pause_reason/bounce_type/paused_at/archived/archived_at/reply_class/cascade_paused_by_prospect_id/reply_classified_msg_id, followups.cycle + unique-constraint swap, users.anti_ghosting_label, thread_messages, app_settings, suppressed_addresses, users.auth_dead_at/auth_dead_reason, followups.retry_count/failure_reason/error_history, cron_heartbeats, partial indexes)",
     );
   } catch (err) {
     logger.error({ err }, "B9a: startup migration failed (AntiGhosting flow will not function correctly until resolved)");

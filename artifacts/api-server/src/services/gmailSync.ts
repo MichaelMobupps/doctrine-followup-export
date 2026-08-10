@@ -802,6 +802,39 @@ export class SyncAlreadyRunningError extends Error {
   }
 }
 
+/**
+ * F-3.6b: thrown by syncEmails() when NO account is connected.
+ *
+ * WHAT THIS REPLACES
+ *
+ * `runAllUsersSync()` used to answer zero connected accounts by falling back
+ * to a single-mailbox legacy sync driven by GOOGLE_REFRESH_TOKEN and
+ * SENDER_EMAIL — one shared mailbox standing in for the whole tenant — and,
+ * when those variables were unset, by returning
+ * `{ synced: 0, repliesDetected: 0, perUser: [] }`.
+ *
+ * That return is indistinguishable from a healthy pass with nothing new to
+ * ingest. `perUser: []` means the cron's failure detector finds no failures,
+ * so the heartbeat records `outcome: "ok"` with `details.synced = 0`. It is
+ * the exact ok-with-synced:0 shape that masked total sync death for months
+ * (D2, 2026-07-31) — and that branch was still armed, because both variables
+ * are set in this deployment.
+ *
+ * Twelve accounts are connected. Zero is not a quiet edge case, it is every
+ * account in the product having lost its grant at once, and it now says so:
+ * 503 on the routes, `outcome: "error"` on the heartbeat, one loud log line.
+ */
+export class NoConnectedAccountsError extends Error {
+  statusCode = 503;
+  constructor() {
+    super(
+      "No Gmail account is connected — nothing can be synced. This is total sync death, " +
+        "not an empty inbox: every account has lost or never completed its grant. Reconnect at least one.",
+    );
+    this.name = "NoConnectedAccountsError";
+  }
+}
+
 // Overlap guard for ALL-USERS sync passes, whatever the entry point (cron
 // tick, POST /api/sync, /api/context/sync, /api/anti-ghosting/sync). In
 // production, overlapping multi-hour passes exhausted the DB pool and the
@@ -856,16 +889,15 @@ async function runAllUsersSync(): Promise<{
     // harder to notice and diagnose than a deterministic order.
     .orderBy(usersTable.id);
 
+  // F-3.6b: the legacy env-var fallback that used to live here is deleted,
+  // along with the single-mailbox sync it called. Zero connected accounts is
+  // reported, not substituted for. See NoConnectedAccountsError for why the
+  // old ok/synced:0 answer was the dangerous one.
   if (connectedUsers.length === 0) {
-    const fallbackToken = process.env.GOOGLE_REFRESH_TOKEN;
-    const fallbackEmail = process.env.SENDER_EMAIL;
-    if (fallbackToken && fallbackEmail) {
-      logger.info("No connected users — using legacy env var credentials");
-      const legacy = await syncForLegacyUser(fallbackToken, fallbackEmail);
-      return { ...legacy, perUser: [] };
-    }
-    logger.info("No connected users and no legacy credentials — skipping sync");
-    return { synced: 0, repliesDetected: 0, perUser: [] };
+    logger.error(
+      "NO CONNECTED ACCOUNTS — sync cannot run. Every account has lost or never completed its Gmail grant.",
+    );
+    throw new NoConnectedAccountsError();
   }
 
   const rows: Array<{
@@ -990,296 +1022,4 @@ async function runAllUsersSync(): Promise<{
     repliesDetected: perUser.reduce((acc, o) => acc + o.repliesDetected, 0),
     perUser,
   };
-}
-
-async function syncForLegacyUser(
-  refreshToken: string,
-  senderEmail: string,
-): Promise<{ synced: number; repliesDetected: number }> {
-  const creds: GmailCredentials = { refreshToken, email: senderEmail };
-  const gmail = getGmailForUser(creds);
-
-  const labels = (process.env.DOCTRINE_LABELS || "doctrine")
-    .split(",")
-    .map((l) => l.trim());
-
-  const sixtyDaysAgo = new Date();
-  sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
-  const afterDate = sixtyDaysAgo.toISOString().split("T")[0].replace(/-/g, "/");
-
-  logger.info({ labels, afterDate }, "Syncing emails (legacy mode)");
-  // Same knownIds prefilter as ingestForUser: skip re-downloading full
-  // bodies of messages that are already prospects. 2026-07-29: scoped by
-  // app for the same reason as ingestForUser (AG seed rows must not block
-  // doctrine ingest of the same message).
-  const knownRows = await db
-    .select({ id: prospectsTable.gmailMessageId })
-    .from(prospectsTable)
-    .where(ne(prospectsTable.app, "anti_ghosting"));
-  const knownIds = new Set(knownRows.map((r) => r.id));
-  const { messages, skippedKnown } = await fetchLabeledSentEmails(labels, afterDate, gmail, knownIds);
-  logger.info({ count: messages.length, skippedKnown }, "Found labeled sent emails");
-
-  let synced = 0;
-  let skipped = 0;
-  for (const msg of messages) {
-    // Per-message isolation — see matching comment in ingestForUser.
-    try {
-      // Skip messages we've already ingested. See matching comment in
-      // ingestForUser above — this prevents the LLM summarizer from re-running
-      // on every email in the 60-day window on every 15-minute sync tick.
-      // 2026-07-29: app-scoped like ingestForUser.
-      const existing = await db
-        .select({ id: prospectsTable.id })
-        .from(prospectsTable)
-        .where(and(
-          eq(prospectsTable.gmailMessageId, msg.id),
-          ne(prospectsTable.app, "anti_ghosting"),
-        ))
-        .limit(1);
-      if (existing.length > 0) {
-        skipped++;
-        continue;
-      }
-
-      const recipientEmail = extractEmail(msg.to);
-      const recipientName = extractRecipientFirstNameFromBody(msg.body) || extractName(msg.to);
-      const { vertical, subVertical } = inferVertical(msg.labels, msg.subject, msg.body);
-      const { summary: bodySummary, language: originalLanguage } = await summarizeOriginalEmail(msg.body);
-
-      const insertResult = await db
-        .insert(prospectsTable)
-        .values({
-          gmailMessageId: msg.id,
-          gmailThreadId: msg.threadId,
-          prospectName: recipientName,
-          company: inferCompany(recipientEmail),
-          email: recipientEmail,
-          vertical,
-          subVertical,
-          product: inferProduct(vertical),
-          subject: msg.subject,
-          originalBodySummary: bodySummary,
-          originalBody: prepareOriginalBody(msg.body),
-          originalLanguage,
-          batchLabel: labels[0],
-          sentAt: safeSentAt(msg),
-        })
-        // B10.1: composite target matches uq_prospects_user_message_app (B9b.6).
-        .onConflictDoNothing({ target: [prospectsTable.userId, prospectsTable.gmailMessageId, prospectsTable.app] });
-      if (insertResult.rowCount && insertResult.rowCount > 0) synced++;
-    } catch (err) {
-      logger.error(
-        { err, messageId: msg.id, threadId: msg.threadId },
-        "Failed to ingest labeled message (legacy) — continuing with the rest",
-      );
-    }
-  }
-
-  const unreplied = await db
-    .selectDistinct({ gmailThreadId: prospectsTable.gmailThreadId })
-    .from(prospectsTable)
-    .where(
-      and(
-        eq(prospectsTable.replied, 0),
-        isNull(prospectsTable.userId),
-        or(ne(prospectsTable.pauseReason, "bounced"), isNull(prospectsTable.pauseReason)),
-        eq(prospectsTable.archived, false),
-      ),
-    );
-
-  let repliesDetected = 0;
-  let bouncesDetected = 0;
-  for (const row of unreplied) {
-    try {
-      const verdict = await classifyThreadInbound(row.gmailThreadId, senderEmail, gmail);
-      if (verdict.kind === "none") continue;
-
-      if (verdict.kind === "bounce") {
-        await db
-          .update(prospectsTable)
-          .set({
-            followupPaused: true,
-            pauseReason: "bounced",
-            bounceType: verdict.bounceType ?? "hard",
-            pausedAt: new Date(),
-          })
-          .where(
-            and(
-              eq(prospectsTable.gmailThreadId, row.gmailThreadId),
-              isNull(prospectsTable.userId),
-              eq(prospectsTable.replied, 0),
-              or(ne(prospectsTable.pauseReason, "bounced"), isNull(prospectsTable.pauseReason)),
-            ),
-          );
-
-        await db
-          .update(followupsTable)
-          .set({ status: "cancelled" })
-          .where(
-            and(
-              sql`${followupsTable.prospectId} IN (SELECT id FROM prospects WHERE gmail_thread_id = ${row.gmailThreadId} AND user_id IS NULL)`,
-              inArray(followupsTable.status, ["queued", "generating", "pending_approval", "drafted"]),
-            ),
-          );
-
-        // Hard bounce: suppress the recipient address(es) on this thread.
-        if ((verdict.bounceType ?? "hard") === "hard") {
-          const emails = await db
-            .select({ email: prospectsTable.email })
-            .from(prospectsTable)
-            .where(and(eq(prospectsTable.gmailThreadId, row.gmailThreadId), isNull(prospectsTable.userId)));
-          for (const e of emails) {
-            if (e.email) await suppressAddress(e.email, "hard_bounce", verdict.bounceDetail ?? "hard bounce");
-          }
-        }
-
-        bouncesDetected++;
-        logger.info(
-          { threadId: row.gmailThreadId, bounceType: verdict.bounceType, detail: verdict.bounceDetail },
-          "Bounce detected (legacy) — campaign auto-paused",
-        );
-        continue;
-      }
-
-      const legacyThreadProspects = await db
-        .select({
-          id: prospectsTable.id,
-          email: prospectsTable.email,
-          sentAt: prospectsTable.sentAt,
-          app: prospectsTable.app,
-          originalBodySummary: prospectsTable.originalBodySummary,
-          replyClass: prospectsTable.replyClass,
-          replyClassifiedMsgId: prospectsTable.replyClassifiedMsgId,
-        })
-        .from(prospectsTable)
-        .where(
-          and(
-            eq(prospectsTable.gmailThreadId, row.gmailThreadId),
-            isNull(prospectsTable.userId),
-            eq(prospectsTable.replied, 0),
-          ),
-        );
-
-      // OOO: ignore, follow-ups continue. Behaviour change from the prior
-      // pause-on-any-inbound path.
-      if (verdict.kind === "ooo") {
-        const prev = legacyThreadProspects[0];
-        const latestId = verdict.latestInboundMessageId ?? null;
-        if (!prev || prev.replyClass !== "ooo" || prev.replyClassifiedMsgId !== latestId) {
-          await db
-            .update(prospectsTable)
-            .set({ replyClass: "ooo", replyClassifiedMsgId: latestId })
-            .where(
-              and(
-                eq(prospectsTable.gmailThreadId, row.gmailThreadId),
-                isNull(prospectsTable.userId),
-                eq(prospectsTable.replied, 0),
-              ),
-            );
-        }
-        logger.info({ threadId: row.gmailThreadId }, "Out-of-office reply ignored (legacy) — follow-ups continue");
-        continue;
-      }
-
-      const trigger = legacyThreadProspects[0];
-      const latestId = verdict.latestInboundMessageId ?? null;
-
-      // Cost guard: skip re-classifying an inbound the LLM already called OOO.
-      if (trigger && trigger.replyClass === "ooo" && trigger.replyClassifiedMsgId && latestId && trigger.replyClassifiedMsgId === latestId) {
-        continue;
-      }
-
-      const sentiment = await classifyReplySentiment({
-        gmail,
-        latestInboundMessageId: latestId,
-        outreachTopic: trigger?.originalBodySummary?.slice(0, 300) || undefined,
-      });
-
-      if (sentiment.replyClass === "ooo") {
-        await db
-          .update(prospectsTable)
-          .set({ replyClass: "ooo", replyClassifiedMsgId: latestId })
-          .where(
-            and(
-              eq(prospectsTable.gmailThreadId, row.gmailThreadId),
-              isNull(prospectsTable.userId),
-              eq(prospectsTable.replied, 0),
-            ),
-          );
-        logger.info({ threadId: row.gmailThreadId }, "LLM classified reply as out-of-office (legacy) — follow-ups continue");
-        continue;
-      }
-
-      await db
-        .update(prospectsTable)
-        .set({
-          replied: 1,
-          repliedAt: new Date(),
-          followupPaused: true,
-          pauseReason: "client_reply",
-          pausedAt: new Date(),
-          replyClass: sentiment.replyClass,
-          replyClassifiedMsgId: latestId,
-        })
-        .where(
-          and(
-            eq(prospectsTable.gmailThreadId, row.gmailThreadId),
-            isNull(prospectsTable.userId),
-            eq(prospectsTable.replied, 0),
-          ),
-        );
-
-      await db
-        .update(followupsTable)
-        .set({ status: "cancelled" })
-        .where(
-          and(
-            sql`${followupsTable.prospectId} IN (SELECT id FROM prospects WHERE gmail_thread_id = ${row.gmailThreadId} AND user_id IS NULL)`,
-            inArray(followupsTable.status, ["queued", "generating", "pending_approval", "drafted"]),
-          ),
-        );
-
-      if (sentiment.replyClass === "unsubscribe") {
-        for (const p of legacyThreadProspects) {
-          if (p.email) await suppressAddress(p.email, "manual", "unsubscribe reply");
-        }
-      }
-
-      if (
-        sentiment.replyClass === "positive" &&
-        sentiment.confidence >= CASCADE_MIN_CONFIDENCE &&
-        trigger &&
-        (CASCADE_ELIGIBLE_APPS as readonly string[]).includes(trigger.app)
-      ) {
-        try {
-          const cascade = await cascadeCompanyPauseOnPositiveReply({
-            userId: null,
-            replierEmail: trigger.email,
-            replierSentAt: trigger.sentAt,
-            replierThreadId: row.gmailThreadId,
-            triggerProspectId: trigger.id,
-          });
-          if (cascade.candidateCount > 0) {
-            logger.info(
-              { threadId: row.gmailThreadId, domain: cascade.domain, paused: cascade.pausedProspectIds.length },
-              "Company-reply cascade paused sibling campaigns (legacy)",
-            );
-          }
-        } catch (cascadeErr) {
-          logger.error({ cascadeErr, threadId: row.gmailThreadId }, "Company-reply cascade failed (legacy; reply still handled)");
-        }
-      }
-
-      repliesDetected++;
-    } catch (err) {
-      logger.error(
-        { err, threadId: row.gmailThreadId },
-        "Inbound classification failed for thread",
-      );
-    }
-  }
-
-  logger.info({ synced, skipped, repliesDetected, bouncesDetected }, "Sync complete (legacy)");
-  return { synced, repliesDetected };
 }
