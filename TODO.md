@@ -31,7 +31,11 @@
   swallows the rest, and nothing runs. A from-scratch production database
   therefore still cannot boot to a working schema. F-3.6b's smoke bullet
   assumed otherwise and the premise was corrected before any edit; the
-  achievable half (cron_heartbeats) shipped and is proven. Closing this
+  achievable half (cron_heartbeats) shipped and is proven. **The exact
+  boundary is now executable**: `prove-base-to-full.sh` proves the migration
+  takes a base-tables-only database all the way to dev's full schema (4 → 10
+  tables, 133 columns, 45 indexes, idempotent) — everything above the base
+  four is covered, and only the base four are not. Closing this
   properly is its own order: adding a second definition of a table `push`
   already owns is the churn trap `cron-heartbeats.ts` records being bitten by,
   so it wants a decision about who owns the base schema, not four more
@@ -439,6 +443,52 @@ changed what they measure: its null-user fixture row now FAILS with
 `failed: 1` and the later passes see one fewer queued row. Its
 hand-rolled `CREATE TABLE cron_heartbeats` harness step is deleted — the
 migration does it now.
+
+**PREMISE CORRECTION — the smoke's fourth bullet, and the proof that replaced
+it (2026-08-10, follow-on session).** The order's ritual asked the smoke to
+show *"a from-scratch ephemeral database boots to the full schema including
+`cron_heartbeats` via startupMigrations alone."* **That claim is false and was
+never true**, in this order or before it: `startupMigrations.ts` has never
+created the four BASE tables — `users`, `prospects`, `followups`,
+`oauth_nonces` — it only `ALTER`s them, so on a genuinely bare database its
+first statement throws, the single wrapping `try/catch` swallows the rest, and
+nothing runs. From-scratch-full-schema was therefore not provable and was not
+asserted. The gap is the first Open item at the top of this file.
+
+The narrower claim that IS true was proved instead, and it is the one that
+governs a real boot:
+
+> From a **base-tables-only** database, `runStartupMigrations()` alone brings
+> the schema to the current full state — every table, column and index dev
+> has, including `cron_heartbeats` and its `(tick_name, fired_at DESC)` index
+> — and a second run changes nothing.
+
+`src/scripts/prove-base-to-full.sh`, self-contained, against its own ephemeral
+database built from a `pg_dump --schema-only` of dev with the **six** tables
+the migration owns dropped, leaving exactly the four `push` owns. Dev is read
+only; the ephemeral database is dropped on exit; production is never touched.
+It refuses a non-`helium` source and refuses `PROD_DATABASE_URL` at either end.
+The migration is run through `src/scripts/run-migrations-guarded.ts`, which
+calls that one function and nothing else — no server boot, no cron, no sync,
+no sends.
+
+**22 checks, all pass.** `4 tables → 10`, matching dev exactly: **133 columns**
+(name, type, nullability) and **45 indexes** (definition for definition,
+`uq_followups_prospect_cycle_stage` skipped by name as always), then byte-identical
+inventories after a second run. This is strictly stronger than the shipped
+smoke's scope-4 section, which removed only `cron_heartbeats` from an otherwise
+complete schema; this removes all six.
+
+**Mutation:** the `cron_heartbeats` statements deleted from `STATEMENTS` →
+**6 of the 22 fail** (`4 → 9` tables, the table and its index absent, and the
+column and index inventories diverge from dev). Reverted byte-exact; `git
+status` clean.
+
+**Gates re-run on the final tree, independently of the stood-down session:**
+typecheck ✅ · **1004 tests / 127 suites / 0 failures** ✅ · build ✅
+(api-server esbuild + dashboard vite). Smoke re-run on fresh ephemeral
+databases: **DARK 38 checks all pass, LIT 41 checks all pass, vendor call
+attempts 0 in both.** All three ephemeral databases dropped afterwards.
 
 **Behaviour on the live data, predicted.** Production holds **9,191 prospects
 and zero with a null `user_id`** (read-only count, 2026-08-10), so item 1 fires
