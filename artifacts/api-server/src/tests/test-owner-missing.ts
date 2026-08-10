@@ -25,6 +25,9 @@
 
 import * as test from "node:test";
 import * as assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   resolveSendIdentity,
@@ -169,6 +172,17 @@ test.describe("the recorded failure", () => {
     // A failure whose text does not explain itself gets re-queued by a human
     // who assumes it was transient.
     assert.match(OWNER_MISSING_MESSAGE, /fallback mailbox/i);
+  });
+
+  test.it("an owner_missing row is counted as HELD on the admin surface", () => {
+    // `by_reason` populates itself from the GROUP BY, but `held` is an
+    // explicit list. A row the policy refuses on every pass, counted as
+    // not-held, is exactly the invisibility that surface exists to end.
+    const source = fs.readFileSync(
+      path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../routes/admin-activity.ts"),
+      "utf8",
+    );
+    assert.match(source, /failureReason\} in \('stranded', 'auth_dead', 'owner_missing'\)/);
   });
 });
 

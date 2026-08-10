@@ -2,7 +2,78 @@
 
 ## Open items
 
-- **[F-3.6a, out of scope — DELETE, do not harden] The zero-users legacy sync
+- **[F-3.6b] `startupMigrations.ts` still does not create the four BASE
+  tables.** `users`, `prospects`, `followups` and `oauth_nonces` are created by
+  `drizzle-kit push` alone. Every other table the server needs is now created
+  at boot — `cron_heartbeats` was the last of those and F-3.6b moved it — but
+  the startup migration only ever `ALTER`s the base four, so on a genuinely
+  bare database its first statement throws, the single wrapping try/catch
+  swallows the rest, and nothing runs. A from-scratch production database
+  therefore still cannot boot to a working schema. F-3.6b's smoke bullet
+  assumed otherwise and the premise was corrected before any edit; the
+  achievable half (cron_heartbeats) shipped and is proven. Closing this
+  properly is its own order: adding a second definition of a table `push`
+  already owns is the churn trap `cron-heartbeats.ts` records being bitten by,
+  so it wants a decision about who owns the base schema, not four more
+  `CREATE TABLE IF NOT EXISTS` statements.
+
+- **[F-3.6b, observation] Two cosmetic dev↔production drifts, neither caused
+  by this order.** (a) `followup_usage.cost_usd` stores its default as `0` on
+  dev and `'0'::numeric` on production — semantically identical, both PG 16;
+  dev's came from the startup migration's `DEFAULT 0`, production's from the
+  drizzle declaration's `.default("0")`. It was equally true on 2026-08-09
+  when the full diff was recorded as empty, so the publish diff does not see
+  it. (b) `idx_cron_heartbeats_tick_fired_at` is `(tick_name, fired_at DESC)`
+  in both databases while `lib/db/src/schema/cron-heartbeats.ts` declares it
+  ascending. F-3.6b's migration matches the DATABASES, deliberately, so a
+  fresh database lands where the real ones are; the declaration was left alone
+  because rewriting it to chase a sort direction is exactly the republish
+  churn that file's own comment warns about. Both are safe to leave and should
+  be fixed, if ever, by an order that owns the publish diff.
+
+- **[F-3.6b, out of scope] Three read-only `getLegacyGmail()` helpers still
+  read the fallback identity.** `routes/email-inspector.ts`,
+  `routes/context.ts` and `routes/anti-ghosting.ts` each carry a private copy
+  that authorises with `GOOGLE_REFRESH_TOKEN` and pairs it with
+  `process.env.SENDER_EMAIL`, used when a request arrives without a resolvable
+  `userId`. They only LIST a mailbox — they never send, draft or delete — so
+  they are off the send path F-3.6b was scoped to, and they were left
+  untouched rather than widened into. They are still the same family: an
+  inspector request that fails to resolve a user silently shows the fallback
+  account's sent mail instead of refusing. `scripts/createLabels.ts` reads the
+  same variable. Same verdict as the items F-3.6b closed: delete, don't harden.
+
+- **[F-3.6b, observation] `checkThreadForReplies()` in `gmailClient.ts` has no
+  callers.** Pre-existing dead export; F-3.6b made its Gmail argument required
+  along with the rest of the file but did not delete the function, which is a
+  separate call. Small, safe, and worth folding into the next cleanup.
+
+- **[RESOLVED by F-3.6b, 2026-08-10] The zero-users legacy sync branch.**
+  Deleted — the branch and `syncForLegacyUser()`, 290 lines. Zero connected
+  accounts now throws `NoConnectedAccountsError` (503) and the cron records
+  `outcome: "error"`. Original finding retained below.
+
+- **[RESOLVED by F-3.6b, 2026-08-10] A `user_id = NULL` prospect sending
+  through the legacy env-var mailbox.** Deleted. The send identity comes from
+  `resolveSendIdentity()`, which contains no `process.env`; an ownerless row
+  fails with `failure_reason = 'owner_missing'` before any generation or Gmail
+  call. `getGmail()` is gone and the Gmail client is a required argument
+  everywhere. Proven in the smoke's LIT mode, with all three variables set.
+  Original finding retained below.
+
+- **[RESOLVED by F-3.6b, 2026-08-10] `queueStageForProspect` ignores `cycle`.**
+  The lookup and the INSERT carry the cycle, and stage counting is scoped to
+  it in both queueing paths. Rules extracted to `lib/cycleScope.ts`. Original
+  finding retained below.
+
+- **[RESOLVED by F-3.6b, 2026-08-10] `cron_heartbeats` created by
+  `drizzle-kit push`, not by `runStartupMigrations`.** Now created at boot, in
+  the live production shape including the `fired_at DESC` index. The wider gap
+  — the base tables — is the first Open item above. Original finding retained
+  below.
+
+- **[F-3.6a, out of scope — DELETE, do not harden — RESOLVED, see above] The
+  zero-users legacy sync
   branch.** `runAllUsersSync()` falls back to `syncForLegacyUser()` when NO
   user is `is_connected`. That path swallows every per-message ingest error
   with a log line (`gmailSync.ts:1009-1012`), returns no `failed` count, and
@@ -16,7 +87,7 @@
   hardening, and there is no scenario in which falling back to one shared
   env-var mailbox is the desired behaviour for a twelve-person team.
 
-- **[F-3.6a, out of scope, found by the smoke] A prospect with
+- **[F-3.6a, out of scope, found by the smoke — RESOLVED, see above] A prospect with
   `user_id = NULL` still sends through the legacy env-var mailbox.** The
   first run of `smoke-f36a.ts` seeded a null-user prospect expecting it to be
   skipped. It was not: a legacy row has no user, so `gmail` stays undefined,
@@ -29,7 +100,7 @@
   item above and it should die with it. F-3.6a fixed only its own smoke (the
   script now deletes the three variables before importing anything).
 
-- **[F-3.6a, out of scope] `queueStageForProspect` ignores `cycle`.** Its
+- **[F-3.6a, out of scope — RESOLVED, see above] `queueStageForProspect` ignores `cycle`.** Its
   lookup filters `(prospect_id, stage)` with `.limit(1)` and no `ORDER BY`,
   while the unique constraint has been `(prospect_id, cycle, stage)` since
   B9a. For an AntiGhosting prospect on cycle 2, the row it finds may be the
@@ -39,7 +110,7 @@
   touched the failed-row branch of this function and deliberately did not
   widen into the cycle question.
 
-- **[F-3.6a, observation] `cron_heartbeats` is created by `drizzle-kit push`,
+- **[F-3.6a, observation — RESOLVED, see above] `cron_heartbeats` is created by `drizzle-kit push`,
   not by `runStartupMigrations`.** Every other table the server depends on is
   created by the startup migration; this one predates that file. It exists in
   both real databases, so the new read endpoint works — but a fresh database
@@ -199,6 +270,176 @@ Notes:
   Pub/Sub topics exist in this codebase.
 
 ## Ledger
+
+### 2026-08-10 — F-3.6b: delete-not-harden cleanup — DONE
+
+Branch `claude/f-36b-delete-not-harden`. **Predicted 17 files; touched 19**
+(6 new, 13 edited). The two beyond the prediction are both audit findings,
+below: `routes/admin-activity.ts` (an `owner_missing` row was not counted as
+held) and the deletion of `isProspectOwnerAuthDead()`, which the new
+three-field lookup left with no callers.
+
+**Gates.** typecheck ✅ · **1004 assertions across 127 files, 0 failures** ✅
+(934 before; +70 in three new suites) · build ✅ (api-server esbuild +
+dashboard vite).
+
+**What shipped, against the six scoped items**
+
+| Item | As built |
+|---|---|
+| 1. Ownerless refuses | `lib/ownerIdentity.ts` — `resolveSendIdentity()`, pure, **no `process.env` in the file at all**. A row sends as the account owning its prospect or not at all. No owner → `failed` + `failure_reason = 'owner_missing'` + an operator sentence, before any claim, any generation, any Gmail call. `getGmail()` — the `GOOGLE_REFRESH_TOKEN` client — is **deleted**, and the Gmail client is a REQUIRED argument on all seven `gmailClient.ts` functions, so `tsc` is what guarantees each call carries its own account. `queueStageForProspect` and the approve-and-send route refuse it too. |
+| 2. Legacy sync deleted | The zero-users branch and `syncForLegacyUser()` — 290 lines — are gone. Zero connected accounts throws `NoConnectedAccountsError` (503), so `/api/sync`, `/api/context/sync` and `/api/anti-ghosting/sync` surface the real condition (all three already honour `err.statusCode`) and the cron records `outcome: "error"` with `details.noConnectedAccounts`. |
+| 3. Cycle respected | `lib/cycleScope.ts` — `rowsInCycle` / `findStageRow` / `campaignPosition`, pure, with a `cycleScoped: false` switch that reproduces the defect against the same implementation (the `excludeHeldUsers` pattern). `queueStageForProspect` filters `(prospect_id, cycle, stage)` and INSERTs the cycle; `autoQueueAllCampaigns` and `queueNextFollowupStageForProspect` count stages within the prospect's current cycle. `loadProspectQueueContext()` fetches cycle + owner state in one LEFT JOIN; the hot loop still costs no extra query (the sweep supplies both). |
+| 4. cron_heartbeats | Two idempotent statements in `startupMigrations.ts`, written from a read-only `information_schema` / `pg_indexes` dump of BOTH databases — including `fired_at DESC`, which the drizzle declaration does not carry. `push` is no longer required for it. |
+| 5. idx_prospects_app | **Deleted.** See the finding below. |
+| 6. Dev alignment | Run. See below. |
+
+**Scope 5, the finding the order asked for.** `prospects.app` is filtered on
+at **29 sites**, grouped by at 1, and sorted by at **0**. So the column is
+used, heavily. The declared single-column index is nonetheless redundant:
+`idx_prospects_app_replied_paused` leads with `app`, and a B-tree prefix scan
+serves every `app = ?` predicate. Verified read-only against **production**,
+`EXPLAIN` (no execution):
+
+- `where app='anti_ghosting'` → `Index Scan using idx_prospects_app_replied_paused`
+- `where app='context'` → same
+- `group by app` → `Index Only Scan using idx_prospects_app_replied_paused`
+
+A second copy of the same prefix would never be preferred. The declaration was
+therefore stale, not pending — it has existed in the schema and in neither
+database since Phase 7a — so it is deleted rather than created. **No database
+changes either way**, which keeps dev and production identical in the publish
+diff's eyes without adding an index nothing would use.
+
+**Scope 6, dev-database alignment.** `runStartupMigrations()` run against
+`heliumdb` through a guarded one-off (`DATABASE_URL` must contain `helium` and
+must not equal `PROD_DATABASE_URL`; both guards were exercised against a
+non-helium URL and against `PROD_DATABASE_URL` itself and both refused). No
+server boot, no cron, no sync, no sends. Result: **public tables 10 → 10, no
+DDL applied** — every F-3.6b statement is `IF NOT EXISTS` over objects dev
+already had. `idx_prospects_app` absent, `idx_cron_heartbeats_tick_fired_at`
+unchanged at `(tick_name, fired_at DESC)`.
+
+Full read-only dev↔production comparison afterwards — every column, every
+index, every constraint:
+
+| Difference | Verdict |
+|---|---|
+| `uq_followups_prospect_cycle_stage`: `(prospect_id, cycle, stage)` on dev vs `(prospect_id, stage, cycle)` on production | The known, deliberate column-order drift. Skipped by name in `startupMigrations.ts`. **Not touched.** |
+| `followup_usage.cost_usd` default stored as `0` on dev, `'0'::numeric` on production | **New observation, pre-existing, not caused by this order.** Semantically identical (both PG 16); dev's copy came from the startup migration's `DEFAULT 0`, production's from the drizzle declaration's `.default("0")`. It was equally true on 2026-08-09, when the diff was recorded as empty, so the publish diff evidently does not see it. Recorded in Open items; changing it would be a schema change beyond this order. |
+
+Nothing else differs.
+
+**Expected publish plan, before Michael touches Publish: NO SCHEMA CHANGES.**
+Scope 5 chose "delete", so there is no new index. The only DDL this order adds
+is `cron_heartbeats`, which both databases already have.
+
+**Ritual: audit rounds.** Three framings; the first two found something, the
+third was clean.
+
+1. **Technical — dead code.** Replacing `isProspectOwnerAuthDead()` with the
+   three-field `loadProspectQueueContext()` left the former with no callers.
+   In a delete-not-harden order, leaving a dead private function behind is the
+   exact debt being removed. Deleted.
+2. **End-user / operator.** `admin-activity.ts` computes `failures.held` from
+   an explicit list — `retry_count >= MAX or failure_reason in ('stranded',
+   'auth_dead')`. `by_reason` populates itself from the `GROUP BY`, so
+   `owner_missing` would have appeared there, but the row would have been
+   counted as **not held** while the policy refuses it on every single pass.
+   A held row counted as unheld is precisely the invisibility F-3.6a built
+   that surface to end. `owner_missing` added to the list, with a source-level
+   test so it cannot silently fall out again.
+   Also checked, and good as-is: the dashboard's sync button already renders
+   `data.error` on a non-OK response, so a zero-account tenant now reads *"No
+   Gmail account is connected — nothing can be synced…"* where it used to read
+   *"Synced 0 emails, 0 replies detected."*
+3. **Security.** `owner_missing` cannot be spoofed over HTTP: no route writes
+   `followups.failure_reason` from request input (the `failureReason` fields in
+   `anti-ghosting.ts` / `antiGhostingValidators.ts` are an unrelated in-memory
+   validation string). The new failure text is a constant with no interpolation
+   and renders as data like every other `error_message`. `NoConnectedAccountsError`
+   carries no token, address or account id. Deleting the fallback strictly
+   reduces credential reach: `GOOGLE_REFRESH_TOKEN` is now read by **nothing**
+   on the send or sync path. Clean.
+
+   One thing considered and deliberately left: the ownerless refusal fires
+   before the suppression gate, so an ownerless prospect on a suppressed
+   address now records `owner_missing` rather than `cancelled`/bounced. Both
+   are terminal, and `owner_missing` is the more fundamental fact about the
+   row.
+
+**Ritual: mutation proof.** Every deleted branch and defect reintroduced
+briefly, each reverted immediately. Unit suites first:
+
+| Mutation | Result |
+|---|---|
+| env fallback restored inside `resolveSendIdentity` | **9 fail** (test-owner-missing, test-fallback-deleted) |
+| `getGmail()` + one optional `gmail?` restored in `gmailClient.ts` | **3 fail** |
+| `cycleScoped` defaulted to off in `cycleScope.ts` | **8 fail** (test-cycle-scope) |
+| `cron_heartbeats` statements removed from the migration | **4 fail** |
+| zero-users `{synced: 0, perUser: []}` return restored | **2 fail** |
+| `idx_prospects_app` declaration restored | **1 fail** |
+
+Then the same defects at the wiring level, against a live database:
+
+| Mutation | Smoke result |
+|---|---|
+| env fallback restored — **LIT mode** | **6 fail**, and the row's `failure_reason` became `send_error` with *"Connection error."*: **the ownerless prospect made 2 outbound calls to Google.** With a real network that is a delivery from the wrong mailbox. The transport lockout is what turned it into a failed assertion instead of a sent email. |
+| `cycle` dropped from the scheduler's lookup + INSERT, sweep unscoped | **6 fail** — `queueStageForProspect` returns `{queued:false}` for cycle-2 stage 1, no row is created, and the sweep queues nothing |
+| `cron_heartbeats` dropped from the migration | **5 fail** — the table never appears |
+| zero-users ok/synced:0 restored | **4 fail** — no throw, no 503, a result object instead |
+
+**Ritual: smoke, dark and lit.** `src/scripts/smoke-f36b.ts`, two isolated
+ephemeral databases (`f36b_smoke_dark`, `f36b_smoke_lit`, both dropped
+afterwards), each built from a `pg_dump --schema-only` of dev with
+`cron_heartbeats` deliberately **dropped**, so the migration is exercised on a
+database that does not have it.
+
+- **DARK** — the three fallback variables absent: **38 checks, all pass.**
+- **LIT** — `GOOGLE_REFRESH_TOKEN` / `SENDER_EMAIL` / `SENDER_NAME` all SET,
+  which is the production configuration and the only one in which the deleted
+  landmine could ever fire: **41 checks, all pass** (3 LIT-only).
+- **Vendor call attempts in both modes: 0.**
+
+Vendors are made impossible rather than unlikely. F-3.6a's smoke answered the
+same problem by unsetting three variables, which depends on the operator
+remembering and could not be used here at all — LIT *needs* them set. So this
+smoke replaces `http.request` / `https.request` / `.get` and `globalThis.fetch`
+with throwers before a single application module is loaded (every application
+import goes through `await import()` below the guard, so the ordering is
+guaranteed by the language rather than by ESM hoisting happening to be
+harmless). Postgres speaks `net`/`tls` and is unaffected. The guard is proven
+armed by two probes at the top of every run, and the counter is reset after
+them so any later increment is a genuine application attempt.
+
+`smoke-f36a.ts` re-run against the new code: **39 checks, all pass.** Four of
+its assertions were updated, each annotated, because F-3.6b deliberately
+changed what they measure: its null-user fixture row now FAILS with
+`owner_missing` where it used to be silently skipped, so one pass reports
+`failed: 1` and the later passes see one fewer queued row. Its
+hand-rolled `CREATE TABLE cron_heartbeats` harness step is deleted — the
+migration does it now.
+
+**Behaviour on the live data, predicted.** Production holds **9,191 prospects
+and zero with a null `user_id`** (read-only count, 2026-08-10), so item 1 fires
+on nothing today: it closes the hole before it opens rather than repairing
+damage. Every prospect is `cycle = 1` — including all 9 AntiGhosting rows — and
+nothing in the code increments `prospects.cycle` yet (the renewal UI is B9d),
+so item 3 likewise changes no current row and makes the first renewal work
+instead of stranding. Items 2 and 4 are dormant-until-needed by construction.
+**This order writes no data at deploy time.**
+
+**Not touched, as required:** `uq_followups_prospect_cycle_stage`; send
+windows, caps, models, providers; the Chief seam; the production database.
+Also deliberately left, and recorded as Open items rather than widened into:
+the three read-only `getLegacyGmail()` inspector helpers, and
+`scripts/createLabels.ts`.
+
+**Not deployed.** No publish, no secret change, no production write.
+
+**Rollback:** `git revert` the merge, or `git reset --hard
+pre-f-36b-main-tip`. `cron_heartbeats` stays and is ignored; the previous build
+created it via `push` anyway.
 
 ### 2026-08-10 — F-3.6b: delete-not-harden cleanup — BLAST RADIUS (pre-edit)
 

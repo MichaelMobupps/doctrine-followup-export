@@ -101,20 +101,11 @@ function isActiveFollowupStatus(status: string): boolean {
 }
 
 /**
- * F-3.6a: is the account that owns this prospect auth-dead?
- *
- * One indexed lookup. Legacy prospects with a null user_id answer `false` —
- * they have no account to be dead, and they are governed by the
- * prospect-level gates exactly as they were before this order.
- */
-async function isProspectOwnerAuthDead(prospectId: number): Promise<boolean> {
-  const ctx = await loadProspectQueueContext(prospectId);
-  return Boolean(ctx?.ownerAuthDead);
-}
-
-/**
  * F-3.6b: everything queueing one stage needs to know about the prospect, in
  * one round-trip.
+ *
+ * This replaces F-3.6a's `isProspectOwnerAuthDead()`, which answered one of
+ * these three questions and has no remaining callers. Delete, do not wrap.
  *
  * `cycle` is the addition, and it is the whole point. B9a made the unique key
  * `(prospect_id, cycle, stage)` but left the queueing path reading and writing
@@ -980,7 +971,7 @@ export async function queueNextFollowupStageForProspect(prospectId: number): Pro
   // reports "active follow-up exists" against rows that belong to a finished
   // cycle, and its nextStage starts at 4 and is rejected by the cap.
   const cycle = prospect.cycle ?? 1;
-  const position = campaignPosition(existingFollowups as StageRow[], cycle);
+  const position = campaignPosition(existingFollowups, cycle);
 
   if (position.hasActive) {
     return { queued: false, stage: null, scheduledAt: null, reason: "active_followup_exists" };

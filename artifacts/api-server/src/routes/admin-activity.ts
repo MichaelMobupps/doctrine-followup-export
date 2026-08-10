@@ -208,11 +208,17 @@ router.get("/admin/activity", async (req: Request, res: Response) => {
     // dead — those resume by themselves on reconnect, and leave this census
     // when they do. `stranded` and `retries_exhausted` are the ones that
     // genuinely want a human.
+    //
+    // F-3.6b: `owner_missing` joins the held set. Like `auth_dead` it is a
+    // state of the world rather than a verdict on the row — it clears the
+    // moment the prospect is given an owner — but until then the policy
+    // refuses it on every pass, and a held row that is not counted as held is
+    // exactly the invisibility this surface exists to end.
     const failedRows = await db
       .select({
         failure_reason: followupsTable.failureReason,
         count: sql<number>`count(*)::int`,
-        held: sql<number>`count(*) filter (where ${followupsTable.retryCount} >= ${MAX_AUTO_RETRIES} or ${followupsTable.failureReason} in ('stranded', 'auth_dead'))::int`,
+        held: sql<number>`count(*) filter (where ${followupsTable.retryCount} >= ${MAX_AUTO_RETRIES} or ${followupsTable.failureReason} in ('stranded', 'auth_dead', 'owner_missing'))::int`,
       })
       .from(followupsTable)
       .where(eq(followupsTable.status, "failed"))
