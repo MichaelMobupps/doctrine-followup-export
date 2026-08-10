@@ -2,33 +2,36 @@
 
 ## Open items
 
-- **[F-3.6b, 2026-08-10] The push to `origin` was REFUSED — no GitHub
-  credential exists in this workspace, and the order's contingency points at a
-  repo-local fix that is not recorded anywhere in this file.** F-3.6b is
-  merged to local `main` (`8dc57f6`, and the follow-on proof at `28bb64d`)
-  with the rollback tag
-  `pre-f-36b-main-tip` at `ac54213`; local `main` is **9 commits ahead of
-  `origin/main`** (this record included: the two pre-existing empty "Published
-  your App" markers, this order's two commits and its merge, the follow-on
-  proof commit and its merge, and this entry). `git push` fails with
-  *"Invalid username or token. Password authentication is not supported for
-  Git operations."*
-  **Re-verified 2026-08-10 by the follow-on session** with `git push --dry-run
-  origin main` — same refusal. `GIT_ASKPASS` is set to `replit-git-askpass`,
-  which does resolve on `PATH`
-  (`/nix/store/…-replit-runtime-path/bin/replit-git-askpass`) but supplies no
-  credential GitHub will accept, so the variable being set is not evidence of
-  a working one.
-  What is actually configured: `origin` is
-  `https://github.com/MichaelMobupps/doctrine-followup-export` with **no
-  credential helper** in either the repo config or the Replit global config
-  (`/run/replit/user/57158411/.config/git/config`, which carries only
-  `init.defaultBranch` and `user.*`); `gh` is installed but not logged in;
-  no token is present in the environment. Nothing was invented and no
-  credential was written — Michael owns secrets. **Michael pushes**, or
-  authorises a credential, and the tag needs pushing too:
+- **[F-3.6b, RESOLVED 2026-08-10] The push path to `origin` is STANDING — this
+  is the contingency the next order should point at.** The earlier refusal
+  (*"Invalid username or token. Password authentication is not supported for
+  Git operations."*) was a missing credential, nothing else. Michael
+  authorised it by logging `gh` in; **no secret was invented or written by an
+  agent**, and none is stored in the repo.
+  **The credential.** `gh` is authenticated as `MichaelMobupps` (token scopes
+  `gist`, `read:org`, `repo`, `workflow`), stored by `gh` itself at
+  `/home/runner/workspace/.config/gh/hosts.yml`. `gh auth login` also writes
+  its own global helper entry, but that entry hardcodes an absolute
+  `/nix/store/…-replit-runtime-path/bin/gh` path, which does not survive a
+  Nix environment rebuild. So a **repo-local helper was added** that resolves
+  `gh` from `PATH` instead:
+  `git config --local credential.https://github.com.helper '!gh auth git-credential'`.
+  That line is the durable part — if a push ever fails again after an
+  environment rebuild, re-run it before assuming the credential is gone.
+  `GIT_ASKPASS=replit-git-askpass` is still set and still supplies nothing
+  GitHub accepts; it is irrelevant now and was never evidence either way.
+  **The push order — anchor first, branch second, so the rollback point
+  exists on the remote before `main` moves:**
   `git push origin refs/tags/pre-f-36b-main-tip && git push origin main`.
-  When the fix is made, record it here so the next order's contingency is real.
+  Both ran 2026-08-10. `origin/main` went `4da6dd2` → `512f706` (the 9
+  commits: two pre-existing empty "Published your App" markers, F-3.6b's two
+  commits and their merge, the follow-on proof commit and its merge, and two
+  record commits). Verified after a re-fetch: local `main`, `origin/main` and
+  the tracking ref all at `512f706`, `0 0` ahead/behind. The rollback tag
+  `pre-f-36b-main-tip` at `ac54213` is now on the remote.
+  **Still local-only:** tag `pre-wipe-2026-07-29` at `3e5001b` was not pushed
+  — out of scope for this order, and it anchors the PA-1 history-wipe record
+  rather than this line of work. Push it deliberately or not at all.
 
 - **[F-3.6b] `startupMigrations.ts` still does not create the four BASE
   tables.** `users`, `prospects`, `followups` and `oauth_nonces` are created by
@@ -302,6 +305,45 @@ Notes:
   Pub/Sub topics exist in this codebase.
 
 ## Ledger
+
+### 2026-08-10 — F-3.6b: the refused push, completed — DONE
+
+The one thing F-3.6b could not finish. Michael authorised the credential by
+logging `gh` in; this session added the repo-local helper and pushed. No
+secret was invented, and none is stored in the repo.
+
+**What was done, in order.**
+
+1. **Repo-local credential helper.**
+   `git config --local credential.https://github.com.helper '!gh auth git-credential'`
+   — `PATH`-resolved on purpose. `gh auth login` writes its own *global*
+   helper, but pinned to an absolute `/nix/store/…/bin/gh`, which a Nix
+   rebuild invalidates. Smoke-tested before any push: the helper returned
+   `username=MichaelMobupps` and a token.
+2. **Tag first.** `git push origin refs/tags/pre-f-36b-main-tip` →
+   `* [new tag]`. The anchor at `ac54213` reaches the remote **before** `main`
+   moves, so the rollback point is never the thing that is missing.
+3. **Then the branch.** `git push origin main` → `4da6dd2..512f706`, 9
+   commits.
+4. **Verified, not assumed.** Re-fetched, then compared three refs:
+   local `main`, `git ls-remote origin refs/heads/main`, and the tracking
+   `origin/main` — all `512f706a8d13815749cffc1285857e862c30869f`.
+   `git rev-list --left-right --count origin/main...main` → `0 0`.
+   `git status -sb` → `## main...origin/main`, no ahead/behind marker.
+
+**Remote tag state after:** `refs/tags/pre-f-36b-main-tip` → `ac54213`, and
+that is the only tag on `origin`. `pre-wipe-2026-07-29` (`3e5001b`) remains
+local-only, deliberately — it belongs to the PA-1 history-wipe record, not to
+this line of work.
+
+**Note on the earlier record.** The pre-push entry stated `gh` was "installed
+but not logged in" and that no credential helper existed in either config.
+That was accurate when written. The global helper entry appeared as a
+side-effect of Michael's `gh auth login` — it was not there to be found
+before, and the earlier session did not miss it.
+
+**Standing push path** is recorded in Open items so the next order's
+contingency is real rather than a pointer to a fix nobody wrote down.
 
 ### 2026-08-10 — F-3.6b: delete-not-harden cleanup — DONE
 
