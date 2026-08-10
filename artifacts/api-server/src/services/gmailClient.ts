@@ -39,11 +39,19 @@ export function getGmailForUser(creds: GmailCredentials): gmail_v1.Gmail {
   return google.gmail({ version: "v1", auth });
 }
 
-function getGmail(): gmail_v1.Gmail {
-  const auth = getAuth();
-  auth.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
-  return google.gmail({ version: "v1", auth });
-}
+// ─── F-3.6b: `getGmail()` is deleted. ───────────────────────────────────
+//
+// It authorised with `process.env.GOOGLE_REFRESH_TOKEN` and every function
+// below took `gmail?` so it could fall back to it. That made a shared mailbox
+// the identity of last resort for the whole file: a caller that failed to
+// resolve an owner did not fail, it silently sent, read or deleted as
+// somebody else.
+//
+// The Gmail client is now a REQUIRED argument on every function here, so the
+// compiler — not a code review — is what guarantees each call carries the
+// account it belongs to. `getAuth()` above stays: the OAuth client id and
+// secret are the app's own credentials and are used for the real per-user
+// grant exchange.
 
 export async function ensureLabelsExist(
   labelNames: string[],
@@ -118,8 +126,10 @@ export interface FetchLabeledResult {
 
 export async function fetchLabeledSentEmails(
   labels: string[],
-  afterDate?: string,
-  gmail?: gmail_v1.Gmail,
+  // Undefined means "no date bound"; it stays explicit rather than optional
+  // because the Gmail client after it is required (F-3.6b).
+  afterDate: string | undefined,
+  gmail: gmail_v1.Gmail,
   // IDs the caller has already ingested. Passing this skips the expensive
   // per-message format:"full" fetch for every already-known message. Before
   // this existed, every 15-minute sync re-downloaded the full body of EVERY
@@ -127,8 +137,6 @@ export async function fetchLabeledSentEmails(
   // Gmail calls per tick, which is what stretched sync passes to hours.
   skipIds?: ReadonlySet<string>,
 ): Promise<FetchLabeledResult> {
-  if (!gmail) gmail = getGmail();
-
   const labelQuery = labels.map((l) => `label:${l.replace(/\s+/g, "-")}`).join(" OR ");
   let q = `in:sent (${labelQuery})`;
   if (afterDate) {
@@ -221,9 +229,8 @@ async function fetchMessageDetail(
 export async function checkThreadForReplies(
   threadId: string,
   senderEmail: string,
-  gmail?: gmail_v1.Gmail,
+  gmail: gmail_v1.Gmail,
 ): Promise<boolean> {
-  if (!gmail) gmail = getGmail();
   const res = await gmail.users.threads.get({
     userId: "me",
     id: threadId,
@@ -286,9 +293,8 @@ export interface ThreadInboundVerdict {
 export async function classifyThreadInbound(
   threadId: string,
   senderEmail: string,
-  gmail?: gmail_v1.Gmail,
+  gmail: gmail_v1.Gmail,
 ): Promise<ThreadInboundVerdict> {
-  if (!gmail) gmail = getGmail();
   const res = await gmail.users.threads.get({
     userId: "me",
     id: threadId,
@@ -484,9 +490,12 @@ export async function sendFollowupReply(params: {
   body: string;
   senderName: string;
   senderEmail: string;
-  gmail?: gmail_v1.Gmail;
+  // F-3.6b: REQUIRED. A send with no per-user client used to fall back to the
+  // shared `GOOGLE_REFRESH_TOKEN` mailbox, which is how an ownerless prospect
+  // was delivered under an identity unrelated to its campaign.
+  gmail: gmail_v1.Gmail;
 }): Promise<string> {
-  const gmail = params.gmail || getGmail();
+  const gmail = params.gmail;
   const raw = await buildFollowupReplyRawMessage({ ...params, gmail });
 
   const res = await gmail.users.messages.send({
@@ -509,9 +518,10 @@ export async function createFollowupDraft(params: {
   body: string;
   senderName: string;
   senderEmail: string;
-  gmail?: gmail_v1.Gmail;
+  // F-3.6b: REQUIRED — a draft lands in a real mailbox, so it needs a real owner.
+  gmail: gmail_v1.Gmail;
 }): Promise<{ draftId: string; messageId: string }> {
-  const gmail = params.gmail || getGmail();
+  const gmail = params.gmail;
   const raw = await buildFollowupReplyRawMessage({
     ...params,
     gmail,
@@ -536,10 +546,13 @@ export async function createFollowupDraft(params: {
 
 export async function deleteDraft(params: {
   draftId: string | null | undefined;
-  gmail?: gmail_v1.Gmail;
+  // F-3.6b: REQUIRED. Deleting is a mailbox mutation; the fallback made it
+  // possible to delete out of the shared mailbox on behalf of a row whose
+  // owner could not be resolved.
+  gmail: gmail_v1.Gmail;
 }): Promise<boolean> {
   if (!params.draftId) return false;
-  const gmail = params.gmail || getGmail();
+  const gmail = params.gmail;
 
   try {
     await gmail.users.drafts.delete({ userId: "me", id: params.draftId });
@@ -691,9 +704,9 @@ export async function detectManualFollowupSend(params: {
   after: Date;
   followupId: number;
   generatedBody?: string | null;
-  gmail?: gmail_v1.Gmail;
+  gmail: gmail_v1.Gmail;
 }): Promise<ManualFollowupSendDetection> {
-  const gmail = params.gmail || getGmail();
+  const gmail = params.gmail;
   const res = await gmail.users.threads.get({
     userId: "me",
     id: params.threadId,

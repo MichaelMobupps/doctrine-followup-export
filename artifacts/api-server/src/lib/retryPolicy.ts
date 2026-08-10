@@ -65,6 +65,13 @@ export function classifyProcessingFailure(args: {
 export type HoldReason =
   /** Owner's grant is refused by Google. Resumes automatically when it heals. */
   | "auth_dead"
+  /**
+   * F-3.6b. The prospect has no owning account, so there is no identity to
+   * send as. Resumes automatically once one is assigned — like `auth_dead`,
+   * and unlike the two below, this is a state of the world rather than a
+   * verdict on the row.
+   */
+  | "owner_missing"
   /** Died between the Gmail send and the status write. Needs a human. */
   | "stranded_needs_human"
   /** Spent both automatic retries. Needs a human. */
@@ -93,20 +100,33 @@ export type RetryDecision =
  * spending a strike: the row did nothing wrong, its owner's token did, and
  * charging it a retry would mean a reconnected account silently drops
  * follow-ups that had two dead-grant attempts against them.
+ *
+ * F-3.6b: `owner_missing` behaves the same way and for the same reason, with
+ * one deliberate difference in how it is READ. Both of these holds are
+ * decided from the CURRENT state of the world — `ownerAuthDead`,
+ * `ownerMissing` — never from the stale `failure_reason` string left on the
+ * row by an earlier attempt. A row that failed `owner_missing` and has since
+ * been given an owner must retry, and it must not pay a strike for the
+ * period during which it had nobody to send as.
  */
 export function decideFailedRowAction(args: {
   retryCount: number;
   failureReason: string | null | undefined;
   ownerAuthDead: boolean;
+  /** F-3.6b: true when the prospect has no `user_id` right now. */
+  ownerMissing?: boolean;
 }): RetryDecision {
   if (args.failureReason === "stranded") {
     return { action: "hold", reason: "stranded_needs_human" };
   }
+  if (args.ownerMissing) {
+    return { action: "hold", reason: "owner_missing" };
+  }
   if (args.ownerAuthDead) {
     return { action: "hold", reason: "auth_dead" };
   }
-  if (args.failureReason === "auth_dead") {
-    // The grant healed. Retry, no strike.
+  if (args.failureReason === "auth_dead" || args.failureReason === "owner_missing") {
+    // The grant healed, or the prospect was given an owner. Retry, no strike.
     return { action: "retry", nextRetryCount: Math.max(0, args.retryCount) };
   }
   if (args.retryCount >= MAX_AUTO_RETRIES) {

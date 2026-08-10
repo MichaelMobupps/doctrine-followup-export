@@ -61,6 +61,9 @@ import {
   strandedErrorMessage,
 } from "../lib/strandedGenerating";
 import { isAuthError, classifyAuthReason } from "../lib/connectionHealth";
+// F-3.6b: the send identity, and the cycle-scoped stage rules. Both pure.
+import { resolveSendIdentity, OWNER_MISSING_MESSAGE } from "../lib/ownerIdentity";
+import { campaignPosition, type StageRow } from "../lib/cycleScope";
 import type { FailureReason } from "@workspace/db";
 import { getDailyBudgetState } from "../lib/dailyBudget";
 // Global address suppression: never send to a suppressed address.
@@ -105,13 +108,45 @@ function isActiveFollowupStatus(status: string): boolean {
  * prospect-level gates exactly as they were before this order.
  */
 async function isProspectOwnerAuthDead(prospectId: number): Promise<boolean> {
+  const ctx = await loadProspectQueueContext(prospectId);
+  return Boolean(ctx?.ownerAuthDead);
+}
+
+/**
+ * F-3.6b: everything queueing one stage needs to know about the prospect, in
+ * one round-trip.
+ *
+ * `cycle` is the addition, and it is the whole point. B9a made the unique key
+ * `(prospect_id, cycle, stage)` but left the queueing path reading and writing
+ * `(prospect_id, stage)`, so a renewed AntiGhosting campaign collided with its
+ * own previous cycle. See lib/cycleScope.ts.
+ *
+ * LEFT JOIN, not INNER: the previous version of this lookup used an inner
+ * join, so a prospect with `user_id = NULL` produced no row and answered
+ * "owner not auth-dead" — true, but only because it had no owner at all. That
+ * distinction now matters, so it is carried explicitly.
+ */
+async function loadProspectQueueContext(prospectId: number): Promise<{
+  cycle: number;
+  ownerMissing: boolean;
+  ownerAuthDead: boolean;
+} | null> {
   const row = (await db
-    .select({ authDeadAt: usersTable.authDeadAt })
+    .select({
+      cycle: prospectsTable.cycle,
+      userId: prospectsTable.userId,
+      authDeadAt: usersTable.authDeadAt,
+    })
     .from(prospectsTable)
-    .innerJoin(usersTable, eq(prospectsTable.userId, usersTable.id))
+    .leftJoin(usersTable, eq(prospectsTable.userId, usersTable.id))
     .where(eq(prospectsTable.id, prospectId))
     .limit(1))[0];
-  return Boolean(row?.authDeadAt);
+  if (!row) return null;
+  return {
+    cycle: row.cycle ?? 1,
+    ownerMissing: row.userId === null || row.userId === undefined,
+    ownerAuthDead: Boolean(row.authDeadAt),
+  };
 }
 
 /**
@@ -294,21 +329,49 @@ export async function processDueFollowups(options?: {
     let gmailArtifactId: string | null = null;
 
     try {
-      let senderEmail = process.env.SENDER_EMAIL || "";
-      let senderName = process.env.SENDER_NAME || "Team";
-      let gmail = undefined;
-
+      // ── F-3.6b: the identity comes from the OWNER or nowhere. ───────────
+      //
+      // This block used to open by seeding senderEmail/senderName from
+      // `process.env.SENDER_EMAIL` / `SENDER_NAME`, and `sendFollowupReply`
+      // fell back to `GOOGLE_REFRESH_TOKEN`. A prospect with `user_id = NULL`
+      // never entered the owner branch, kept all three, and was delivered
+      // from the shared fallback mailbox — a client's follow-up going out
+      // under an identity unrelated to the campaign that owns it. Both
+      // variables are set in this deployment, so this was live.
+      //
+      // There is no identity of last resort now. `resolveSendIdentity` is a
+      // pure function with no `process.env` in it at all.
       if (item.userId) {
         if (!userCache.has(item.userId)) {
           const users = await db.select().from(usersTable).where(eq(usersTable.id, item.userId)).limit(1);
           if (users.length > 0) userCache.set(item.userId, users[0]);
         }
-        const user = userCache.get(item.userId);
-        if (user && user.googleRefreshToken && user.isConnected) {
-          senderEmail = user.email;
-          senderName = user.name || user.email.split("@")[0];
-          gmail = getGmailForUser({ refreshToken: user.googleRefreshToken, email: user.email });
-        }
+      }
+      const identity = resolveSendIdentity({
+        userId: item.userId,
+        owner: item.userId ? userCache.get(item.userId) : null,
+      });
+
+      // An ownerless row does not "skip" — skipping is what kept it invisible
+      // and re-selected on every tick. It fails, with the reason on the row,
+      // countable on the admin surface, and it reaches no Gmail call of any
+      // kind: nothing is generated, nothing is claimed, nothing is sent.
+      if (!identity.ok && identity.reason === "owner_missing") {
+        logger.error(
+          { followupId: item.followupId, prospectId: item.prospectId },
+          "F-3.6b: prospect has no owning account — REFUSING to send. Before this order the row " +
+            "would have gone out from the shared fallback mailbox.",
+        );
+        await db
+          .update(followupsTable)
+          .set({
+            status: "failed",
+            errorMessage: OWNER_MISSING_MESSAGE,
+            failureReason: "owner_missing",
+          })
+          .where(and(eq(followupsTable.id, item.followupId), eq(followupsTable.status, "queued")));
+        failed++;
+        continue;
       }
 
       // B7u: skip paused users in process. Don't generate, don't send.
@@ -340,7 +403,12 @@ export async function processDueFollowups(options?: {
           continue;
         }
       }
-      if (item.userId && !gmail) {
+      // The owner exists but holds no usable grant (never connected, or
+      // disconnected). Unchanged from before F-3.6b: the row stays queued and
+      // waits for the account to connect. This is a waiting state, not a
+      // defect — which is exactly why it is a DIFFERENT refusal from
+      // `owner_missing` above, where waiting fixes nothing.
+      if (!identity.ok) {
         logger.warn(
           { followupId: item.followupId, prospectId: item.prospectId, userId: item.userId },
           "User Gmail credentials unavailable — skipping follow-up",
@@ -348,10 +416,8 @@ export async function processDueFollowups(options?: {
         continue;
       }
 
-      if (!senderEmail) {
-        logger.warn({ followupId: item.followupId, prospectId: item.prospectId }, "No sender credentials available — skipping");
-        continue;
-      }
+      const { senderEmail, senderName } = identity;
+      const gmail = getGmailForUser({ refreshToken: identity.refreshToken, email: senderEmail });
 
       // Suppression gate: never send to a globally suppressed address. A hard
       // bounce earlier put the recipient on the list. Cancel the follow-up
@@ -900,6 +966,8 @@ export async function queueNextFollowupStageForProspect(prospectId: number): Pro
 
   const existingFollowups = await db
     .select({
+      id: followupsTable.id,
+      cycle: followupsTable.cycle,
       stage: followupsTable.stage,
       status: followupsTable.status,
       sentAt: followupsTable.sentAt,
@@ -907,15 +975,18 @@ export async function queueNextFollowupStageForProspect(prospectId: number): Pro
     .from(followupsTable)
     .where(eq(followupsTable.prospectId, prospectId));
 
-  if (existingFollowups.some((f) => isActiveFollowupStatus(f.status))) {
+  // F-3.6b: scoped to the prospect's CURRENT cycle. Unscoped, a renewed
+  // AntiGhosting campaign inherits the previous cycle's three sent stages: it
+  // reports "active follow-up exists" against rows that belong to a finished
+  // cycle, and its nextStage starts at 4 and is rejected by the cap.
+  const cycle = prospect.cycle ?? 1;
+  const position = campaignPosition(existingFollowups as StageRow[], cycle);
+
+  if (position.hasActive) {
     return { queued: false, stage: null, scheduledAt: null, reason: "active_followup_exists" };
   }
 
-  const sentRows = existingFollowups.filter((f) => f.status === "sent");
-  const lastSentRow = sentRows.length > 0
-    ? sentRows.reduce((a, b) => (a.stage > b.stage ? a : b))
-    : null;
-  const nextStage = lastSentRow ? lastSentRow.stage + 1 : 1;
+  const nextStage = position.nextStage;
   const maxFollowups = getFollowupCap(user.maxFollowups);
 
   if (nextStage > maxFollowups) {
@@ -925,7 +996,7 @@ export async function queueNextFollowupStageForProspect(prospectId: number): Pro
   const scheduledAt = computeNextStageScheduledAt({
     stage: nextStage,
     initialSentAt: prospect.sentAt,
-    lastFollowupSentAt: lastSentRow?.sentAt ?? null,
+    lastFollowupSentAt: position.lastSentAt,
     userSettings: buildUserTimingSettings(user),
     mode: getScheduleMode(user),
   });
@@ -934,11 +1005,13 @@ export async function queueNextFollowupStageForProspect(prospectId: number): Pro
   // are human-initiated, so it overrides the retry policy — but it still
   // refuses an auth-dead account. Queueing a stage against a grant Google
   // refuses buys a generation that cannot be delivered.
+  // F-3.6b: `cycle` is already resolved here, so it is passed rather than
+  // re-read.
   const { queued: didQueue, held } = await queueStageForProspect(
     prospectId,
     nextStage,
     scheduledAt,
-    { ownerAuthDead: Boolean(user.authDeadAt), automatic: false },
+    { ownerAuthDead: Boolean(user.authDeadAt), ownerMissing: false, cycle, automatic: false },
   );
 
   return {
@@ -996,6 +1069,23 @@ export interface QueueStageOptions {
    */
   ownerAuthDead?: boolean;
   /**
+   * F-3.6b. The prospect's current cycle — `prospects.cycle`.
+   *
+   * OMIT IT and this function looks it up, like `ownerAuthDead`. It is not
+   * optional to the DECISION: the unique key has been
+   * `(prospect_id, cycle, stage)` since B9a, so a lookup or an insert that
+   * ignores the cycle addresses the wrong row. See lib/cycleScope.ts.
+   */
+  cycle?: number;
+  /**
+   * F-3.6b. True when the prospect has no owning account at all.
+   *
+   * Held, not queued: there is no identity to send as, so a queued stage
+   * would be generated and then refused by the send path. Looked up when
+   * omitted. Clears by itself the moment an owner is assigned.
+   */
+  ownerMissing?: boolean;
+  /**
    * True for the 15-minute auto-queue sweep. False for an explicit human
    * action — the dashboard queue buttons, admin salvage, a manual resume.
    *
@@ -1028,12 +1118,29 @@ export async function queueStageForProspect(
   scheduledAt: Date,
   options: QueueStageOptions,
 ): Promise<{ queued: boolean; revived: boolean; held?: HoldReason }> {
+  // F-3.6b: resolve cycle / owner state in ONE round-trip, and only when the
+  // caller has not already supplied every piece. `cycle` is not optional to
+  // the decision — see QueueStageOptions.
+  const needsLookup =
+    options.cycle === undefined ||
+    options.ownerAuthDead === undefined ||
+    options.ownerMissing === undefined;
+  const ctx = needsLookup ? await loadProspectQueueContext(prospectId) : null;
+  if (needsLookup && !ctx) {
+    // No such prospect. Previously this fell through to an INSERT that died
+    // on the foreign key; refusing is the same outcome without the exception.
+    logger.warn({ prospectId, stage }, "F-3.6b: not queueing — prospect does not exist");
+    return { queued: false, revived: false };
+  }
+  const cycle = options.cycle ?? ctx!.cycle;
+  const ownerAuthDead = options.ownerAuthDead ?? ctx!.ownerAuthDead;
+  const ownerMissing = options.ownerMissing ?? ctx!.ownerMissing;
+
   // F-3.6a: an auth-dead owner blocks the WHOLE function — fresh inserts as
   // well as revivals. Google refuses the grant, so any stage queued here is a
   // full-cost generation with no possible delivery. This one is not human-
   // overridable: pressing the button harder does not make a dead token work,
   // and a reconnect clears the state (and therefore this guard) instantly.
-  const ownerAuthDead = options.ownerAuthDead ?? (await isProspectOwnerAuthDead(prospectId));
   if (ownerAuthDead) {
     logger.info(
       { prospectId, stage, automatic: options.automatic },
@@ -1042,11 +1149,29 @@ export async function queueStageForProspect(
     return { queued: false, revived: false, held: "auth_dead" };
   }
 
+  // F-3.6b: same shape, different cause. No owner means no identity to send
+  // as. Queueing here would buy a full generation for a row the send path now
+  // refuses outright — and before this order it bought a delivery from the
+  // shared fallback mailbox instead.
+  if (ownerMissing) {
+    logger.warn(
+      { prospectId, stage, cycle, automatic: options.automatic },
+      "F-3.6b: not queueing — this prospect has no owning account, so there is no Gmail grant to send from.",
+    );
+    return { queued: false, revived: false, held: "owner_missing" };
+  }
+
   // The uq_followups_prospect_cycle_stage unique index means a blind INSERT
-  // blocks if any prior row exists at this stage — including 'cancelled' rows
-  // left behind by a previous pause/cancel. Detect such rows and revive them
-  // in place; otherwise insert fresh.
+  // blocks if any prior row exists at this (cycle, stage) — including
+  // 'cancelled' rows left behind by a previous pause/cancel. Detect such rows
+  // and revive them in place; otherwise insert fresh.
   // Never touches rows that are already 'sent' or currently active.
+  //
+  // F-3.6b: `cycle` is in the WHERE. Without it this lookup addressed
+  // `(prospect_id, stage)` — half the unique key — with `.limit(1)` and no
+  // ORDER BY, so for a renewed AntiGhosting prospect it could return the
+  // PREVIOUS cycle's row. When that row was `sent` the function answered
+  // `{queued: false}` and the new cycle's stage was never queued at all.
   const existing = await db
     .select({
       id: followupsTable.id,
@@ -1059,6 +1184,7 @@ export async function queueStageForProspect(
     .from(followupsTable)
     .where(and(
       eq(followupsTable.prospectId, prospectId),
+      eq(followupsTable.cycle, cycle),
       eq(followupsTable.stage, stage),
     ))
     .limit(1);
@@ -1079,6 +1205,11 @@ export async function queueStageForProspect(
         // reach here (the auth-dead guard returned early), and it is passed
         // so the policy sees exactly the inputs its tests give it.
         ownerAuthDead,
+        // F-3.6b: likewise always false here, and passed for the same reason.
+        // The policy reads CURRENT ownership, never the stale reason string —
+        // a row that failed `owner_missing` and has since been given an owner
+        // must retry, and must not pay a strike for the gap.
+        ownerMissing,
       });
 
       // The automatic sweep obeys every hold. A human overrides
@@ -1176,9 +1307,14 @@ export async function queueStageForProspect(
 
   // No prior row. Insert. onConflictDoNothing guards a concurrent-insert
   // race (e.g., autoQueue running in parallel inserting first).
+  //
+  // F-3.6b: `cycle` is written. It used to be omitted, so every row this
+  // function created took the column default of 1 — which is correct for
+  // doctrine and context, and silently wrong for a renewed AntiGhosting
+  // campaign, whose stage belongs to cycle 2.
   const insertResult = await db
     .insert(followupsTable)
-    .values({ prospectId, stage, scheduledAt, status: "queued" })
+    .values({ prospectId, cycle, stage, scheduledAt, status: "queued" })
     .onConflictDoNothing();
   return { queued: Boolean(insertResult.rowCount), revived: false };
 }
@@ -1368,6 +1504,10 @@ export async function autoQueueAllCampaigns(): Promise<number> {
       vertical: prospectsTable.vertical,
       subVertical: prospectsTable.subVertical,
       product: prospectsTable.product,
+      // F-3.6b: the renewal cycle. Selected here so the sweep can scope stage
+      // counting to it and hand it to queueStageForProspect without a second
+      // round-trip per prospect.
+      cycle: prospectsTable.cycle,
     })
     .from(prospectsTable)
     .where(
@@ -1385,7 +1525,9 @@ export async function autoQueueAllCampaigns(): Promise<number> {
   const prospectIds = unrepliedProspects.map(p => p.id);
   const existingFollowups = await db
     .select({
+      id: followupsTable.id,
       prospectId: followupsTable.prospectId,
+      cycle: followupsTable.cycle,
       stage: followupsTable.stage,
       status: followupsTable.status,
       sentAt: followupsTable.sentAt,
@@ -1393,15 +1535,18 @@ export async function autoQueueAllCampaigns(): Promise<number> {
     .from(followupsTable)
     .where(inArray(followupsTable.prospectId, prospectIds));
 
-  const prospectFollowupMap = new Map<number, { maxSentStage: number; hasActive: boolean; lastSentAt: Date | null }>();
+  // F-3.6b: group by prospect, then let campaignPosition() apply the cycle
+  // scope per prospect. The previous version folded every cycle's rows into
+  // one running maximum, so a renewed AntiGhosting campaign inherited the
+  // finished cycle's stage count: nextStage came out 4 on a cycle that had
+  // sent nothing, the follow-up cap rejected it, and the campaign was skipped
+  // on every tick for ever. Doctrine and context are all cycle 1, so the
+  // scoped and unscoped answers are identical for them.
+  const rowsByProspect = new Map<number, StageRow[]>();
   for (const f of existingFollowups) {
-    const entry = prospectFollowupMap.get(f.prospectId) || { maxSentStage: 0, hasActive: false, lastSentAt: null };
-    if (f.status === "sent" && f.stage > entry.maxSentStage) {
-      entry.maxSentStage = f.stage;
-      entry.lastSentAt = f.sentAt;
-    }
-    if (isActiveFollowupStatus(f.status)) entry.hasActive = true;
-    prospectFollowupMap.set(f.prospectId, entry);
+    const list = rowsByProspect.get(f.prospectId) || [];
+    list.push(f);
+    rowsByProspect.set(f.prospectId, list);
   }
 
   let queued = 0;
@@ -1422,6 +1567,7 @@ export async function autoQueueAllCampaigns(): Promise<number> {
   // computation from before.
   type QueuePlanItem = {
     prospectId: number;
+    cycle: number;
     nextStage: number;
     sentAt: Date;
     lastFollowupSentAt: Date | null;
@@ -1433,21 +1579,23 @@ export async function autoQueueAllCampaigns(): Promise<number> {
   const plan: QueuePlanItem[] = [];
 
   for (const prospect of unrepliedProspects) {
-    const info = prospectFollowupMap.get(prospect.id);
-    // Skip if there's already an active (queued/generating/pending/drafted) follow-up.
-    if (info?.hasActive) continue;
+    const cycle = prospect.cycle ?? 1;
+    const position = campaignPosition(rowsByProspect.get(prospect.id) ?? [], cycle);
+    // Skip if there's already an active (queued/generating/pending/drafted)
+    // follow-up IN THIS CYCLE.
+    if (position.hasActive) continue;
 
     const userFull = prospect.userId ? userById.get(prospect.userId) : undefined;
     const maxFollowups = maxFollowupsMap.get(prospect.userId!);
-    const maxSent = info?.maxSentStage || 0;
-    const nextStage = maxSent + 1;
+    const nextStage = position.nextStage;
     if (maxFollowups !== undefined && nextStage > maxFollowups) continue;
 
     plan.push({
       prospectId: prospect.id,
+      cycle,
       nextStage,
       sentAt: new Date(prospect.sentAt),
-      lastFollowupSentAt: info?.lastSentAt ? new Date(info.lastSentAt) : null,
+      lastFollowupSentAt: position.lastSentAt ? new Date(position.lastSentAt) : null,
       userFull,
       alignmentKey: buildAlignmentKey({
         userId: prospect.userId,
@@ -1510,17 +1658,22 @@ export async function autoQueueAllCampaigns(): Promise<number> {
       // failed row's evidence every 15 minutes. `ownerAuthDead: false` is
       // guaranteed by construction: the connectedUsers query that produced
       // `plan` already excludes auth-dead accounts.
+      // F-3.6b: `cycle` and `ownerMissing` are supplied by construction too —
+      // the prospect query selected the cycle, and its `user_id IN (…)` filter
+      // means every planned prospect has an owner. The hot loop still costs no
+      // extra query per row.
       const { queued: didQueue, revived } = await queueStageForProspect(
         item.prospectId,
         item.nextStage,
         scheduledAt,
-        { ownerAuthDead: false, automatic: true },
+        { ownerAuthDead: false, ownerMissing: false, cycle: item.cycle, automatic: true },
       );
       if (didQueue) {
         queued++;
         logger.info(
           {
             prospectId: item.prospectId,
+            cycle: item.cycle,
             stage: item.nextStage,
             scheduledAt: scheduledAt.toISOString(),
             followupMode: item.userFull?.followupMode || "auto_send",

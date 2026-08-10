@@ -200,6 +200,138 @@ Notes:
 
 ## Ledger
 
+### 2026-08-10 — F-3.6b: delete-not-harden cleanup — BLAST RADIUS (pre-edit)
+
+Branch `claude/f-36b-delete-not-harden`, from `main` at `ac54213`. Closes the
+four Open items F-D4 and F-3.6a recorded as debt to **delete**, not harden.
+
+**Lineage check (Git safety rule 1), directional form.** `main` is 2 ahead of
+`origin/main` — both are empty Replit "Published your App" markers created
+locally after the F-3.6a merge (`4da6dd2`) was pushed. `replit-agent` diffs
+to **zero lines** against `main`. `gitsafe-backup/main`,
+`snapshot-2026-07-30` and `backup-old-shallow-history` hold, directionally,
+only `backup.sql`, `sync-dev-db.sql` and one stray shell-name artifact — the
+exact set PA-1 recorded on 08-05 as deliberate replacement. Every
+`bundle-*` / `cutover-*` / `followupper-f36a-*` ref is a strict ancestor of
+`main`. **No ref holds newer content `main` lacks.**
+
+**Rollback point:** tag `pre-f-36b-main-tip` at `ac54213`, pushed before the
+merge.
+
+**Premise correction, raised before any edit.** The smoke bullet asks for "a
+from-scratch ephemeral database boots to the full schema including
+`cron_heartbeats` via startupMigrations alone". The first half of that is not
+achievable and is not made achievable by this order: `startupMigrations.ts`
+has never created the four base tables (`users`, `prospects`, `followups`,
+`oauth_nonces`) — it only `ALTER`s them — so on a genuinely bare database its
+first statement throws, the single wrapping try/catch swallows the rest, and
+nothing else runs. `drizzle-kit push` owns those tables today. Scope item 4
+itself is achievable exactly as written and is delivered in full: after this
+order `cron_heartbeats` is created by the startup migration, in the live
+production shape, and `push` is not required for it. The smoke proves that
+claim against a real database that has the base tables and **no**
+`cron_heartbeats`. The residue — base tables still `push`-owned — is recorded
+as a new Open item; it is a bigger order than this one and adding a second
+definition of a table `push` already owns is the exact churn trap
+`cron-heartbeats.ts` records being bitten by.
+
+**Files to be touched — 17** (6 new, 11 edited)
+
+| File | Change |
+|---|---|
+| `api-server/src/lib/ownerIdentity.ts` | NEW — pure send-identity resolver: owner or refusal, no env, no db |
+| `api-server/src/lib/cycleScope.ts` | NEW — pure cycle-scoped stage rules, no db (mirrors `dueEligibility.ts`) |
+| `api-server/src/tests/test-owner-missing.ts` | NEW — the ownerless refusal + retry policy for it |
+| `api-server/src/tests/test-cycle-scope.ts` | NEW — the cycle regression, old rules vs new against one implementation |
+| `api-server/src/tests/test-fallback-deleted.ts` | NEW — structural: the env-fallback identity cannot come back unnoticed |
+| `api-server/src/scripts/smoke-f36b.ts` | NEW — live smoke, dark and lit, vendors blocked at the socket |
+| `lib/db/src/schema/followups.ts` | `owner_missing` added to `FAILURE_REASONS` (TS union over a plain TEXT column — no DDL) |
+| `lib/db/src/schema/prospects.ts` | `idx_prospects_app` declaration deleted (scope 5) |
+| `api-server/src/lib/retryPolicy.ts` | `owner_missing` becomes a hold, decided on CURRENT ownership |
+| `api-server/src/lib/startupMigrations.ts` | +2 statements: `cron_heartbeats` table + its index |
+| `api-server/src/services/gmailClient.ts` | `getGmail()` **deleted**; the Gmail client is a required argument everywhere |
+| `api-server/src/services/gmailSync.ts` | zero-users branch and `syncForLegacyUser()` (~290 lines) **deleted**; `NoConnectedAccountsError` added |
+| `api-server/src/services/scheduler.ts` | ownerless rows refuse with `owner_missing`; queueing becomes cycle-aware |
+| `api-server/src/routes/doctrine.ts` | approve-and-send refuses without a per-user Gmail client |
+| `api-server/src/cron.ts` | a zero-account sync tick records `error`, not `ok` |
+| `api-server/src/scripts/smoke-f36a.ts` | the three assertions F-3.6b deliberately changes |
+| `TODO.md` | Open items closed; this ledger |
+
+**Schema deltas — 2 statements, both create-only, plus one deletion that
+touches no database**
+
+| Statement | Rollback |
+|---|---|
+| `CREATE TABLE IF NOT EXISTS cron_heartbeats (…)` — byte-for-byte the live production shape, verified read-only against both databases on 2026-08-10 | none needed: the table already exists in dev and production, so this is a no-op there and only fires on a fresh database |
+| `CREATE INDEX IF NOT EXISTS idx_cron_heartbeats_tick_fired_at ON cron_heartbeats(tick_name, fired_at DESC)` | `DROP INDEX`; same no-op property |
+| `idx_prospects_app`: declaration deleted from the drizzle schema | re-add the line. **No database changes**: the index exists in neither dev nor production and nothing has ever created it |
+
+`failure_reason` is a plain TEXT column with no CHECK constraint, so the new
+`owner_missing` value needs no DDL — the same widening `pause_reason` has
+taken twice before. Nothing is dropped, renamed, retyped or made NOT NULL, so
+a code rollback needs no schema rollback.
+
+**Behaviors affected**
+
+1. A follow-up whose prospect has no owning user stops sending from
+   `SENDER_EMAIL`/`GOOGLE_REFRESH_TOKEN` and instead **fails visibly** with
+   `failure_reason = 'owner_missing'`. Today, in production, such a row sends
+   from `michael.a.g@` under someone else's campaign.
+2. A sync pass with zero connected accounts stops returning `ok`/`synced: 0`
+   and reports its true condition — 503 on the routes, `outcome: "error"` and
+   a named detail on the cron heartbeat.
+3. Queueing a stage is scoped to the prospect's current cycle, so an
+   AntiGhosting cycle-2 stage can be queued instead of colliding with a
+   `sent` cycle-1 row.
+4. A fresh database gets `cron_heartbeats` from boot instead of from
+   `drizzle-kit push`.
+
+**Worst realistic failure — five ways this could go wrong, each pre-mitigated**
+
+1. **Deleting the env fallback silently stops a real send.** If any live
+   prospect legitimately depended on the fallback identity, its follow-ups
+   would stop. Mitigation: that is the *intent* — sending a client's
+   follow-up from the wrong mailbox is the bug — and the refusal is loud
+   (`failed` + `owner_missing` + an operator sentence on the row) rather than
+   a silent skip, which is what the ownerless row gets today when the
+   variables are unset. The refusal is a pure function with its own suite.
+2. **Making the Gmail client a required argument breaks a caller.** A caller
+   relying on the fallback would now fail to compile. Mitigation: that is
+   exactly what makes this safe — every one of the seven call sites is
+   checked by `tsc`, and all of them already passed a per-user client.
+3. **Deleting `syncForLegacyUser` removes a path someone still uses.** It is
+   reachable only when `is_connected` is true for **zero** users; twelve are
+   connected today, and the multi-user path has had per-message isolation,
+   a `failed` count and per-user outcomes since the sync hardening.
+   Mitigation: the new typed error means the condition is reported instead of
+   silently substituted, and nothing else calls that function.
+4. **Cycle scoping changes doctrine/context behaviour.** Every doctrine and
+   context row is cycle 1 on both sides of the join, so the scoped query
+   returns exactly what the unscoped one did. Mitigation: the rules are one
+   pure implementation with a `cycleScoped: false` switch that reproduces the
+   old behaviour against the same fixture — the `excludeHeldUsers` pattern
+   `dueEligibility.ts` established — so the regression is demonstrated, not
+   asserted.
+5. **The new migration churns the publish diff.** A second definition of a
+   `push`-owned table is how `cron_heartbeats` index churn started in the
+   first place. Mitigation: the statement was written from a read-only
+   `pg_indexes` / `information_schema` dump of **production**, including the
+   `fired_at DESC` ordering that the drizzle declaration does not carry, so a
+   fresh database lands on the identical shape; `IF NOT EXISTS` makes it a
+   no-op on both real databases; and the dev-alignment run at the end proves
+   the publish plan is empty.
+
+**Not touched, deliberately:** `uq_followups_prospect_cycle_stage`; send
+windows, caps, models, providers; the Chief seam; the three read-only
+`getLegacyGmail()` inspector helpers in `email-inspector.ts`, `context.ts`
+and `anti-ghosting.ts` (they read a mailbox, they never send — recorded as an
+Open item rather than widened into); `scripts/createLabels.ts`; the
+production database.
+
+**Rollback:** `git revert` the merge, or `git reset --hard
+pre-f-36b-main-tip`. The one new table stays and is ignored. No data is
+migrated, no row is mutated by this order at deploy time.
+
 ### 2026-08-09 — F-3.6a: truth and flow — BLAST RADIUS (pre-edit)
 
 Branch `followupper-f36a-truth-and-flow`, from `main` at `918d996`. Built from

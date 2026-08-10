@@ -25,9 +25,19 @@ export interface FollowupFailureRecord {
  *                a full generation to learn nothing.
  * `stranded`   — the row sat in `generating` past the RH-1 threshold: the
  *                process died between the claim and the final status write.
+ * `owner_missing` — F-3.6b. The prospect has no `user_id`, so there is no
+ *                account to send as. Until F-3.6b such a row silently used
+ *                the shared `SENDER_EMAIL` / `GOOGLE_REFRESH_TOKEN` mailbox
+ *                and went out under an identity unrelated to its campaign.
+ *                Now it refuses and says so. Held, not retried: no number of
+ *                attempts invents an owner.
  * `send_error` — anything else thrown inside the per-row processing block.
+ *
+ * `failure_reason` is a plain TEXT column with no CHECK constraint — the TS
+ * union is the source of truth — so adding a value needs no DDL. Same
+ * widening `prospects.pause_reason` has taken twice.
  */
-export const FAILURE_REASONS = ["auth_dead", "stranded", "send_error"] as const;
+export const FAILURE_REASONS = ["auth_dead", "stranded", "owner_missing", "send_error"] as const;
 export type FailureReason = (typeof FAILURE_REASONS)[number];
 // The history cap and the retry budget live in api-server's lib/retryPolicy.ts
 // — they are policy, not schema, and that file must stay importable without a

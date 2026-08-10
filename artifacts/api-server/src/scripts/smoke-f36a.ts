@@ -102,20 +102,11 @@ async function main(): Promise<void> {
 
   // ── Fixture ───────────────────────────────────────────────────────────
   section("fixture");
-  // `cron_heartbeats` is created by `drizzle-kit push`, not by
-  // runStartupMigrations — it predates the startup-migration file and lives
-  // only in the drizzle schema. It therefore exists in the real databases but
-  // not in a bare scratch one, so the harness creates it. Deliberately NOT
-  // added to startupMigrations: a second definition of a table that push
-  // already owns is how index churn on every Republish starts.
-  await pool.query(`CREATE TABLE IF NOT EXISTS cron_heartbeats (
-    id SERIAL PRIMARY KEY,
-    tick_name TEXT NOT NULL,
-    fired_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    outcome TEXT NOT NULL,
-    duration_ms INTEGER NOT NULL DEFAULT 0,
-    details JSONB
-  )`);
+  // F-3.6b: `cron_heartbeats` used to be created here, because it was created
+  // by `drizzle-kit push` alone and so did not exist in a bare scratch
+  // database. It is now created by runStartupMigrations() above — in the exact
+  // live production shape, index sort order included — so this harness step is
+  // gone. See smoke-f36b.ts, which asserts that directly.
   await pool.query("TRUNCATE followups, prospects, users, cron_heartbeats RESTART IDENTITY CASCADE");
 
   // No refresh tokens anywhere: the processing loop can never reach Gmail.
@@ -162,7 +153,13 @@ async function main(): Promise<void> {
   // row is the one the query must leave behind.
   check("the due query returns all three unheld rows", r.processed === 3, r);
   check("the admin-paused row was NOT selected — no wasted slot", r.processed === 3, r);
-  check("NO VENDOR CALL: nothing sent, nothing failed", r.sent === 0 && r.failed === 0, r);
+  // F-3.6b: the null-user row now FAILS with `owner_missing` instead of being
+  // skipped at the "No sender credentials available" guard. Still no vendor
+  // call — it refuses before reaching one. That the row is SELECTED at all is
+  // the F-3.6a claim this fixture exists to prove (LEFT JOIN, not INNER); what
+  // F-3.6b changed is what happens to it afterwards.
+  check("NO VENDOR CALL: nothing sent", r.sent === 0 && r.drafted === 0, r);
+  check("F-3.6b: the ownerless row fails honestly instead of being skipped", r.failed === 1, r);
 
   // ── MODE B: auth-dead ─────────────────────────────────────────────────
   section("MODE B — auth-dead account");
@@ -176,12 +173,18 @@ async function main(): Promise<void> {
   check("the refresh token / grant row is preserved, not wiped", deadRow.isConnected === true);
 
   r = await processDueFollowups();
-  check("the auth-dead and admin-paused rows are NOT selected — no slot wasted", r.processed === 2, r);
+  // F-3.6b: one selected, not two — the legacy row left `queued` in the pass
+  // above, having failed with `owner_missing`. The auth-dead and admin-paused
+  // rows are the ones the QUERY holds back, which is what this asserts.
+  check("the auth-dead and admin-paused rows are NOT selected — no slot wasted", r.processed === 1, r);
   check("still no vendor call", r.sent === 0 && r.failed === 0, r);
 
   const stillQueued = await db.select({ n: sql<number>`count(*)::int` })
     .from(followupsTable).where(eq(followupsTable.status, "queued"));
-  check("held rows are still QUEUED, nothing cancelled", stillQueued[0].n === 4, stillQueued[0]);
+  // F-3.6b: three, not four. The held rows are all still queued and nothing is
+  // cancelled — that is the claim. The fourth is the ownerless row, now
+  // visibly failed rather than invisibly re-selected on every tick for ever.
+  check("held rows are still QUEUED, nothing cancelled", stillQueued[0].n === 3, stillQueued[0]);
 
   const queuedForDead = await queueStageForProspect(pDead.id, 2, new Date(), { automatic: true });
   check("queueStageForProspect refuses an auth-dead owner", queuedForDead.queued === false && queuedForDead.held === "auth_dead", queuedForDead);
@@ -196,7 +199,8 @@ async function main(): Promise<void> {
   section("healing — a reconnect resumes everything");
   await db.update(usersTable).set({ authDeadAt: null, authDeadReason: null }).where(eq(usersTable.id, dead.id));
   r = await processDueFollowups();
-  check("the healed account's row is selected again", r.processed === 3, r);
+  // F-3.6b: two, not three — see the ownerless row above.
+  check("the healed account's row is selected again", r.processed === 2, r);
   check("still no vendor call", r.sent === 0 && r.failed === 0, r);
 
   // ── Failed rows keep their evidence ───────────────────────────────────
