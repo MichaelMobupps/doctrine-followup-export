@@ -26,11 +26,17 @@
   Both ran 2026-08-10. `origin/main` went `4da6dd2` → `512f706` (the 9
   commits: two pre-existing empty "Published your App" markers, F-3.6b's two
   commits and their merge, the follow-on proof commit and its merge, and two
-  record commits), then `512f706` → `744832a` when the commit carrying this
-  record was pushed on top. Verified after a re-fetch at each step: local
-  `main`, `origin/main` and the tracking ref equal, `0 0` ahead/behind —
-  **`744832a` is the current tip on both sides.** The rollback tag
-  `pre-f-36b-main-tip` at `ac54213` is now on the remote.
+  record commits). The commits carrying this record were then pushed on top,
+  advancing the tip further. **No tip SHA is pinned here on purpose:** this
+  file is itself committed, so any "current tip" it names is stale the moment
+  it is pushed — the earlier session's stale commit count and this session's
+  first correction were both that same regress. The durable claim is the
+  invariant, not the SHA: after every push, local `main`, `origin/main` and
+  the tracking ref were re-fetched and compared equal at `0 0` ahead/behind.
+  Re-check it any time with
+  `git fetch origin && git rev-list --left-right --count origin/main...main`
+  — `0 0` means parity. The rollback tag `pre-f-36b-main-tip` at `ac54213` is
+  now on the remote.
   **Still local-only:** tag `pre-wipe-2026-07-29` at `3e5001b` was not pushed
   — out of scope for this order, and it anchors the PA-1 history-wipe record
   rather than this line of work. Push it deliberately or not at all.
