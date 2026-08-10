@@ -26,8 +26,10 @@
   Both ran 2026-08-10. `origin/main` went `4da6dd2` → `512f706` (the 9
   commits: two pre-existing empty "Published your App" markers, F-3.6b's two
   commits and their merge, the follow-on proof commit and its merge, and two
-  record commits). Verified after a re-fetch: local `main`, `origin/main` and
-  the tracking ref all at `512f706`, `0 0` ahead/behind. The rollback tag
+  record commits), then `512f706` → `744832a` when the commit carrying this
+  record was pushed on top. Verified after a re-fetch at each step: local
+  `main`, `origin/main` and the tracking ref equal, `0 0` ahead/behind —
+  **`744832a` is the current tip on both sides.** The rollback tag
   `pre-f-36b-main-tip` at `ac54213` is now on the remote.
   **Still local-only:** tag `pre-wipe-2026-07-29` at `3e5001b` was not pushed
   — out of scope for this order, and it anchors the PA-1 history-wipe record
