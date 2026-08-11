@@ -354,6 +354,38 @@ const STATEMENTS: string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_cron_heartbeats_tick_fired_at
      ON cron_heartbeats(tick_name, fired_at DESC)`,
+
+  // ──────────────────────────────────────────────────────────────────
+  // F-3.7a: the Chief spend cursor.
+  //
+  // One row per (UTC day, vendor) recording the running total this app has
+  // had ACCEPTED by the Chief, in whole cents. See
+  // lib/db/src/schema/chief-spend-cursor.ts for why it is a dollar total
+  // rather than a chunk count, and lib/chiefSpend.ts for how it makes a
+  // retry safe against the Chief's first-write-wins dedupe.
+  //
+  // Created unconditionally, not only when CHIEF_URL / CHIEF_INGEST_TOKEN
+  // are set. The reporter itself is fully inert while they are unset — it
+  // opens no socket and writes no row — but a table that only appears once
+  // a secret is set is a table whose first use races its own creation, and
+  // it would make the publish plan depend on which secrets happened to be
+  // present at boot. An empty four-column table costs nothing.
+  //
+  // The PRIMARY KEY constraint is NAMED explicitly. Postgres would call it
+  // `chief_spend_cursor_pkey` and drizzle-kit calls the same thing
+  // `chief_spend_cursor_day_key_vendor_pk`; a mismatch is precisely the
+  // shape of diff churn cron-heartbeats.ts records being bitten by. Both
+  // sides now spell it out, identically.
+  //
+  // IF NOT EXISTS, so re-running on every boot is a no-op.
+  // ──────────────────────────────────────────────────────────────────
+  `CREATE TABLE IF NOT EXISTS chief_spend_cursor (
+    day_key TEXT NOT NULL,
+    vendor TEXT NOT NULL,
+    reported_cents INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT chief_spend_cursor_day_key_vendor_pk PRIMARY KEY (day_key, vendor)
+  )`,
 ];
 
 export async function runStartupMigrations(): Promise<void> {
@@ -362,7 +394,7 @@ export async function runStartupMigrations(): Promise<void> {
       await pool.query(stmt);
     }
     logger.info(
-      "B7r/B7u/B9a + bounce/archive + company-cascade + F-3.6a + F-3.6b migrations applied (followup_usage, users.paused_by_admin, prospects.cycle/parent_prospect_id/pause_reason/bounce_type/paused_at/archived/archived_at/reply_class/cascade_paused_by_prospect_id/reply_classified_msg_id, followups.cycle + unique-constraint swap, users.anti_ghosting_label, thread_messages, app_settings, suppressed_addresses, users.auth_dead_at/auth_dead_reason, followups.retry_count/failure_reason/error_history, cron_heartbeats, partial indexes)",
+      "B7r/B7u/B9a + bounce/archive + company-cascade + F-3.6a + F-3.6b + F-3.7a migrations applied (followup_usage, users.paused_by_admin, prospects.cycle/parent_prospect_id/pause_reason/bounce_type/paused_at/archived/archived_at/reply_class/cascade_paused_by_prospect_id/reply_classified_msg_id, followups.cycle + unique-constraint swap, users.anti_ghosting_label, thread_messages, app_settings, suppressed_addresses, users.auth_dead_at/auth_dead_reason, followups.retry_count/failure_reason/error_history, cron_heartbeats, chief_spend_cursor, partial indexes)",
     );
   } catch (err) {
     logger.error({ err }, "B9a: startup migration failed (AntiGhosting flow will not function correctly until resolved)");

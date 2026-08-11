@@ -7,6 +7,9 @@ import { runWeeklyDigest } from "./services/weeklyDigest";
 import { logger } from "./lib/logger";
 // Phase 7n: per-tick heartbeat recording for cron-firing observability.
 import { recordHeartbeat } from "./lib/cronHeartbeat";
+// F-3.7a: outbound spend reporting to the Chief. Registers its own tick, and
+// only when CHIEF_URL + CHIEF_INGEST_TOKEN are both set.
+import { startChiefSpendReporting } from "./lib/chiefSpendSweep";
 
 // Overlap guard for follow-up processing ticks. processDueFollowups() is
 // CAS-protected against double sends, so overlap is safe — but process_due
@@ -402,5 +405,13 @@ export function startCronJobs(): void {
     }
   });
 
-  logger.info("Cron jobs active: sync+auto-queue @*/15, process @5,20,35,50, draft-stall @00:30, campaign-expiry @00:15, over-cap @00:20, archive-sweep @00:45, shared-draft-prune @01:00, weekly-digest @Tue 00:00 UTC + retry @Tue 06:00 UTC, fast-tick @*/3");
+  // F-3.7a: the outbound half of the Chief uplink. The schedule for this one
+  // lives with its own config decision rather than here, because whether it
+  // exists at all depends on CHIEF_URL + CHIEF_INGEST_TOKEN: unset means no
+  // tick is registered, no socket is opened and no cursor row is touched, and
+  // the app says so once, loudly. See lib/chiefSpendSweep.ts. It registers
+  // `chief_spend_report` @*/5 when configured.
+  startChiefSpendReporting();
+
+  logger.info("Cron jobs active: sync+auto-queue @*/15, process @5,20,35,50, draft-stall @00:30, campaign-expiry @00:15, over-cap @00:20, archive-sweep @00:45, shared-draft-prune @01:00, weekly-digest @Tue 00:00 UTC + retry @Tue 06:00 UTC, fast-tick @*/3, chief-spend @*/5 (only when the Chief seam is configured)");
 }
