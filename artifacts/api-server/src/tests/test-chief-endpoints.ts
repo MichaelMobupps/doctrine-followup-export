@@ -478,6 +478,37 @@ test.describe("GET /api/chief/accounts", () => {
     assert.equal(page.page.next_offset, page.accounts.length);
     assert.ok(Buffer.byteLength(JSON.stringify(page), "utf8") <= 420);
   });
+
+  test.it("a page always ADVANCES, even when one row alone blows the budget", async () => {
+    // The failure this pins is a hang in somebody else's process, not a wrong
+    // number: a page that returns zero rows while rows remain sets
+    // `next_offset` back to its own `offset`, and a caller following
+    // `next_offset` walks that page for ever.
+    const { packAccountsPage } = await import("../lib/chiefView");
+    let offset = 0;
+    const visited = new Set<number>();
+    for (let hop = 0; hop < 20 && offset !== null && offset < FIXTURE.length; hop++) {
+      const page: {
+        page: { next_offset: number | null; returned: number };
+        accounts: Array<{ id: number }>;
+      } = packAccountsPage({
+        rows: FIXTURE.slice(offset),
+        limit: 50,
+        offset,
+        total: FIXTURE.length,
+        serverTime: NOW.toISOString(),
+        appName: "followup",
+        byteBudget: 1, // no page can satisfy this
+      });
+      assert.equal(page.page.returned, 1, "one row is kept rather than none");
+      page.accounts.forEach((a) => visited.add(a.id));
+      const next: number | null = page.page.next_offset;
+      assert.notEqual(next, offset, "the walk must move");
+      if (next === null) break;
+      offset = next;
+    }
+    assert.equal(visited.size, FIXTURE.length, "every row is still reachable");
+  });
 });
 
 test.describe("identity discipline — no email address ever reaches the wire", () => {
@@ -491,6 +522,15 @@ test.describe("identity discipline — no email address ever reaches the wire", 
     assert.equal(accountLabel(7, "Michael"), "Michael");
     assert.equal(accountLabel(7, "  Michael\nGoldstein  "), "Michael Goldstein");
     assert.equal(accountLabel(7, "M".repeat(500)).length, MAX_LABEL_CHARS);
+  });
+
+  test.it("bounds by code point, so a long label cannot end in half a character", () => {
+    const label = accountLabel(7, "😀".repeat(100));
+    assert.equal(Array.from(label).length, MAX_LABEL_CHARS);
+    // A lone surrogate survives JSON.stringify as an escape rather than
+    // throwing, so the failure this pins is a `\udXXX` in an operator's console.
+    assert.equal(JSON.parse(JSON.stringify({ label })).label, label);
+    assert.ok(!/[\uD800-\uDFFF]/.test(label.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, "")));
   });
 
   test.it("an empty or missing name becomes a positional label", () => {

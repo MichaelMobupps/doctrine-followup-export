@@ -248,19 +248,36 @@ export function preparePayload(
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
-/** Bodies may be HTML (§5). Never `JSON.parse` blindly. */
-function describeBody(text: string): string {
-  const clipped = text.slice(0, BODY_LOG_MAX);
+/**
+ * Remove the order-token from a string that came from outside this process.
+ *
+ * Every request this module makes hands the token to whatever is answering at
+ * `CHIEF_URL`. An app — or, far more likely, a proxy or a deployment
+ * interstitial in front of one — that echoes its request headers into an error
+ * page would otherwise walk the token straight into this app's log. Cheap to
+ * prevent, impossible to notice afterwards. The Chief applies the identical
+ * rule to text it carries back from us (`appClient.ts scrubSecret()`).
+ */
+export function scrubSecret(text: string, secret: string): string {
+  if (!secret) return text;
+  return text.split(secret).join("[redacted]");
+}
+
+/**
+ * Bodies may be HTML (§5). Never `JSON.parse` blindly, and never return text
+ * from the other side without scrubbing the token out of it first.
+ */
+function describeBody(text: string, secret: string): string {
   try {
     const parsed = JSON.parse(text) as unknown;
     if (parsed && typeof parsed === "object") {
       const e = (parsed as Record<string, unknown>).error;
-      if (typeof e === "string") return e;
+      if (typeof e === "string") return scrubSecret(e, secret).slice(0, BODY_LOG_MAX);
     }
   } catch {
     /* HTML, or a stack trace outside production. The clipped text is the answer. */
   }
-  return clipped;
+  return scrubSecret(text, secret).slice(0, BODY_LOG_MAX);
 }
 
 export function createChiefReporter(
@@ -339,12 +356,12 @@ export function createChiefReporter(
     if (res.status === 200) return { class: "ok", deduped: true };
 
     if (res.status >= 500) {
-      return { class: "retry", reason: `HTTP ${res.status}: ${describeBody(text)}` };
+      return { class: "retry", reason: `HTTP ${res.status}: ${describeBody(text, cfg.token)}` };
     }
 
     // Everything else — every 4xx, and any redirect we refused to follow — is a
     // human's problem. Never retried, here or on a later sweep.
-    return { class: "refused", status: res.status, reason: describeBody(text) };
+    return { class: "refused", status: res.status, reason: describeBody(text, cfg.token) };
   }
 
   return {

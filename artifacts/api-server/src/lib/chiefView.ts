@@ -78,7 +78,12 @@ export function accountLabel(id: number, name: string | null | undefined): strin
   // A bare `@` is not an address but is still the shape of one; refuse it too
   // rather than reasoning about which halves of an address are harmless.
   if (cleaned.includes("@")) return `Account ${id}`;
-  return cleaned.length > MAX_LABEL_CHARS ? cleaned.slice(0, MAX_LABEL_CHARS) : cleaned;
+  // Sliced by CODE POINT, not by UTF-16 unit. A plain `slice()` can cut an
+  // emoji or a non-BMP character in half and leave a lone surrogate in the
+  // label; `JSON.stringify` escapes that rather than throwing, so it would not
+  // break the response — it would just put a `\udXXX` in front of an operator.
+  const points = Array.from(cleaned);
+  return points.length > MAX_LABEL_CHARS ? points.slice(0, MAX_LABEL_CHARS).join("") : cleaned;
 }
 
 // ── Account state ────────────────────────────────────────────────────────────
@@ -252,7 +257,14 @@ export function packAccountsPage(args: {
 
   for (const row of args.rows) {
     accounts.push(row);
-    if (Buffer.byteLength(JSON.stringify(build()), "utf8") > budget) {
+    // ALWAYS keep the first row, even if it alone blows the budget. A page that
+    // returns zero rows while rows remain sets `next_offset` back to its own
+    // `offset`, and a caller following `next_offset` then spins on that page for
+    // ever. One oversize page is a bad response the Chief already knows how to
+    // report; an infinite walk is a hang in somebody else's process. A label is
+    // bounded and the envelope is fixed, so this branch is unreachable at the
+    // real budget — it is here so that stays true if either changes.
+    if (accounts.length > 1 && Buffer.byteLength(JSON.stringify(build()), "utf8") > budget) {
       accounts.pop();
       break;
     }
@@ -260,10 +272,11 @@ export function packAccountsPage(args: {
 
   // The envelope's own counters shrink as rows come off, so a single trailing
   // check is enough — but loop anyway rather than reason about it, since the
-  // cost is one serialisation of a page that is already at the ceiling.
+  // cost is one serialisation of a page that is already at the ceiling. Stops
+  // at one row for the reason above.
   let body = build();
   while (
-    accounts.length > 0 &&
+    accounts.length > 1 &&
     Buffer.byteLength(JSON.stringify(body), "utf8") > budget
   ) {
     accounts.pop();

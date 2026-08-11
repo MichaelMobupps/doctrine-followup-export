@@ -340,6 +340,28 @@ test.describe("the reporter", () => {
     assert.ok(!lines.join(" ").includes(CFG.token));
   });
 
+  test.it("scrubs the order-token out of anything the other side says back", async () => {
+    // Not the Chief itself — its 401 body is fixed. The realistic source is a
+    // proxy or a deployment interstitial in front of it echoing the request
+    // headers into an error page, which would otherwise walk the token into
+    // this app's log where nobody would ever notice it.
+    const lines: Array<Record<string, unknown>> = [];
+    const log = {
+      info: () => {},
+      warn: () => {},
+      error: (o: Record<string, unknown>) => lines.push(o),
+    };
+    const { fetchImpl } = fakeChief([
+      { status: 400, body: `<pre>Bad Request: Authorization: Bearer ${CFG.token}</pre>` },
+    ]);
+    const r = createChiefReporter(CFG, { fetchImpl, log, ...FAST });
+    const out = await r.send({ vendor: "anthropic", amountUsd: 0.5, externalId: "kS" });
+    assert.equal(out.kind, "refused");
+    const everything = JSON.stringify(lines) + JSON.stringify(out) + String(r.haltedReason());
+    assert.ok(!everything.includes(CFG.token), "the token must not survive into a log or an outcome");
+    assert.ok(everything.includes("[redacted]"));
+  });
+
   test.it("a 3xx is a refusal, not a hop — the token never follows a redirect", async () => {
     const { fetchImpl, seen } = fakeChief([{ status: 307, body: "" }]);
     const r = createChiefReporter(CFG, { fetchImpl, ...FAST });
