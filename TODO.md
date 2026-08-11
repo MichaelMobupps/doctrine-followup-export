@@ -2,6 +2,30 @@
 
 ## Open items
 
+- **[F-3.7a] `drizzle-kit push` wants to churn 18 statements against a
+  dev-shaped database, and F-3.7a is not the cause.** Measured on 2026-08-11
+  with `--verbose` against throwaway copies of the dev schema, never against
+  dev or production. The pre-F-3.7a schema against a pre-F-3.7a database
+  produces the **same 18 statements** as the F-3.7a schema against a database
+  that has booted this build, and neither list mentions `chief_spend_cursor`.
+  What it wants to do: drop and re-add `uq_followups_prospect_cycle_stage`,
+  `thread_messages_gmail_message_id_key`, `suppressed_addresses_email_key`,
+  `thread_messages_prospect_id_fkey`, `fk_prospects_parent_prospect` and
+  `fk_prospects_cascade_trigger` under drizzle's own naming; drop
+  `prospects_app_check` and `users_followup_mode_check`; rewrite two jsonb
+  defaults; and — the one that matters — **`DROP INDEX
+  idx_cron_heartbeats_tick_fired_at` and recreate it WITHOUT the `fired_at
+  DESC`** that F-3.6b deliberately wrote into the startup migration after
+  reading it off production. On a table with rows the constraint swap prompts
+  about truncating `followups`; on an empty one it applies silently. Nothing
+  was applied to dev (the one interactive run was killed at the prompt and dev
+  was verified intact afterwards: all eight constraints present, the `DESC`
+  index intact, 11 tables). This is the churn class `cron-heartbeats.ts` and
+  `startupMigrations.ts` both record being bitten by, now measured end to end.
+  Closing it is its own order — it wants a decision about whether the drizzle
+  declarations or the live databases are the source of truth, not eighteen
+  ad-hoc alignments.
+
 - **[F-3.6b, RESOLVED 2026-08-10] The push path to `origin` is STANDING — this
   is the contingency the next order should point at.** The earlier refusal
   (*"Invalid username or token. Password authentication is not supported for
@@ -313,6 +337,159 @@ Notes:
   Pub/Sub topics exist in this codebase.
 
 ## Ledger
+
+### 2026-08-11 — F-3.7a: the Chief's uplink — DONE
+
+Branch `claude/f-37a-chief-uplink`, from `main` at `d653912`. Rollback tag
+`pre-f-37a-main-tip` at that commit, pushed before the merge.
+
+**Lineage check (Git safety rule 1), directional form.** `main` was 2 ahead of
+`origin/main`; both are the empty Replit "Published your App" markers F-3.6b
+already recorded. `replit-agent` diffs to **zero lines** against `main`.
+`gitsafe-backup/main`, `snapshot-2026-07-30` and `backup-old-shallow-history`
+hold exactly three files `main` lacks — `backup.sql`, `sync-dev-db.sql` and the
+stray shell-name artifact `"ql \"$DATABASE_URL\" -c \""` — the same set PA-1
+recorded on 08-05 as deliberate replacement. Every `bundle-*` / `cutover-*` /
+`claude/f-36b-*` / `followupper-f36a-*` ref is a strict ancestor of `main`.
+**No ref holds newer content `main` lacks.**
+
+**Files: 17** (13 new, 4 edited). Nothing outside the new seam changed
+behaviour; the four edits are one import + one mount line, one migration
+statement, one schema export, and one boot call.
+
+| File | Change |
+|---|---|
+| `api-server/src/lib/chiefAuth.ts` | NEW — order-token gate, pure (`node:crypto` only): case-sensitive `Bearer `, constant-time compare, the one 401 body, the half-a-seam boot warning |
+| `api-server/src/lib/chiefView.ts` | NEW — pure wire shaping: account label, state precedence, measured page packing, status body, the email predicate |
+| `api-server/src/lib/chiefReaders.ts` | NEW — the six reads, composed from the same pure helpers as their fail-open siblings but letting the error out |
+| `api-server/src/routes/chief.ts` | NEW — the two endpoints, sources injected |
+| `api-server/src/lib/chiefSpend.ts` | NEW — the outbound protocol, pure: config, payload, reporter, offsets, id namespace, vendor names |
+| `api-server/src/lib/chiefSpendSweep.ts` | NEW — the sweep, the cursor, the tick, and the dormant-and-loud decision |
+| `lib/db/src/schema/chief-spend-cursor.ts` | NEW — the cursor declaration |
+| `api-server/src/tests/test-chief-{auth,endpoints,spend,mount}.ts` | NEW — 4 suites, 91 assertions |
+| `api-server/src/scripts/smoke-f37a.ts` | NEW — dark/lit smoke |
+| `api-server/src/lib/startupMigrations.ts` | +1 idempotent statement (`chief_spend_cursor`), named PK |
+| `api-server/src/routes/index.ts` | mount `/chief` **before** `doctrineRouter` |
+| `lib/db/src/schema/index.ts` | export the new table |
+| `api-server/src/cron.ts` | call `startChiefSpendReporting()` |
+
+**What shipped, against the six scoped items**
+
+| Item | As built |
+|---|---|
+| 1. `GET /api/chief/status` | `app`, `ok`, `version`, `server_time`, `spend_today_usd` (UTC day, every vendor), a `capabilities` object, `health` (census / due-queue depth / global pause / oldest heartbeat age / per-cron pulses) and `budget` (both day windows). `accepting_jobs` and `active_jobs` are **omitted** — see below |
+| 2. `GET /api/chief/accounts` | Per account: positional-or-name label that can never be an address, `state` in a four-value closed set, `paused_by_admin`, `auth_dead_since` (date), `auth_dead_reason` (closed vocabulary), `last_send_at`, `queue_depth`. Paged, and packed to a **measured** 48 KB budget under the Chief's 64 KB hard ceiling |
+| 3. Spend reporting | `POST <CHIEF_URL>/api/ingest/spend`, $0.50 quanta, one request per quantum, per UTC day per vendor, `initiated_by: human`, `external_id` = `followup-<day>-<vendor>-<offset cents>`. 5xx retries the same id; every 4xx latches the reporter off loudly; 401 names the operator fix. Unset config = dormant, one loud line per boot, nothing touched |
+| 4. Token | `FOLLOWUP_CHIEF_TOKEN` inbound, `CHIEF_INGEST_TOKEN` outbound, and a boot WARN when the two disagree or only one is set — the Chief holds ONE value per app and uses it in both directions |
+| 5. Cursor table | `chief_spend_cursor`, idempotent startup migration, dev booted before Publish, publish plan measured (below) |
+| 6. Contract | Printed verbatim in the F-3.7a report, ready to embed in C-3.7b |
+
+**Why `accepting_jobs` and `active_jobs` are absent rather than `false`/`0`.**
+The Chief reads six optional fields and renders `—` for any it did not receive,
+recording the absence in `fields_present` (`src/probe.ts readStatus()`). Two of
+the six presuppose an app that takes jobs. This one takes none and F-3.7a
+deliberately adds no seam for it. `accepting_jobs: false` renders as "accepting
+jobs: no", which reads as a temporary condition somebody should fix; `true`
+would advertise a seam that does not exist. Omission is the Chief's own designed
+way to say "that question does not apply", and the real answer travels in
+`capabilities`.
+
+**Three premise corrections, raised before any edit.**
+1. **The state set is four, not three.** The order names `connected |
+   auth_dead | paused`. `is_connected` and `auth_dead_at` are different facts
+   (F-3.6a: a withdrawn grant is not a refused one) and `paused_by_admin` is
+   orthogonal to both, so `disconnected` exists and is reported. `auth_dead`
+   OUTRANKS `paused` in the single `state` string — an admin pause must never
+   hide the condition this endpoint exists to surface — and `paused_by_admin`
+   rides alongside so nothing is lost.
+2. **There is no `.replit.app` address to state verbatim.** `.replit:27-32`
+   records that `doctrine-followupv-2.replit.app` died with the old deployment
+   and that the canonical address is now the custom domain. The report states
+   the address to use and the exact probe URL instead.
+3. **Two variable names, one secret.** The order names the inbound and outbound
+   tokens separately; the Chief's `FOLLOWUP_TOKEN` is marked `both` in its
+   CONTRACT §7. Both are read, and a boot WARN fires when they disagree.
+
+**Gates.** typecheck ✅ · **1095 tests / 147 suites / 0 failures** ✅ (1004
+before; +91 in four new suites) · build ✅ (api-server esbuild + dashboard vite).
+
+**Smoke, on isolated ephemeral databases, vendors impossible, no email sent.**
+`DARK 19 checks pass, LIT 47 checks pass, outbound vendor call attempts 0 in
+both.` Both databases dropped afterwards. The transport (`http(s).request`,
+`http(s).get`, `globalThis.fetch`) is replaced with throwers before the first
+application import; the only escape hatch refuses any host but `127.0.0.1`, and
+the spend reporter is handed a fake Chief rather than a socket.
+
+**Mutation proof — every claim was broken on purpose and watched to bite.**
+
+| Mutation | Result |
+|---|---|
+| 401s made distinguishable (four different bodies by failure class) | **6 of 36 fail** across `test-chief-endpoints` and `test-chief-mount` |
+| Cursor never advances (double-report every quantum) | **5 smoke checks fail**; the fake Chief absorbs the repeats (`deduped: 2`, no second row) — idempotency doing its job while the smoke catches the defect |
+| `external_id` made non-deterministic | **4 smoke checks + 1 unit test fail**; the fake Chief now books **4 rows for 2 real quanta** — the exact double charge the id namespace prevents |
+| Label rule removed, payload guard left in | accounts answers **503**; the second line of defence holds and the fixture check bites |
+| Label rule AND payload guard removed | **the leak grep bites**, naming the three response bodies that carried the address |
+
+Every file restored and confirmed byte-identical to `HEAD` afterwards.
+
+**Godlike audit — 3 rounds, closed clean on round 4.**
+- *Round 1, technical, 2 findings, both fixed.* (i) A page that could fit no
+  rows set `next_offset` back to its own `offset`, so a caller following
+  `next_offset` walks that page for ever — a hang in somebody else's process,
+  not a wrong number. The packer now always keeps the first row. Unreachable at
+  the real budget; pinned by a test that drives a 1-byte budget. (ii) The
+  `(day, vendor)` bucket key was recovered by splitting the joined string back
+  apart — correct only while no vendor name contains the separator. One
+  `bucketKey()` now spells it and the parts ride alongside the map entry.
+- *Round 2, end-user, 1 finding, fixed.* Labels were bounded by UTF-16 unit, so
+  a long non-BMP name could end in half a character and reach the operator's
+  console as `\udXXX`. Bounded by code point now.
+- *Round 3, security, 1 finding, fixed.* Text the other side sends back was
+  logged unscrubbed. The Chief's own 401 body is fixed, but a proxy or
+  deployment interstitial in front of it echoing request headers into an error
+  page would have walked our order-token into this app's log. `scrubSecret()`
+  now runs over anything carried back — the same rule the Chief applies to text
+  it carries from us.
+- *Round 4 (added), clean.* All gates and both smokes re-run on the final tree.
+
+**Schema and the publish plan, measured rather than promised.** Dev was booted
+before Publish — `run-migrations-guarded.ts` with `ALLOW_DEV=1`, which runs
+`runStartupMigrations()` and nothing else: no server, no cron, no sync, no send.
+`chief_spend_cursor` now exists in dev with the declared shape, including the
+primary-key constraint name `chief_spend_cursor_day_key_vendor_pk`, spelled out
+explicitly on both sides so the two tools cannot disagree about it.
+
+Three `drizzle-kit push --verbose` probes, each against a throwaway copy of the
+dev schema, never against dev or production:
+
+| Probe | Schema | Database | Result |
+|---|---|---|---|
+| A | F-3.7a | has `chief_spend_cursor` | 18 statements, **none of them about `chief_spend_cursor`** |
+| B | F-3.7a with the declaration removed | has `chief_spend_cursor` | `DROP TABLE "chief_spend_cursor" CASCADE` — this is why the declaration exists |
+| C | pre-F-3.7a | no `chief_spend_cursor` | **the same 18 statements** |
+
+So **F-3.7a adds exactly zero statements** to the publish plan against a
+database that has booted this build, and exactly one `CREATE TABLE` against one
+that has not — which production will never need, because the startup migration
+creates it at boot. The 18-statement baseline is pre-existing and is recorded as
+an Open item below.
+
+**Not touched, deliberately:** every send path, every Gmail call, every
+generator, the scheduler, the daily budget cap's own enforcement, the admin
+surface, `uq_followups_prospect_cycle_stage`, the production database. No
+endpoint lets the Chief write, enrol, pause or command anything. No reply or
+sentiment data crosses the seam. The Chat app is untouched.
+
+**Not deployed.** No publish, no secret change, no production read or write.
+The seam ships DARK: with `FOLLOWUP_CHIEF_TOKEN` unset every probe is answered
+`401`, and with `CHIEF_URL` / `CHIEF_INGEST_TOKEN` unset the reporter is dormant
+and says so once per boot. Michael sets the secrets; nothing here does.
+
+**Rollback:** `git revert` the merge, or `git reset --hard
+pre-f-37a-main-tip`. `chief_spend_cursor` stays and is ignored — the previous
+build simply does not know about it, the same property every additive migration
+since B7u has had. No data is migrated and no row is mutated by this order at
+deploy time.
 
 ### 2026-08-10 — F-3.6b: the refused push, completed — DONE
 
