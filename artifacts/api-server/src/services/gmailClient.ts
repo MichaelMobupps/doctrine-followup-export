@@ -1,7 +1,8 @@
-import { google, gmail_v1 } from "googleapis";
+import { gmail_v1 } from "googleapis";
 import { logger } from "../lib/logger";
 import { classifyBounce, type BounceKind } from "../lib/bounceDetection";
 import { isOutOfOffice, type AutoReplyHeaders } from "../lib/replyClassification";
+import { newGoogleOAuthClient, newGmailClient } from "../lib/googleApi";
 
 export interface GmailMessageMeta {
   id: string;
@@ -27,16 +28,17 @@ export interface GmailCredentials {
 }
 
 function getAuth() {
-  return new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-  );
+  // F-3.7b: constructed through lib/googleApi so the OAuth token refresh —
+  // made on the auth library's own transporter, which service options never
+  // reach — is bounded too. An unbounded refresh hangs the row before the
+  // API call is even attempted.
+  return newGoogleOAuthClient();
 }
 
 export function getGmailForUser(creds: GmailCredentials): gmail_v1.Gmail {
   const auth = getAuth();
   auth.setCredentials({ refresh_token: creds.refreshToken });
-  return google.gmail({ version: "v1", auth });
+  return newGmailClient(auth);
 }
 
 // ─── F-3.6b: `getGmail()` is deleted. ───────────────────────────────────

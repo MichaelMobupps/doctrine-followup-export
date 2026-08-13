@@ -2,6 +2,79 @@
 
 ## Open items
 
+- **[F-3.7b, DONE 2026-08-13] The fast_tick alarm was a false death report, and
+  three real unbounded things sat under it.** The Chief's all-day
+  `followup_cron_stale` alerts were accurate about the number and wrong about
+  the cause: fast_tick was firing every three minutes exactly as scheduled and
+  writing NOTHING when it hit the processing overlap guard, so `max(fired_at)` —
+  the machine liveness signal since F-3.7a — aged for the length of every pass.
+  Four fixes, in the diagnosis's order.
+  1. **The skip is recorded.** A guarded fast_tick now writes its heartbeat
+     (`outcome: ok`, `details.skipped`, plus `passAgeMs`/`sinceProgressMs`)
+     exactly as process_due always has. The deleted comment feared "20k+ rows of
+     skipped entries"; the arithmetic never supported it, because the tick
+     writes at most one row per firing either way — the ceiling was 480/day
+     before and is 480/day now. The Chief's staleness rule works as written,
+     with no Chief-side change.
+  2. **The guard is bounded.** `processTickRunning` (a bare boolean with no
+     watchdog and no identity token) became a pass record in
+     `lib/processingGuard.ts`. Deliberate departure from the sync guard: the
+     watchdog measures TIME SINCE THE PASS LAST FINISHED A ROW, not total pass
+     age, because a healthy 20-row pass legitimately runs for many minutes and
+     age alone cannot tell slow from wedged. Limit **10 minutes** of no
+     progress — well above any single row (180s generation + 30s-bounded Gmail
+     calls) and far below the sync path's 4h, because every extra minute is a
+     minute a genuinely hung pass blocks ALL sending. Reclaiming early is safe
+     by construction: rows are CAS-claimed to `generating`, so a second pass
+     skips everything the first holds. A reclaim logs at error, lands on the
+     heartbeat as `wedgeReclaimedAfterMs`, and marks the tick `partial` so it
+     shows in the Chief's `errors_24h`.
+  3. **googleapis request timeouts — the gap this file has recorded open since
+     2026-07-16 is closed.** Every Google client is now built by
+     `lib/googleApi.ts`, at **30s**, on BOTH HTTP surfaces: the API request (via
+     service options, which googleapis merges into every call) and the OAuth
+     token refresh (via `transporterOptions`, which service options never
+     reach — an unbounded refresh hangs the row before the API call is even
+     attempted). A test walks the tree and fails if any raw `google.gmail(`,
+     `google.oauth2(` or `new google.auth.OAuth2` reappears elsewhere.
+  4. **Per-row generation deadline, 180s.** Exactly the sum of the three 60s
+     per-call caps for a full draft/critic/rewrite, so it cannot cut a
+     generation that is merely slow inside those caps; it cuts what the caps do
+     not bound, which is retry ladders stacking (~13 min for one row). Two
+     mechanisms: a hard race that bounds the PASS, and an AsyncLocalStorage
+     budget both retry layers read so an abandoned row stops billing — the
+     F-D4 burn shape. A deadlined row is `send_error` under the F-3.6a policy
+     (bounded retry, never `stranded`: generation is entirely before the first
+     Gmail write, so nothing can be duplicated), carrying "No email or draft was
+     created" as evidence.
+  **Two defects the audit round found in my own work, both fixed:** a
+  GenerationDeadlineError thrown inside the fail-open critic would have shipped
+  an un-critiqued email on the strength of a timeout, and inside the writer
+  chain would have scored `breaker.onFailure()` against Gemini — opening the
+  breaker and pushing later rows onto the dearer Anthropic tier for a fault
+  Gemini never had. Both paths now re-throw the budget.
+  **A correction to the 2026-08-13 diagnosis:** it put a call site's worst case
+  at ~5.25 min and a row's at ~16 min. `withAnthropicRetry` already carried
+  `totalBudgetMs: 90s`, which the diagnosis missed. The real figures are ~150s
+  per ladder and ~13 min per row. Smaller, still far past a 3-minute tick, and
+  the design is unchanged.
+  **Proofs.** 29 hermetic tests + `scripts/smoke-f37b.ts` on an ephemeral
+  database with the transport dead (`f37b_smoke`, created, run, dropped; zero
+  outbound attempts, nothing sent). Five mutation proofs, each watched to bite:
+  remove the skip heartbeat (both the unit pin AND the smoke — which reproduced
+  the exact production symptom, `max(fired_at)` frozen while the tick fired),
+  remove the watchdog, neuter the deadline, let the breaker absorb a deadline,
+  let the critic swallow one. `pnpm run build` green.
+  **Known and NOT closed here:** nothing prunes `cron_heartbeats`. No retention
+  governs the table at all. This order does not change its growth rate — the
+  ceiling is unchanged — but the table grows unboundedly and always did. That
+  is its own order.
+  **Deployment, unchanged and re-verified:** `.replit` is `deploymentTarget =
+  "vm"` and the 2026-07-16 switch demonstrably reached production (it killed the
+  old `.replit.app` address, which is why `APP_URL` is the custom domain). The
+  process is resident; it never idled between requests. This was never the
+  autoscale failure returning. **Not published — Michael publishes.**
+
 - **[F-3.7a] `drizzle-kit push` wants to churn 18 statements against a
   dev-shaped database, and F-3.7a is not the cause.** Measured on 2026-08-11
   with `--verbose` against throwaway copies of the dev schema, never against

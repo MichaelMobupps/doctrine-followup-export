@@ -62,6 +62,8 @@ import {
   isGeminiConfigured as realIsGeminiConfigured,
   type ThinkingLevel,
 } from "../lib/gemini";
+// F-3.7b: the row budget outranks the tier fallback chain.
+import { GenerationDeadlineError } from "../lib/generationDeadline";
 import { logger as realLogger } from "../lib/logger";
 import { recordGeminiUsageBestEffort as realRecordGeminiUsage } from "../lib/usageTracker";
 import { createCircuitBreaker, type CircuitBreaker } from "../lib/circuitBreaker";
@@ -371,6 +373,12 @@ export async function runWriter(
       );
       return { ...draft, modelUsed: res.model, tier };
     } catch (err) {
+      // F-3.7b: a spent row budget is not this tier's failure. Advancing the
+      // chain would burn the next tier's latency for a row the pass has already
+      // abandoned, and — worse — breaker.onFailure() would score the timeout
+      // against Gemini, opening the breaker and pushing later rows onto the
+      // dearer Anthropic tier for a fault Gemini never had.
+      if (err instanceof GenerationDeadlineError) throw err;
       breaker.onFailure();
       const capacity = isCapacityError(err);
       deps.logger.warn(

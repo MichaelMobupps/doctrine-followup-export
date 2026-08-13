@@ -1,16 +1,14 @@
-import { google } from "googleapis";
 import { ALL_DOCTRINE_LABELS } from "../lib/constants";
+import { newGoogleOAuthClient, newGmailClient } from "../lib/googleApi";
 
 const LABELS = [...ALL_DOCTRINE_LABELS];
 
 async function main() {
-  const auth = new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-  );
+  // F-3.7b: bounded construction — see lib/googleApi.ts.
+  const auth = newGoogleOAuthClient();
   auth.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
 
-  const gmail = google.gmail({ version: "v1", auth });
+  const gmail = newGmailClient(auth);
 
   const existing = await gmail.users.labels.list({ userId: "me" });
   const existingMap = new Map<string, string>();

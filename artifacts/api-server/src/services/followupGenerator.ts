@@ -1,5 +1,8 @@
 import { anthropic, MODEL_DRAFT_GENERATOR, MODEL_CRITIC, MODEL_REWRITER, withOpusReasoning, cachedSystem, assertCriticModelAllowed } from "../lib/anthropic";
 import { withAnthropicRetry } from "./anthropicRetry";
+// F-3.7b: a spent row budget is terminal for the row and must outrank every
+// fail-open path below it.
+import { GenerationDeadlineError } from "../lib/generationDeadline";
 // B7r: usage tracker import. recordUsageBestEffort is no-op when called
 // outside a runWithUsageContext scope, so safe to call from any path.
 import { recordUsageBestEffort } from "../lib/usageTracker";
@@ -574,6 +577,12 @@ export async function generateFollowupEmail(
       try {
         critique = await runCritic(ctx, current, () => critiqueDraft(ctx, current));
       } catch (err) {
+        // F-3.7b: the critic is deliberately fail-open — a critic outage should
+        // ship the best draft rather than fail the row. A spent generation
+        // budget is NOT an outage: the pass has already abandoned this row, and
+        // "returning the best draft seen" would ship an un-critiqued email on
+        // the strength of a deadline. Let it through.
+        if (err instanceof GenerationDeadlineError) throw err;
         logger.warn(
           { err: String(err), prospect: ctx.prospect_name, iteration },
           "Critic unavailable after retries — returning best draft seen",

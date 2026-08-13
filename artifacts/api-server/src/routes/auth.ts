@@ -1,11 +1,11 @@
 import { Router, type Request, type Response } from "express";
-import { google } from "googleapis";
 import crypto from "crypto";
 import { db, oauthNoncesTable } from "@workspace/db";
 import { eq, lt, and, gt } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { resolveAdminGrant } from "../lib/adminAccess";
 import { publicUrl, redirectPath } from "../lib/appUrls";
+import { newGoogleOAuthClient, newOAuth2InfoClient } from "../lib/googleApi";
 
 const router = Router();
 
@@ -26,11 +26,8 @@ function getRedirectUri(): string {
 }
 
 function getOAuth2Client() {
-  return new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-    getRedirectUri(),
-  );
+  // F-3.7b: bounded token-refresh transporter — see lib/googleApi.ts.
+  return newGoogleOAuthClient(getRedirectUri());
 }
 
 router.get("/auth/google", async (_req: Request, res: Response) => {
@@ -97,7 +94,8 @@ router.get("/auth/callback", async (req: Request, res: Response) => {
     const { tokens } = await oauth2Client.getToken(code as string);
     oauth2Client.setCredentials(tokens);
 
-    const oauth2 = google.oauth2({ version: "v2", auth: oauth2Client });
+    // F-3.7b: bounded like every other Google call — see lib/googleApi.ts.
+    const oauth2 = newOAuth2InfoClient(oauth2Client);
     const userInfo = await oauth2.userinfo.get();
     const email = userInfo.data.email || "";
 

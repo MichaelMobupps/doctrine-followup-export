@@ -30,6 +30,9 @@
  * the file typechecks regardless of the tsconfig lib or @types/node version.
  */
 import { logger } from "./logger";
+// F-3.7b: the row-level generation budget. Both helpers are no-ops when no
+// generation is in scope, so routes, scripts and tests are unaffected.
+import { assertGenerationBudget, clampToGenerationBudget } from "./generationDeadline";
 
 export const GEMINI_CRITIC_MODEL = process.env.GEMINI_CRITIC_MODEL || "gemini-3-flash-preview";
 
@@ -199,9 +202,13 @@ export async function geminiGenerateJson(args: {
     "x-goog-api-key": apiKey,
   };
 
-  const timeoutMs = resolveTimeoutMs();
+  const baseTimeoutMs = resolveTimeoutMs();
 
   async function fetchOnce(): Promise<MinimalResponse> {
+    // F-3.7b: an attempt must never outlive the row's generation budget.
+    // Clamped per attempt, not once, because the budget drains as the row runs.
+    // Unchanged (returns baseTimeoutMs) outside a generation.
+    const timeoutMs = clampToGenerationBudget(baseTimeoutMs);
     const AbortCtl = runtime.AbortController;
     const controller = AbortCtl ? new AbortCtl() : null;
     const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
@@ -221,6 +228,9 @@ export async function geminiGenerateJson(args: {
   let lastErr: unknown = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // F-3.7b: same rule as the Anthropic ladder — do not start what the row
+    // can no longer afford.
+    assertGenerationBudget(`gemini ${model} attempt ${attempt}`);
     let res: MinimalResponse;
     try {
       res = await fetchOnce();
