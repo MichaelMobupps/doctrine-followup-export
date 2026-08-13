@@ -1,5 +1,5 @@
 import { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
-import { google, gmail_v1 } from "googleapis";
+import { gmail_v1 } from "googleapis";
 import { db, prospectsTable, followupsTable, usersTable } from "@workspace/db";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { getGmailForUser, isOutboundMessage } from "../services/gmailClient";
@@ -10,6 +10,7 @@ import { rejectUnboundedList } from "../lib/listGuards";
 // Phase 7l: timingEngine helpers for /prospect/:id/resume parity with doctrine.
 import { computeNextStageScheduledAt } from "../services/timingEngine";
 import type { UserTimingSettings } from "../services/timingEngine";
+import { newGoogleOAuthClient, newGmailClient } from "../lib/googleApi";
 // Phase 7g: googleapis + getGmailForUser imports for /gmail/sent-emails.
 
 /**
@@ -63,12 +64,11 @@ function getFollowupCap(maxFollowups?: number | null): number {
 // Future cleanup: extract to a shared lib once a third consumer exists.
 
 function getLegacyGmail(): gmail_v1.Gmail {
-  const auth = new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-  );
+  // F-3.7b: constructed through lib/googleApi so both the API requests and
+  // the token refresh carry GOOGLE_API_TIMEOUT_MS.
+  const auth = newGoogleOAuthClient();
   auth.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
-  return google.gmail({ version: "v1", auth });
+  return newGmailClient(auth);
 }
 
 async function getGmailForRequest(req: Request): Promise<{ gmail: gmail_v1.Gmail; senderEmail: string }> {

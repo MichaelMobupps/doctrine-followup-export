@@ -1,5 +1,4 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
-import { google } from "googleapis";
 import crypto from "crypto";
 import {
   db,
@@ -18,6 +17,7 @@ import { HARD_FOLLOWUP_CAP } from "../lib/followupLimits";
 import { publicUrl, appPath } from "../lib/appUrls";
 // F-3.6a: the connection-health vocabulary. Pure; see lib/connectionHealth.ts.
 import { connectionState, authDeadMessage } from "../lib/connectionHealth";
+import { newGoogleOAuthClient, newOAuth2InfoClient } from "../lib/googleApi";
 
 const router = Router();
 
@@ -41,11 +41,8 @@ function getRedirectUri(): string {
 }
 
 function getOAuth2Client() {
-  return new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-    getRedirectUri(),
-  );
+  // F-3.7b: bounded token-refresh transporter — see lib/googleApi.ts.
+  return newGoogleOAuthClient(getRedirectUri());
 }
 
 function authMiddleware(req: Request, res: Response, next: NextFunction): void {
@@ -163,7 +160,8 @@ router.get("/gmail/callback", async (req: Request, res: Response) => {
 
     oauth2Client.setCredentials(tokens);
 
-    const oauth2 = google.oauth2({ version: "v2", auth: oauth2Client });
+    // F-3.7b: bounded like every other Google call — see lib/googleApi.ts.
+    const oauth2 = newOAuth2InfoClient(oauth2Client);
     const userInfo = await oauth2.userinfo.get();
     // Normalize email at write time. Google occasionally returns
     // mixed-case emails depending on the tenant, and downstream lookups

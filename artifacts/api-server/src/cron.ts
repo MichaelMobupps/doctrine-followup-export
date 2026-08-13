@@ -11,14 +11,11 @@ import { recordHeartbeat } from "./lib/cronHeartbeat";
 // only when CHIEF_URL + CHIEF_INGEST_TOKEN are both set.
 import { startChiefSpendReporting } from "./lib/chiefSpendSweep";
 
-// Overlap guard for follow-up processing ticks. processDueFollowups() is
-// CAS-protected against double sends, so overlap is safe — but process_due
-// (4x/hour) and fast_tick (every 3 min) calling it concurrently multiplies
-// DB round-trips and Gmail reads for zero benefit. One processing pass at
-// a time; an overlapping tick simply skips. (The all-users SYNC overlap
-// guard lives inside syncEmails() itself so it also covers the /sync
-// routes — see SyncAlreadyRunningError.)
-let processTickRunning = false;
+// F-3.7b: the processing overlap guard moved to lib/processingGuard.ts. It is
+// pure module state with no database or vendor import, which is what lets the
+// wedge watchdog be proven hermetically — the same reasoning retryPolicy.ts
+// applies to the failed-row rules.
+import { claimProcessingGuard } from "./lib/processingGuard";
 
 export function startCronJobs(): void {
   // Gmail sync + auto-queue every 15 minutes.
@@ -110,46 +107,7 @@ export function startCronJobs(): void {
 
   // Process due follow-ups four times per hour on the main tick.
   // Phase 7n: heartbeat tickName="process_due".
-  cron.schedule("5,20,35,50 * * * *", async () => {
-    const startedAt = Date.now();
-    let outcome: "ok" | "partial" | "error" = "ok";
-    const details: Record<string, unknown> = {};
-    if (processTickRunning) {
-      logger.warn("Previous follow-up processing pass still running — skipping process_due tick");
-      await recordHeartbeat({
-        tickName: "process_due",
-        durationMs: 0,
-        outcome: "ok",
-        details: { skipped: "previous processing pass still running" },
-      });
-      return;
-    }
-    processTickRunning = true;
-    try {
-      logger.info("Processing due follow-ups...");
-      const result = await processDueFollowups();
-      details.processed = result.processed;
-      details.sent = result.sent;
-      details.drafted = result.drafted;
-      details.failed = result.failed;
-      logger.info(
-        { sent: result.sent, drafted: result.drafted, failed: result.failed },
-        "Follow-up processing done",
-      );
-    } catch (err) {
-      outcome = "error";
-      details.error = err instanceof Error ? err.message : String(err);
-      logger.error({ err }, "Scheduler error");
-    } finally {
-      processTickRunning = false;
-      await recordHeartbeat({
-        tickName: "process_due",
-        durationMs: Date.now() - startedAt,
-        outcome,
-        details,
-      });
-    }
-  });
+  cron.schedule("5,20,35,50 * * * *", runProcessDueTick);
 
 
   // Daily stall watcher: draft-mode follow-ups that sit unsent for 30 days
@@ -272,44 +230,7 @@ export function startCronJobs(): void {
   // No longer tied to test mode — this runs for all users and is scoped to
   // picking up already-due rows only.
   // Phase 7n: heartbeat tickName="fast_tick".
-  cron.schedule("*/3 * * * *", async () => {
-    const startedAt = Date.now();
-    let outcome: "ok" | "partial" | "error" = "ok";
-    const details: Record<string, unknown> = {};
-    if (processTickRunning) {
-      // Shares the guard with process_due — both run processDueFollowups(),
-      // and overlapped passes just re-select rows another pass will claim.
-      // Skipping silently (no heartbeat) keeps the fast_tick heartbeat
-      // stream meaningful: 20k+ rows of "skipped" entries would drown it.
-      return;
-    }
-    processTickRunning = true;
-    try {
-      const result = await processDueFollowups();
-      details.processed = result.processed;
-      details.sent = result.sent;
-      details.drafted = result.drafted;
-      details.failed = result.failed;
-      if (result.sent > 0 || result.drafted > 0 || result.processed > 0) {
-        logger.info(
-          { sent: result.sent, drafted: result.drafted, failed: result.failed },
-          "Fast-tick processed follow-ups",
-        );
-      }
-    } catch (err) {
-      outcome = "error";
-      details.error = err instanceof Error ? err.message : String(err);
-      logger.error({ err }, "Fast-tick error");
-    } finally {
-      processTickRunning = false;
-      await recordHeartbeat({
-        tickName: "fast_tick",
-        durationMs: Date.now() - startedAt,
-        outcome,
-        details,
-      });
-    }
-  });
+  cron.schedule("*/3 * * * *", runFastTick);
 
   // Weekly digest: Tuesday 00:00 UTC. The runWeeklyDigest() function
   // self-dedupes via users.last_weekly_digest_at (6-day window) so any
@@ -414,4 +335,138 @@ export function startCronJobs(): void {
   startChiefSpendReporting();
 
   logger.info("Cron jobs active: sync+auto-queue @*/15, process @5,20,35,50, draft-stall @00:30, campaign-expiry @00:15, over-cap @00:20, archive-sweep @00:45, shared-draft-prune @01:00, weekly-digest @Tue 00:00 UTC + retry @Tue 06:00 UTC, fast-tick @*/3, chief-spend @*/5 (only when the Chief seam is configured)");
+}
+
+/**
+ * The process_due tick body, `5,20,35,50 * * * *`.
+ *
+ * F-3.7b: named and exported rather than inline, so the smoke can run the
+ * REAL tick — guard, heartbeat and all — instead of a re-implementation of it
+ * that could drift from the thing production runs.
+ */
+export async function runProcessDueTick(): Promise<void> {
+  const startedAt = Date.now();
+  let outcome: "ok" | "partial" | "error" = "ok";
+  const details: Record<string, unknown> = {};
+  const claim = claimProcessingGuard("process_due");
+  if (!claim.claimed) {
+    logger.warn("Previous follow-up processing pass still running — skipping process_due tick");
+    await recordHeartbeat({
+      tickName: "process_due",
+      durationMs: 0,
+      outcome: "ok",
+      details: {
+        skipped: "previous processing pass still running",
+        passAgeMs: claim.passAgeMs,
+        sinceProgressMs: claim.sinceProgressMs,
+      },
+    });
+    return;
+  }
+  if (claim.reclaimedAfterMs !== null) {
+    // F-3.7b: a reclaim is not a healthy tick. `partial` puts it in the
+    // Chief's errors_24h instead of letting it pass as ok.
+    outcome = "partial";
+    details.wedgeReclaimedAfterMs = claim.reclaimedAfterMs;
+  }
+  try {
+    logger.info("Processing due follow-ups...");
+    const result = await processDueFollowups({ onProgress: claim.onProgress });
+    details.processed = result.processed;
+    details.sent = result.sent;
+    details.drafted = result.drafted;
+    details.failed = result.failed;
+    logger.info(
+      { sent: result.sent, drafted: result.drafted, failed: result.failed },
+      "Follow-up processing done",
+    );
+  } catch (err) {
+    outcome = "error";
+    details.error = err instanceof Error ? err.message : String(err);
+    logger.error({ err }, "Scheduler error");
+  } finally {
+    claim.release();
+    await recordHeartbeat({
+      tickName: "process_due",
+      durationMs: Date.now() - startedAt,
+      outcome,
+      details,
+    });
+  }
+}
+
+/**
+ * The fast_tick body, the every-three-minutes schedule.
+ *
+ * F-3.7b: named and exported for the same reason as runProcessDueTick. The
+ * property this order turns on — that a GUARDED fast_tick still writes a
+ * heartbeat — lives in here, so the proof has to be able to call in here.
+ */
+export async function runFastTick(): Promise<void> {
+  const startedAt = Date.now();
+  let outcome: "ok" | "partial" | "error" = "ok";
+  const details: Record<string, unknown> = {};
+  const claim = claimProcessingGuard("fast_tick");
+  if (!claim.claimed) {
+    // Shares the guard with process_due — both run processDueFollowups(),
+    // and overlapped passes just re-select rows another pass will claim.
+    //
+    // ── F-3.7b: the skip is RECORDED. ─────────────────────────────────
+    //
+    // This path used to return bare, on the reasoning that 20k+ rows of
+    // "skipped" entries would drown a human reading the stream. That was
+    // true of a stream only a human read. F-3.7a made `max(fired_at)` per
+    // tick the Chief's machine liveness signal, and from that moment a
+    // silent skip was indistinguishable from a dead tick: every fast_tick
+    // suppressed by a long pass aged the Chief's figure until it alarmed,
+    // all day, while the tick was firing exactly on schedule. The heartbeat
+    // stream now answers the question it is actually asked — "did this tick
+    // fire", not "did this tick do work" — and the reason it did no work
+    // travels in `details.skipped`, where process_due has always put it.
+    //
+    // The volume fear was also arithmetic that never held: a recorded skip
+    // replaces a row this tick would have written anyway on a pass it did
+    // not have to skip. The ceiling is unchanged at one row per firing,
+    // 480/day, which is what the tick has always been budgeted for.
+    await recordHeartbeat({
+      tickName: "fast_tick",
+      durationMs: 0,
+      outcome: "ok",
+      details: {
+        skipped: "previous processing pass still running",
+        passAgeMs: claim.passAgeMs,
+        sinceProgressMs: claim.sinceProgressMs,
+      },
+    });
+    return;
+  }
+  if (claim.reclaimedAfterMs !== null) {
+    outcome = "partial";
+    details.wedgeReclaimedAfterMs = claim.reclaimedAfterMs;
+  }
+  try {
+    const result = await processDueFollowups({ onProgress: claim.onProgress });
+    details.processed = result.processed;
+    details.sent = result.sent;
+    details.drafted = result.drafted;
+    details.failed = result.failed;
+    if (result.sent > 0 || result.drafted > 0 || result.processed > 0) {
+      logger.info(
+        { sent: result.sent, drafted: result.drafted, failed: result.failed },
+        "Fast-tick processed follow-ups",
+      );
+    }
+  } catch (err) {
+    outcome = "error";
+    details.error = err instanceof Error ? err.message : String(err);
+    logger.error({ err }, "Fast-tick error");
+  } finally {
+    claim.release();
+    await recordHeartbeat({
+      tickName: "fast_tick",
+      durationMs: Date.now() - startedAt,
+      outcome,
+      details,
+    });
+  }
 }

@@ -42,6 +42,9 @@ import { generateContextFollowup } from "./contextFollowupGenerator";
 // B7r: usage context import. Wraps generator calls so the recordUsage
 // helper inside the generators knows which followup the LLM call is for.
 import { runWithUsageContext } from "../lib/usageContext";
+// F-3.7b: per-row generation wall-clock budget. See lib/generationDeadline.ts
+// for why 180s and what it does and does not bound.
+import { withGenerationDeadline } from "../lib/generationDeadline";
 // Global pause switch: when on, bulk cron processing and bulk auto-queue stop.
 import { isGlobalPauseEnabled } from "../lib/globalPause";
 // F-3.6a: bounded retry policy replacing the amnesia revive, the due-batch
@@ -175,6 +178,14 @@ async function markUserAuthDead(userId: number, rawError: string): Promise<void>
 export async function processDueFollowups(options?: {
   followupId?: number;
   forceSend?: boolean;
+  /**
+   * F-3.7b: called once per row, however the row ended — sent, drafted,
+   * skipped or failed. The cron overlap guard uses it as the pass's own
+   * heartbeat: a pass still finishing rows is alive, and a pass that has
+   * called this for PROCESS_WEDGE_NO_PROGRESS_MS is wedged on one row and
+   * gets broken. Never throws into the loop; see the per-row finally.
+   */
+  onProgress?: () => void;
 }): Promise<{
   processed: number;
   sent: number;
@@ -675,7 +686,12 @@ export async function processDueFollowups(options?: {
         // prompts (no doctrine, faithful-to-context).
         // B7r: wrap generator dispatch with the usage context so
         // recordUsageBestEffort() inside the generator knows what to attribute.
-        generated = await runWithUsageContext(
+        // F-3.7b: the row's wall-clock budget. Everything inside — every
+        // writer tier, every critic pass, every retry ladder — shares 180s.
+        // On expiry this throws GenerationDeadlineError, the catch below
+        // classifies it `send_error` (no Gmail artifact exists yet, so
+        // nothing can be duplicated), and the pass moves to the next row.
+        generated = await withGenerationDeadline(() => runWithUsageContext(
           {
             followupId: item.followupId,
             prospectId: item.prospectId,
@@ -696,7 +712,7 @@ export async function processDueFollowups(options?: {
               ? generateContextFollowup(genCtx)
               : generateFollowupEmail(genCtx);
           },
-        );
+        ));
         if (cohort && sharedMode) {
           // CSD v1.1: deterministic egress guard. If the generated draft
           // contains a name token of the source prospect, it is correct for
@@ -911,6 +927,16 @@ export async function processDueFollowups(options?: {
       }
 
       failed++;
+    } finally {
+      // F-3.7b: one row finished, whatever its verdict — including the
+      // `continue` paths above, which a finally still covers. This is the
+      // only signal the cron wedge watchdog has that the pass is alive, so
+      // it must never be able to throw into the loop.
+      try {
+        options?.onProgress?.();
+      } catch (progressErr) {
+        logger.error({ err: progressErr }, "F-3.7b: onProgress callback threw — ignored");
+      }
     }
   }
 

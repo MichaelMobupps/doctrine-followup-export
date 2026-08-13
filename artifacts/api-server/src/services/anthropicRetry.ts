@@ -17,6 +17,8 @@
  */
 import Anthropic from "@anthropic-ai/sdk";
 import { logger } from "../lib/logger";
+// F-3.7b: the row-level generation budget. No-op outside a generation.
+import { assertGenerationBudget, remainingGenerationMs } from "../lib/generationDeadline";
 
 export interface RetryOptions {
   /** Max number of attempts (including the first). Default 5. */
@@ -82,6 +84,11 @@ export async function withAnthropicRetry<T>(
   let lastErr: unknown;
 
   for (let attempt = 1; attempt <= cfg.maxAttempts; attempt++) {
+    // F-3.7b: refuse to start an attempt the row can no longer afford. The
+    // pass has already abandoned this row at the deadline, so a ladder that
+    // keeps climbing here is billing for work nobody will read. Throws
+    // GenerationDeadlineError; a no-op when no generation is in scope.
+    assertGenerationBudget(`${label} attempt ${attempt}`);
     try {
       return await fn();
     } catch (err) {
@@ -114,6 +121,19 @@ export async function withAnthropicRetry<T>(
 
       const hint = retryAfterMs(err);
       const backoff = hint ?? cfg.backoffMs[Math.min(attempt - 1, cfg.backoffMs.length - 1)];
+
+      // F-3.7b: a backoff the row's budget cannot absorb is a sleep whose
+      // retry can never run. Fail now with the real vendor cause rather than
+      // burning the remainder of the budget waiting to be cut off anyway.
+      const remainingMs = remainingGenerationMs();
+      if (remainingMs !== null && backoff >= remainingMs) {
+        logger.error(
+          { label, attempt, backoff, remainingMs, err: String(err) },
+          "Generation budget cannot absorb the retry backoff — failing this row now",
+        );
+        throw err;
+      }
+
       logger.warn(
         { label, attempt, willRetryInMs: backoff, err: String(err) },
         "Transient Anthropic error — retrying",
