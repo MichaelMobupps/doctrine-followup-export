@@ -331,6 +331,45 @@
   repository and not in production until Michael publishes; the three ephemeral
   smoke databases were dropped.
 
+  ── PUBLISHED 2026-08-17 ~19:50Z; VERIFIED LIVE, READ-ONLY ────────────────
+
+  Michael published; the new process's `process_start` row — the first ever —
+  is at **19:50:43.474Z**, carrying the armed tick set in its details. Every
+  property was then verified against production through the two read surfaces,
+  no database write and no repo hand needed:
+  - **`result_age_seconds` is on the wire and immediately earned its place.**
+    First post-publish probe: `sync_and_autoqueue` age 227s / result_age 819s
+    with `running_24h: 1` — the 20:00 pass in flight, counted, not blamed —
+    where the old shape would have been silent for five minutes.
+  - **`last_fired_at` names the firing now.** The 20:00 sync row is stamped
+    20:00:00.658, dead on the */15 mark; the pre-publish rows beside it are
+    completion-stamped (19:50:08 = the 19:45 firing plus its 308s body), so
+    the transition is legible in the table itself, and ages out of the 24h
+    window within a day.
+  - **`process_start` is on the admin rollup and absent from the Chief's
+    crons[]**, exactly as designed.
+  - **This publish lost NOTHING — better than predicted.** The prediction was
+    one lost fast_tick firing; the streams show 180s gaps throughout and the
+    19:50:00 chief_spend_report row landed 43 seconds BEFORE `process_start`,
+    so the old process was still firing until the handoff (and one, not two,
+    19:51 fast_tick rows — so it was gone by then). A Replit publish on this
+    VM can therefore be a zero-loss handoff. This refines, without overturning,
+    the Aug-16 hole attribution: 14:51→14:57 remains best explained by that
+    publish (commit 14:53:55Z, five seconds before the missing firing), but
+    "publish" and "lost firing" are not synonyms — some handoffs are seamless,
+    and from now on `process_start` says which kind each one was.
+  - **A near-miss worth knowing about:** the 19:45 sync pass finished at
+    19:50:08 on the OLD process — roughly 35 seconds before that process died.
+    Sixty seconds earlier a mid-flight pass would have died with it; under the
+    old code that firing would have vanished entirely, under the new code it
+    leaves a `running` row that `running_24h` shows and this entry explains.
+  - **The full lifecycle, watched end to end at 20:06:09Z:** the 20:00 sync
+    pass finished `partial` (account 5, unchanged), `running_24h` returned to
+    0, `result_age_seconds` fell 908→369, `errors_24h` held at 96 (the new
+    partial joined as yesterday's edge row aged out), and fast_tick's 20:06
+    firing was on the rollup nine seconds after the mark. Every scope item is
+    live and behaving as proven.
+
 - **[F-3.7c finding, 2026-08-17] `sync_and_autoqueue` reads 96 errors in 96
   runs and the tick is not failing — one mailbox is.** Account 5 has been
   `auth_dead` since 2026-08-09 (`unauthorized_client`) with **189 follow-ups
