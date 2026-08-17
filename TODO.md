@@ -183,6 +183,15 @@
   - A failed UPDATE leaves a row at `running` for ever. It is not an error, does
     not move either age, and shows on the admin surface as `running_24h` above 1
     — strictly more than the silence it replaces.
+  - **[Added by the 2026-08-17 audit pass]** The retry ladder without an
+    idempotency key can DUPLICATE a row on an ambiguous success — a statement
+    that commits while the client sees a connection reset, the very failure the
+    ladder exists for. The duplicate is an orphan `running` row or a doubled
+    finished row; every distortion it can cause points toward OVER-reporting
+    liveness, never toward a false death, which is the correct direction for
+    this table to err. Exactly-once needs a schema change (idempotency key) and
+    schema is out of this order's scope. Stated in the module header where the
+    next reader will meet it.
 
   ── THE ONE COORDINATION POINT WITH THE CHIEF ─────────────────────────────
 

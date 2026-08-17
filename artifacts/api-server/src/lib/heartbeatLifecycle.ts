@@ -50,6 +50,23 @@
  * one. The compromise is loudness: a write that runs out of attempts says, in
  * one line, that this firing has left a hole and what the hole will look like
  * from the Chief.
+ *
+ * ── THE PRICE OF RETRYING WITHOUT AN IDEMPOTENCY KEY, STATED ─────────────────
+ *
+ * A statement can succeed on the server while the client sees an error — the
+ * connection reset between commit and response, which is the same idle-reset
+ * failure this ladder exists for. The retry then writes a SECOND row: either an
+ * orphan stuck at `running` beside the sibling that finished (it inflates
+ * `running_24h` by one for a day and `ticks_24h` with it), or a duplicate
+ * finished row (+1 `ticks_24h`). This is accepted deliberately, for two
+ * reasons. First, every possible distortion points the same way — toward
+ * OVER-reporting liveness — and this table's one job since F-3.7a is to never
+ * under-report it; the pre-retry behaviour erred in exactly the dangerous
+ * direction. Second, exactly-once needs an idempotency key, which is a schema
+ * change, and schema is out of this order's scope by law. The artifact is
+ * legible when it happens: two rows for one tick within a second of each
+ * other, one of them `running` with null details, is a shape an operator can
+ * read from the admin surface.
  */
 
 /** The stored `outcome` of a row whose tick has fired and not yet finished. */

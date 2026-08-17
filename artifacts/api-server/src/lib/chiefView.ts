@@ -430,7 +430,13 @@ export interface ChiefStatusBody {
   };
 }
 
-/** How many cron pulses may appear. The tick set is closed and currently 10. */
+/**
+ * How many cron pulses may appear. The tick set is closed: eleven names reach
+ * this seam (the ten in cron.ts plus `chief_spend_report` when the seam is
+ * configured), and `process_start` exists in the table but is withheld here —
+ * see NON_CADENCE_TICKS. The margin to 50 is for tick names that do not exist
+ * yet, not for an open set.
+ */
 export const MAX_CRON_PULSES = 50;
 
 /** Shape the status body. Pure: every number is handed in. */
