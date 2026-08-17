@@ -287,12 +287,36 @@ export function packAccountsPage(args: {
 
 // ── Status ───────────────────────────────────────────────────────────────────
 
-/** One cron tick's liveness, as the status endpoint reports it. */
+/**
+ * One cron tick's liveness, as the status endpoint reports it.
+ *
+ * ── WHY THERE ARE TWO AGES, SINCE F-3.7c ─────────────────────────────────────
+ *
+ * `age_seconds` answers "did this tick FIRE", and since F-3.7c it answers it
+ * honestly: the row is written when the tick fires, so the figure is no longer
+ * shortened by however long the body ran.
+ *
+ * That fix opens a hole, and `result_age_seconds` closes it. A tick whose body
+ * HANGS now writes its row on time and then never finishes it — so the firing
+ * age stays fresh while nothing is actually being done. Under the old shape that
+ * silence eventually read as a stale cron, which was an accidental stall
+ * detector but a real one. So the pair is reported: seconds since the last
+ * firing, and seconds since the last firing that reached an OUTCOME. A tick that
+ * is alive and working keeps both small. A tick that is firing into a hang keeps
+ * the first small and lets the second climb, which is a thing no single number
+ * can say.
+ */
 export interface CronPulse {
   tick_name: string;
   last_fired_at: string | null;
   /** Seconds since that tick last fired. Null when it has never fired. */
   age_seconds: number | null;
+  /**
+   * Seconds since the last firing of this tick that RECORDED AN OUTCOME. Null
+   * when every firing on record is still in flight. Climbing while
+   * `age_seconds` stays small means firings are starting and not finishing.
+   */
+  result_age_seconds: number | null;
   ticks_24h: number;
   errors_24h: number;
 }
@@ -454,11 +478,13 @@ function round6(usd: number): number {
   return Math.round(usd * 1_000_000) / 1_000_000;
 }
 
-/** Seconds between two instants, floored at zero and rounded. */
-export function ageSeconds(now: Date, then: Date | null): number | null {
-  if (!then) return null;
-  return Math.max(0, Math.round((now.getTime() - then.getTime()) / 1000));
-}
+// F-3.7c: `ageSeconds(now, then)` used to live here, and its only caller was
+// the cron pulse reader. It is DELETED rather than left unused, because what it
+// computed was an age from the APP's clock against a timestamp from the
+// database's — the mismatch this order exists to remove — and a pure helper
+// sitting in the pure module is exactly what the next reader would reach for.
+// Ages are computed by the database now, in the same snapshot as the counters
+// they sit beside. See `readCronPulses()`.
 
 /** Start of the UTC day containing `now`. The window every spend report uses. */
 export function startOfUtcDay(now: Date): Date {

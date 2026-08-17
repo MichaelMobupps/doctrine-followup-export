@@ -555,16 +555,29 @@ test.describe("wiring pins (mutation proofs bite here)", () => {
 
   test.it("the GUARDED fast_tick path records a heartbeat", () => {
     // The whole false-death-report bug in one assertion: find fast_tick's
-    // guarded branch and require a heartbeat inside it. Delete the
-    // recordHeartbeat from that branch and this bites.
+    // guarded branch and require a heartbeat inside it.
+    //
+    // F-3.7c REPHRASED THIS PIN, and the property it protects got stronger.
+    // The branch used to call `recordHeartbeat({ tickName: "fast_tick", … })`
+    // — it decided whether a row existed. The row is now inserted by
+    // `beginHeartbeat("fast_tick")` before the guard is consulted at all, so
+    // this branch finishes a row that already exists and the tick name is no
+    // longer repeated here. What still bites: delete the `hb.finish` and the
+    // firing is left at `running` for ever with no reason attached.
     const guarded = cron.slice(
       cron.indexOf('const claim = claimProcessingGuard("fast_tick");'),
       cron.indexOf("if (claim.reclaimedAfterMs !== null)", cron.indexOf('claimProcessingGuard("fast_tick")')),
     );
     assert.ok(guarded.length > 0, "fast_tick must claim the shared guard");
-    assert.match(guarded, /recordHeartbeat\(\{/, "a guarded fast_tick MUST still write a heartbeat");
-    assert.match(guarded, /tickName: "fast_tick"/);
+    assert.match(guarded, /hb\.finish\(\{/, "a guarded fast_tick MUST still record its firing's result");
     assert.match(guarded, /skipped:/, "and must say why it did no work");
+    // The firing itself is recorded ahead of the guard, which is what makes the
+    // property structural rather than dependent on this branch remembering.
+    const fastTick = cron.slice(cron.indexOf("export async function runFastTick"));
+    assert.ok(
+      fastTick.indexOf('beginHeartbeat("fast_tick")') < fastTick.indexOf("claimProcessingGuard"),
+      "the row must exist before the guard can send the tick home",
+    );
   });
 
   test.it("both processing ticks share the watchdog-bearing guard", () => {

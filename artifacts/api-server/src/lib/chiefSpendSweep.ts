@@ -33,7 +33,7 @@ import cron from "node-cron";
 import { db, chiefSpendCursorTable, followupUsageTable } from "@workspace/db";
 import { gte, inArray, sql } from "drizzle-orm";
 import { logger } from "./logger";
-import { recordHeartbeat } from "./cronHeartbeat";
+import { beginHeartbeat } from "./cronHeartbeat";
 import { chiefTokenMismatchWarning } from "./chiefAuth";
 import {
   type ChiefReporter,
@@ -348,11 +348,25 @@ export function startChiefSpendReporting(): ChiefReportingState {
   );
 
   cron.schedule(SWEEP_CRON, async () => {
-    if (sweepRunning) return;
-    sweepRunning = true;
-    const startedAt = Date.now();
+    // F-3.7c: the firing is recorded FIRST, before the overlap guard is
+    // consulted. This tick carried the same defect F-3.7b removed from
+    // fast_tick — `if (sweepRunning) return` wrote nothing at all, so a sweep
+    // that ran long aged this tick's `max(fired_at)` while it fired exactly on
+    // schedule, and the Chief would have read that as a dead tick. It has
+    // never bitten in production (288 of 288 rows in 24h on 2026-08-17,
+    // because a sweep takes about a second), which is precisely why it was
+    // still there to find.
+    const hb = await beginHeartbeat(CHIEF_SPEND_TICK);
     let outcome: "ok" | "partial" | "error" = "ok";
     const details: Record<string, unknown> = {};
+    if (sweepRunning) {
+      await hb.finish({
+        outcome: "ok",
+        details: { skipped: "previous chief spend sweep still running" },
+      });
+      return;
+    }
+    sweepRunning = true;
     try {
       const r = await runChiefSpendSweep(reporter);
       details.recorded = r.recorded;
@@ -373,12 +387,7 @@ export function startChiefSpendReporting(): ChiefReportingState {
       logger.error({ err }, "F-3.7a: Chief spend sweep failed");
     } finally {
       sweepRunning = false;
-      await recordHeartbeat({
-        tickName: CHIEF_SPEND_TICK,
-        durationMs: Date.now() - startedAt,
-        outcome,
-        details,
-      });
+      await hb.finish({ outcome, details });
     }
   });
 
