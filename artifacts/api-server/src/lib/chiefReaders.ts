@@ -265,6 +265,18 @@ export async function readCronPulses(): Promise<CronPulse[]> {
       ageSeconds: sql<
         number | null
       >`greatest(0, round(extract(epoch from (now() - max(${cronHeartbeatsTable.firedAt})))))::int`,
+      // F-3.7c: the second age. `max(fired_at)` over the FINISHED rows only, so a
+      // tick that fires into a hang shows a fresh `age_seconds` and a climbing
+      // `result_age_seconds` — see the CronPulse comment for why one number
+      // cannot say both. Null when every firing on record is still in flight.
+      // The CASE is not ceremony. `greatest(0, NULL)` is 0 in Postgres — the
+      // function IGNORES nulls rather than propagating them — so the obvious
+      // spelling reported "no firing has ever finished" as "one finished this
+      // second", which is the opposite. The live smoke caught it.
+      resultAgeSeconds: sql<number | null>`case
+        when max(${cronHeartbeatsTable.firedAt}) filter (where ${cronHeartbeatsTable.outcome} <> ${HEARTBEAT_RUNNING}) is null then null
+        else greatest(0, round(extract(epoch from (now() - max(${cronHeartbeatsTable.firedAt}) filter (where ${cronHeartbeatsTable.outcome} <> ${HEARTBEAT_RUNNING})))))::int
+      end`,
       ticks24h: sql<number>`count(*) filter (where ${cronHeartbeatsTable.firedAt} > now() - interval '24 hours')::int`,
       // F-3.7c: `not in ('ok', 'running')` rather than `<> 'ok'`. A row sits at
       // `running` between its tick's firing and its result, and an in-flight
@@ -281,7 +293,14 @@ export async function readCronPulses(): Promise<CronPulse[]> {
     // this tick's cadence" (C-3.7b §4), and `process_start`'s age is the
     // process's uptime — a number that is SUPPOSED to grow without bound. It
     // stays on the admin surface, which is where a hole gets explained.
-    .where(notInArray(cronHeartbeatsTable.tickName, [...NON_CADENCE_TICKS]))
+    // The conditional is not decoration: `notInArray(col, [])` compiles to a
+    // false predicate in drizzle, so emptying NON_CADENCE_TICKS would answer the
+    // Chief with NO ticks at all — every cron reading as never having fired.
+    .where(
+      NON_CADENCE_TICKS.length > 0
+        ? notInArray(cronHeartbeatsTable.tickName, [...NON_CADENCE_TICKS])
+        : undefined,
+    )
     .groupBy(cronHeartbeatsTable.tickName)
     .orderBy(cronHeartbeatsTable.tickName);
 
@@ -289,10 +308,15 @@ export async function readCronPulses(): Promise<CronPulse[]> {
     const last = r.lastFiredAt ? new Date(r.lastFiredAt) : null;
     const valid = last && !Number.isNaN(last.getTime()) ? last : null;
     const age = Number(r.ageSeconds);
+    // `null` when no firing has finished: the SQL returns NULL there, and
+    // Number(null) is 0 — which would read as "finished just now", the exact
+    // opposite of the truth. Checked before conversion for that reason.
+    const resultAge = r.resultAgeSeconds === null ? null : Number(r.resultAgeSeconds);
     return {
       tick_name: r.tickName,
       last_fired_at: valid ? valid.toISOString() : null,
       age_seconds: Number.isFinite(age) ? age : null,
+      result_age_seconds: resultAge !== null && Number.isFinite(resultAge) ? resultAge : null,
       ticks_24h: Number(r.ticks24h ?? 0),
       errors_24h: Number(r.errors24h ?? 0),
     };

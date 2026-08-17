@@ -86,6 +86,16 @@ router.get("/admin/cron-heartbeats", async (req: Request, res: Response) => {
         // F-3.7c: an in-flight tick sits at `running` and is not an error.
         errors_24h: sql<number>`count(*) filter (where ${cronHeartbeatsTable.firedAt} > now() - interval '24 hours' and ${cronHeartbeatsTable.outcome} not in ('ok', ${HEARTBEAT_RUNNING}))::int`,
         running_now: sql<number>`count(*) filter (where ${cronHeartbeatsTable.outcome} = ${HEARTBEAT_RUNNING} and ${cronHeartbeatsTable.firedAt} > now() - interval '24 hours')::int`,
+        // F-3.7c: seconds since the last firing that reached an OUTCOME. Sits
+        // beside seconds_since_last for the same reason the Chief gets both: a
+        // tick firing into a hang keeps the first small while this one climbs.
+        // CASE rather than a bare greatest(): `greatest(0, NULL)` is 0 in
+        // Postgres, which would report "nothing has ever finished" as "finished
+        // this second". Same spelling as readCronPulses() for the same reason.
+        seconds_since_last_result: sql<number | null>`case
+          when max(${cronHeartbeatsTable.firedAt}) filter (where ${cronHeartbeatsTable.outcome} <> ${HEARTBEAT_RUNNING}) is null then null
+          else greatest(0, round(extract(epoch from (now() - max(${cronHeartbeatsTable.firedAt}) filter (where ${cronHeartbeatsTable.outcome} <> ${HEARTBEAT_RUNNING})))))::int
+        end`,
       })
       .from(cronHeartbeatsTable)
       .groupBy(cronHeartbeatsTable.tickName)
@@ -107,6 +117,8 @@ router.get("/admin/cron-heartbeats", async (req: Request, res: Response) => {
           tick_name: t.tick_name,
           last_fired_at: last ? last.toISOString() : null,
           seconds_since_last: Number.isFinite(age) ? age : null,
+          seconds_since_last_result:
+            t.seconds_since_last_result === null ? null : Number(t.seconds_since_last_result),
           ticks_24h: t.ticks_24h,
           errors_24h: t.errors_24h,
           // F-3.7c: rows still at `running`. Normally 0 or 1 — one firing that

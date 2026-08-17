@@ -102,6 +102,9 @@ function sourcesFrom(over: Partial<ChiefSources> = {}): ChiefSources {
         tick_name: "fast_tick",
         last_fired_at: "2026-08-11T09:29:00.000Z",
         age_seconds: 60,
+        // F-3.7c: a healthy tick keeps both ages small — it fired a minute ago
+        // and the firing before that one finished.
+        result_age_seconds: 240,
         ticks_24h: 480,
         errors_24h: 0,
       },
@@ -112,6 +115,7 @@ function sourcesFrom(over: Partial<ChiefSources> = {}): ChiefSources {
         tick_name: "weekly_digest",
         last_fired_at: "2026-08-04T00:00:00.000Z",
         age_seconds: 639_000,
+        result_age_seconds: 639_000,
         ticks_24h: 0,
         errors_24h: 0,
       },

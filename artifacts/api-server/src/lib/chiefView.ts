@@ -287,12 +287,36 @@ export function packAccountsPage(args: {
 
 // ── Status ───────────────────────────────────────────────────────────────────
 
-/** One cron tick's liveness, as the status endpoint reports it. */
+/**
+ * One cron tick's liveness, as the status endpoint reports it.
+ *
+ * ── WHY THERE ARE TWO AGES, SINCE F-3.7c ─────────────────────────────────────
+ *
+ * `age_seconds` answers "did this tick FIRE", and since F-3.7c it answers it
+ * honestly: the row is written when the tick fires, so the figure is no longer
+ * shortened by however long the body ran.
+ *
+ * That fix opens a hole, and `result_age_seconds` closes it. A tick whose body
+ * HANGS now writes its row on time and then never finishes it — so the firing
+ * age stays fresh while nothing is actually being done. Under the old shape that
+ * silence eventually read as a stale cron, which was an accidental stall
+ * detector but a real one. So the pair is reported: seconds since the last
+ * firing, and seconds since the last firing that reached an OUTCOME. A tick that
+ * is alive and working keeps both small. A tick that is firing into a hang keeps
+ * the first small and lets the second climb, which is a thing no single number
+ * can say.
+ */
 export interface CronPulse {
   tick_name: string;
   last_fired_at: string | null;
   /** Seconds since that tick last fired. Null when it has never fired. */
   age_seconds: number | null;
+  /**
+   * Seconds since the last firing of this tick that RECORDED AN OUTCOME. Null
+   * when every firing on record is still in flight. Climbing while
+   * `age_seconds` stays small means firings are starting and not finishing.
+   */
+  result_age_seconds: number | null;
   ticks_24h: number;
   errors_24h: number;
 }

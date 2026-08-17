@@ -244,6 +244,43 @@ check(
   { reported: aged?.age_seconds, control: control[0].age },
 );
 
+// ── PROOF 3b: the two ages, and the stall only the pair can describe. ────
+//
+// This is the hole that moving the row to fire-time would otherwise open: a tick
+// that fires and never finishes has a fresh firing age, so the figure that used
+// to climb into an alarm now says nothing. `result_age_seconds` is what says it.
+console.log("\n3b. a firing that never finishes shows up as a climbing RESULT age");
+const stalled = await beginHeartbeat("process_due");
+const stalling = await pulse("process_due");
+check(
+  "the firing age is fresh — the tick did fire, and that is true",
+  (stalling?.age_seconds ?? 999) <= 3,
+  stalling?.age_seconds,
+);
+check(
+  "and the result age still reads ten minutes — nothing has finished since",
+  Math.abs((stalling?.result_age_seconds ?? -1) - 600) <= 3,
+  stalling?.result_age_seconds,
+);
+await stalled.finish({ outcome: "ok" });
+const settled = await pulse("process_due");
+check(
+  "finishing it brings the result age back down",
+  (settled?.result_age_seconds ?? 999) <= 3,
+  settled?.result_age_seconds,
+);
+
+await pool.query(`DELETE FROM cron_heartbeats WHERE tick_name = 'draft_stall_watcher'`);
+const neverFinishes = await beginHeartbeat("draft_stall_watcher");
+const noResultYet = await pulse("draft_stall_watcher");
+check(
+  "a tick whose only firing is still in flight reports NO result age, not zero",
+  noResultYet?.result_age_seconds === null,
+  noResultYet,
+);
+await neverFinishes.finish({ outcome: "ok" });
+await pool.query(`DELETE FROM cron_heartbeats WHERE tick_name = 'draft_stall_watcher'`);
+
 // ── PROOF 4: a GUARDED real tick still records — now structurally. ───────
 console.log("\n4. a guarded fast_tick records its firing and says why it did nothing");
 __resetProcessingGuardForTests();

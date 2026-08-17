@@ -367,6 +367,32 @@ test.describe("structural pins", () => {
     assert.match(src, /notInArray\(cronHeartbeatsTable\.tickName/, "non-cadence ticks stay off the Chief seam");
   });
 
+  test.it("a firing that never finishes is describable — two ages, not one", () => {
+    const view = readSrc("lib/chiefView.ts");
+    assert.match(
+      view,
+      /result_age_seconds: number \| null;/,
+      "fire-time rows make a hung tick look fresh; the second age is what says otherwise",
+    );
+    const readers = readSrc("lib/chiefReaders.ts");
+    assert.match(
+      readers,
+      /filter \(where \$\{cronHeartbeatsTable\.outcome\} <> \$\{HEARTBEAT_RUNNING\}\)/,
+      "the result age must be max(fired_at) over FINISHED rows only",
+    );
+    assert.match(readers, /resultAgeSeconds === null \? null : Number/, "NULL must not become 0 — that reads as 'just finished'");
+    const admin = readSrc("routes/admin-cron-heartbeats.ts");
+    assert.match(admin, /seconds_since_last_result/, "the operator gets the same pair");
+  });
+
+  test.it("emptying the withheld-tick list cannot blank the Chief's cron list", () => {
+    assert.match(
+      readSrc("lib/chiefReaders.ts"),
+      /NON_CADENCE_TICKS\.length > 0/,
+      "notInArray(col, []) compiles to a false predicate — every tick would vanish",
+    );
+  });
+
   test.it("the app-clock age helper is gone from the pure view module", () => {
     const src = readSrc("lib/chiefView.ts");
     assert.doesNotMatch(
