@@ -196,6 +196,20 @@
   additive field, and it is the one to alarm on for "fired but did nothing" —
   with a threshold well above cadence plus a normal body.
 
+  ── PUSHED, NOT PUBLISHED ─────────────────────────────────────────────────
+
+  Merged to `main` with `--no-ff` and pushed in the recorded order — anchor
+  first, so the rollback point exists on the remote before `main` moves:
+  `git push origin refs/tags/pre-f-37c-main-tip && git push origin main`. The
+  tag is on the remote at the pre-order tip. No SHA for the branch tip is
+  pinned here, for the reason F-3.6b records: this file is itself committed, so
+  any tip it names is stale the moment it lands. The invariant instead —
+  `git rev-list --left-right --count origin/main...main` read `0 0` after the
+  push, with the tracking ref and local `main` at the same commit. Re-check it
+  that way. **Nothing was published.** The four scope items are live in the
+  repository and not in production until Michael publishes; the three ephemeral
+  smoke databases were dropped.
+
 - **[F-3.7c finding, 2026-08-17] `sync_and_autoqueue` reads 96 errors in 96
   runs and the tick is not failing — one mailbox is.** Account 5 has been
   `auth_dead` since 2026-08-09 (`unauthorized_client`) with **189 follow-ups
