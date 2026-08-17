@@ -407,6 +407,21 @@
   a business decision nobody has made yet, not a default.** The Workspace
   audit-log question stays open for account 3 (Denise Cafaro), whose 12-hour
   `unauthorized_client` window shares Murat's reason and may share its cause.
+  **[Both questions CLOSED by Michael, 2026-08-17 ~20:2xZ.]** Murat's
+  pipeline: *"we simply pause everything and do not pass it"* — no
+  reassignment, ever. The standing state already is that decision: the
+  admin-pause holds every queued row, and the nightly expiry/archive sweeps
+  retire the campaigns as they age. Nothing further to do, and nothing may be
+  moved to another rep. Denise: *"she was simply offline for a long time, all
+  good"* — the window is explained to Michael's satisfaction and the
+  audit-log check is dropped. One factual note kept for the future, not as a
+  reopened question: her recovery was verified working (49 failing passes,
+  then twelve clean hours, 32 messages synced), and if long-offline windows
+  recur on other accounts, each one costs the Chief exactly one WARN per
+  transition into `auth_dead` — the volume at which the hysteresis option
+  above stays not-worth-taking. The 20:15Z sync pass after Murat's removal
+  ran `ok` with 10 users and zero failures — the first `ok` on this tick
+  since 2026-08-09.
 
 - **[F-3.7b, DONE 2026-08-13] The fast_tick alarm was a false death report, and
   three real unbounded things sat under it.** The Chief's all-day
