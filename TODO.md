@@ -389,6 +389,24 @@
   degraded from down. F-3.7b deliberately routes a wedge reclaim into
   `partial` -> `errors_24h`, so that is a contract decision, not a fix to take
   unilaterally.
+  **[RESOLVED differently, 2026-08-17 ~20:12Z]: account 5 was REMOVED, not
+  reconnected — Murat Solendil left Mobupps.** On Michael's instruction, via
+  the app's own surfaces (no direct database write): `DELETE
+  /gmail/accounts/5` (refresh token cleared, `is_connected` false, auth-dead
+  cleared — there is no grant left to be dead) and `POST
+  /admin/users/5/pause`. He now carries the departed-member shape account 8
+  (Marissa Ye) established: `disconnected` + `paused_by_admin`, and the census
+  reads **auth_dead: 0 for the first time since 2026-08-09**. Consequences:
+  from the next */15 pass he is out of `runAllUsersSync()` entirely
+  (`is_connected = true` filter), so the 96/96 partials END here — sync
+  `errors_24h` drains to zero over the following 24 hours, and the Chief-side
+  "firing but always failing" concern above resolves itself for this tick. His
+  ~253 queued follow-ups stay held (paused users are excluded from the due
+  queue; the daily expiry/archive sweeps will retire the campaigns over the
+  coming days) — **whether any of that pipeline should move to another rep is
+  a business decision nobody has made yet, not a default.** The Workspace
+  audit-log question stays open for account 3 (Denise Cafaro), whose 12-hour
+  `unauthorized_client` window shares Murat's reason and may share its cause.
 
 - **[F-3.7b, DONE 2026-08-13] The fast_tick alarm was a false death report, and
   three real unbounded things sat under it.** The Chief's all-day
