@@ -2,9 +2,9 @@
 
 ## Open items
 
-- **[F-3.7c, IN FLIGHT 2026-08-17] BLAST RADIUS (pre-edit) — the liveness
-  signal stops depending on how long the work takes, and on a write that is
-  allowed to fail silently.** The Chief's session of 2026-08-17 read this app
+- **[F-3.7c, DONE 2026-08-17] The liveness signal stops depending on how long
+  the work takes, and on a write that is allowed to fail silently.** The Chief's
+  session of 2026-08-17 read this app
   read-only and found the cron healthy while the age it reports "occasionally
   spikes", and asked for one thing: make `age_seconds` come from the same
   bookkeeping as the tick counter. The read-only diagnosis behind this order
@@ -71,6 +71,130 @@
   **Out of scope:** splitting `partial` from `error` on the Chief seam (it
   belongs with the Chief order — see the finding below), `DUE_BATCH_LIMIT`,
   any DDL, and publishing.
+
+  ── WHAT SHIPPED, AND WHAT THE AUDIT ROUND CHANGED ────────────────────────
+
+  All four scope items landed as written, and the audit round added a fifth
+  thing that the first four made necessary.
+  1. **The firing is the row.** `beginHeartbeat(tick)` inserts at the top of the
+     body with `outcome: 'running'` and `fired_at` left to the column default —
+     `NOW()`, the DATABASE's clock — and `hb.finish({outcome, details})` updates
+     that row. One row per firing, as before; the app clock no longer stamps any
+     stored instant; and no tick body keeps a `startedAt` any more, because the
+     duration is measured by the recorder. **F-3.7b's recorded skip stopped
+     being a code path and became a property of the shape**: the row exists
+     before the guard is consulted, so every exit — including one somebody adds
+     later without reading the comment — leaves the firing recorded.
+  2. **The write is not best-effort.** Three attempts, 1s and 3s apart, in
+     `lib/heartbeatLifecycle.ts` — pure, no `db` import, so failure is provable
+     hermetically (the `processingGuard.ts` idiom). A ladder that runs out says
+     so in one line naming the hole it left and what that hole looks like from
+     the Chief. It still never throws: a tick that died because its bookkeeping
+     did would trade a false death report for a real one. Worst case ~49s at
+     the top of the tightest tick, and only when the database is unreachable —
+     a state in which that tick's work would do nothing anyway.
+  3. **A restart writes `process_start`,** carrying the armed tick set in its
+     details, so a hole in the stream is readable as a restart by somebody who
+     no longer has the log lines. Withheld from the Chief's `crons[]`: its age
+     is the process's uptime, a number that SHOULD grow without bound, and the
+     Chief's rule is a multiple of a cadence it has not got. Present on the
+     admin surface, which is where a hole gets explained.
+  4. **One clock.** Both readers compute their ages in SQL, in the same snapshot
+     as their 24h counters. `ageSeconds()` is DELETED from `chiefView.ts` rather
+     than left unused — what it computed was the wrong clock, and a pure helper
+     in the pure module is what the next reader would reach for. `errors_24h` is
+     `not in ('ok', 'running')`, written as an exclusion so an outcome nobody
+     has thought of yet counts as a problem instead of disappearing.
+  5. **The second age, from the audit round.** Fire-time rows open a hole: a tick
+     that fires and never finishes now reports a FRESH age, where the old shape's
+     silence eventually read as a stale cron — an accidental stall detector, but
+     a real one, and for `sync_and_autoqueue` (4h sync wedge limit) the only one.
+     So the pulse carries `result_age_seconds` beside `age_seconds`: seconds
+     since the last firing that reached an outcome. Both small is healthy; the
+     first small and the second climbing is a tick firing into a hang. Rendered
+     from the smoke database, that reads
+     `{"tick_name":"sync_and_autoqueue","age_seconds":90,"result_age_seconds":1020,…}`.
+     Mirrored on the admin surface as `seconds_since_last_result`, beside a new
+     `running_24h`.
+
+  ── DEFECTS THE PROOFS FOUND IN MY OWN WORK, ALL FIXED ────────────────────
+
+  - `greatest(0, NULL)` is **0** in Postgres — the function ignores nulls rather
+    than propagating them — so the first spelling of `result_age_seconds`
+    reported "no firing has ever finished" as "one finished this second". Both
+    readers now spell it as a CASE. The live smoke caught this; no hermetic test
+    could have.
+  - `notInArray(col, [])` compiles to a **false predicate** in drizzle, so
+    emptying `NON_CADENCE_TICKS` would have answered the Chief with no ticks at
+    all — every cron reading as never fired. Guarded and pinned.
+  - The smoke inherited the **real `CHIEF_URL` and `CHIEF_INGEST_TOKEN`** from
+    the workspace environment, armed the spend reporter and gave the tick census
+    an eleventh tick pointed at the live Chief. The transport lockout caught it;
+    the smoke now unsets all three Chief variables, as `smoke-f37a.ts` does.
+  - The smoke read an **absolute** `status = 'sent'` count in a scratch database
+    another smoke had already seeded. It measures a delta now.
+
+  ── FOUND WHILE DOING THE WORK, FIXED HERE ────────────────────────────────
+
+  `chief_spend_report` carried the same defect F-3.7b removed from `fast_tick`:
+  `if (sweepRunning) return` wrote nothing at all, so a sweep that ran long
+  would age this tick's `max(fired_at)` while it fired on schedule. It has never
+  bitten in production — 288 of 288 rows in 24h on 2026-08-17, because a sweep
+  takes about a second — which is exactly why it was still there to find.
+
+  ── PROOFS ────────────────────────────────────────────────────────────────
+
+  `tests/test-f37c-honest-liveness.ts`, 25 hermetic tests: the ladder's shape,
+  the fallback that still records a RESULT when the firing could not be
+  recorded, the single loud line when a write is lost, idempotent finish,
+  duration measured from the firing, a backwards clock, the withheld tick name,
+  and structural pins on all five items. `scripts/smoke-f37c.ts`, 42 live checks
+  on an ephemeral database with vendors impossible: the row present mid-flight,
+  the second write proven to be an UPDATE, `fired_at` still at the firing after
+  a slow body, an in-flight row counted but not blamed, a row pushed ten minutes
+  into the past reading as ten minutes and matching the database's own
+  arithmetic, the two ages describing a stall, `process_start` written and
+  withheld, and — instead of two tick bodies — **all ten registered ticks driven
+  for real** by replacing `cron.schedule` before any application module loads and
+  invoking the callbacks it captures. Sibling smokes re-run green: F-3.7b (its
+  own properties hold unchanged under the new mechanism), F-3.7a dark and lit,
+  F-3.6a, F-3.6b. Whole hermetic suite green: 47 files. `pnpm run build` green.
+  **Mutation proofs, seven, each bit:** one attempt only; the firing recorded
+  after the guard (bites in both this suite and F-3.7b's); the age no longer
+  computed in SQL; an in-flight row counted as an error again (bites hermetically
+  AND live); the cadence-less tick no longer withheld (both); a lost write logged
+  quietly; `finish` inserting a second row instead of updating (13 live checks
+  bite). **One result worth recording:** reverting the age to the app clock is
+  caught ONLY by the structural pin — the live smoke passes, because in this
+  environment the two clocks agree to within a second. That is why that pin is
+  structural rather than behavioural.
+
+  ── HONEST GAPS ───────────────────────────────────────────────────────────
+
+  - The `chief_spend_report` wrapper is proven **structurally, not live**: it is
+    registered only when `CHIEF_URL` and `CHIEF_INGEST_TOKEN` are both set, and
+    an armed reporter has no business inside a smoke. Its shape is identical to
+    the ten that are driven for real.
+  - On a database that does not yet have `cron_heartbeats`, the first
+    `process_start` write is lost — loudly, after three attempts — because
+    `startCronJobs()` does not wait on the startup migration. Both real
+    databases have had the table since F-3.6b; a fresh one records its restart
+    from the second boot onward.
+  - A failed UPDATE leaves a row at `running` for ever. It is not an error, does
+    not move either age, and shows on the admin surface as `running_24h` above 1
+    — strictly more than the silence it replaces.
+
+  ── THE ONE COORDINATION POINT WITH THE CHIEF ─────────────────────────────
+
+  Two things the Chief-side order needs to know, neither of which this side can
+  decide alone. **(a)** `age_seconds` now measures from the FIRING, so a tick's
+  age legitimately climbs to its full cadence — up to 900s for the two
+  15-minute ticks — where before it was shortened by however long the body ran
+  (`sync_and_autoqueue` fired at 18:00:00 and stamped 18:05:19). A staleness
+  threshold of exactly 1x cadence will alarm on a healthy tick; the "sane
+  multiple" C-3.7b §4 specifies will not. **(b)** `result_age_seconds` is a new
+  additive field, and it is the one to alarm on for "fired but did nothing" —
+  with a threshold well above cadence plus a normal body.
 
 - **[F-3.7c finding, 2026-08-17] `sync_and_autoqueue` reads 96 errors in 96
   runs and the tick is not failing — one mailbox is.** Account 5 has been
