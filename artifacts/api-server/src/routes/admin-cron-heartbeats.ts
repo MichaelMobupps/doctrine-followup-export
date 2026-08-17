@@ -35,6 +35,7 @@ import {
   parseHeartbeatQuery,
   redactHeartbeatDetails,
 } from "../lib/heartbeatView";
+import { HEARTBEAT_RUNNING } from "../lib/heartbeatLifecycle";
 
 const router = Router();
 
@@ -72,8 +73,19 @@ router.get("/admin/cron-heartbeats", async (req: Request, res: Response) => {
       .select({
         tick_name: cronHeartbeatsTable.tickName,
         last_fired_at: sql<string>`max(${cronHeartbeatsTable.firedAt})`,
+        // F-3.7c: the database's clock, in the same snapshot as the counters,
+        // for the same reason as `readCronPulses()` — the app clock had no
+        // business in a comparison against a stored timestamp. Unlike the Chief
+        // seam, NO tick is withheld here: `process_start` is the row that tells
+        // an operator a hole in the stream was a restart, so this is the surface
+        // that must show it.
+        seconds_since_last: sql<
+          number
+        >`greatest(0, round(extract(epoch from (now() - max(${cronHeartbeatsTable.firedAt})))))::int`,
         ticks_24h: sql<number>`count(*) filter (where ${cronHeartbeatsTable.firedAt} > now() - interval '24 hours')::int`,
-        errors_24h: sql<number>`count(*) filter (where ${cronHeartbeatsTable.firedAt} > now() - interval '24 hours' and ${cronHeartbeatsTable.outcome} <> 'ok')::int`,
+        // F-3.7c: an in-flight tick sits at `running` and is not an error.
+        errors_24h: sql<number>`count(*) filter (where ${cronHeartbeatsTable.firedAt} > now() - interval '24 hours' and ${cronHeartbeatsTable.outcome} not in ('ok', ${HEARTBEAT_RUNNING}))::int`,
+        running_now: sql<number>`count(*) filter (where ${cronHeartbeatsTable.outcome} = ${HEARTBEAT_RUNNING} and ${cronHeartbeatsTable.firedAt} > now() - interval '24 hours')::int`,
       })
       .from(cronHeartbeatsTable)
       .groupBy(cronHeartbeatsTable.tickName)
@@ -90,14 +102,18 @@ router.get("/admin/cron-heartbeats", async (req: Request, res: Response) => {
       },
       ticks: latestPerTick.map((t) => {
         const last = t.last_fired_at ? new Date(t.last_fired_at) : null;
+        const age = Number(t.seconds_since_last);
         return {
           tick_name: t.tick_name,
           last_fired_at: last ? last.toISOString() : null,
-          seconds_since_last: last
-            ? Math.max(0, Math.round((now.getTime() - last.getTime()) / 1000))
-            : null,
+          seconds_since_last: Number.isFinite(age) ? age : null,
           ticks_24h: t.ticks_24h,
           errors_24h: t.errors_24h,
+          // F-3.7c: rows still at `running`. Normally 0 or 1 — one firing that
+          // has not finished yet. A number that stays above 1 for a tick means
+          // firings are starting and not finishing, which is the state that
+          // used to be invisible entirely.
+          running_24h: t.running_now,
         };
       }),
       heartbeats: rows.map((r) => ({

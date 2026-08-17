@@ -454,11 +454,13 @@ function round6(usd: number): number {
   return Math.round(usd * 1_000_000) / 1_000_000;
 }
 
-/** Seconds between two instants, floored at zero and rounded. */
-export function ageSeconds(now: Date, then: Date | null): number | null {
-  if (!then) return null;
-  return Math.max(0, Math.round((now.getTime() - then.getTime()) / 1000));
-}
+// F-3.7c: `ageSeconds(now, then)` used to live here, and its only caller was
+// the cron pulse reader. It is DELETED rather than left unused, because what it
+// computed was an age from the APP's clock against a timestamp from the
+// database's — the mismatch this order exists to remove — and a pure helper
+// sitting in the pure module is exactly what the next reader would reach for.
+// Ages are computed by the database now, in the same snapshot as the counters
+// they sit beside. See `readCronPulses()`.
 
 /** Start of the UTC day containing `now`. The window every spend report uses. */
 export function startOfUtcDay(now: Date): Date {

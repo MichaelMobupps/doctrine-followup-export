@@ -82,7 +82,12 @@ export interface ChiefSources {
   globalPause(): Promise<boolean>;
   census(): Promise<AccountCensus>;
   dueQueueDepth(now: Date): Promise<number>;
-  cronPulses(now: Date): Promise<CronPulse[]>;
+  /**
+   * F-3.7c: takes no `now`. Every figure in a pulse — the age included — is
+   * computed by the database in one snapshot, so there is no instant for this
+   * seam to hand in and no second clock for it to hand in from.
+   */
+  cronPulses(): Promise<CronPulse[]>;
   accountsSlice(limit: number, offset: number): Promise<AccountsSlice>;
   /** Overridable for tests. Defaults to the real clock. */
   now?(): Date;
@@ -169,7 +174,7 @@ export function createChiefRouter(sources: ChiefSources): IRouter {
           sources.globalPause(),
           sources.census(),
           sources.dueQueueDepth(at),
-          sources.cronPulses(at),
+          sources.cronPulses(),
         ]);
 
       sendGuarded(

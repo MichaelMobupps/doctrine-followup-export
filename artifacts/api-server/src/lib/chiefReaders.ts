@@ -34,7 +34,8 @@ import {
   usersTable,
   GLOBAL_PAUSE_KEY,
 } from "@workspace/db";
-import { and, eq, gte, inArray, isNull, lte, or, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, isNull, lte, notInArray, or, sql } from "drizzle-orm";
+import { HEARTBEAT_RUNNING, NON_CADENCE_TICKS } from "./heartbeatLifecycle";
 import {
   DAILY_BUDGET_CAP_KEY,
   DAILY_BUDGET_ENABLED_KEY,
@@ -48,7 +49,6 @@ import {
   type CronPulse,
   accountLabel,
   accountState,
-  ageSeconds,
   startOfUtcDay,
 } from "./chiefView";
 
@@ -240,26 +240,59 @@ export async function readDueQueueDepth(now: Date): Promise<number> {
  * NOTE what is NOT here: `details`. That column is where a googleapis error can
  * serialise an `Authorization: Bearer …`, which is why F-3.6a wrote a redactor
  * for it. Not selecting it at all is a stronger guarantee than redacting it.
+ *
+ * F-3.7c CHANGES WHAT `last_fired_at` MEANS, and the Chief has to know: it is
+ * now the instant the tick FIRED, not the instant its row was written. Before
+ * this order a tick stamped its row when its body finished, so a tick with a
+ * long body reported an age that was younger than the truth by however long the
+ * work took — `sync_and_autoqueue` fired at 18:00:00 on 2026-08-17 and stamped
+ * 18:05:19. The honest figure is larger, and it climbs to the tick's full
+ * cadence between firings. A staleness rule set at exactly 1x cadence will now
+ * alarm on a healthy tick; the "sane multiple" C-3.7b §4 specifies will not.
  */
-export async function readCronPulses(now: Date): Promise<CronPulse[]> {
+export async function readCronPulses(): Promise<CronPulse[]> {
   const rows = await db
     .select({
       tickName: cronHeartbeatsTable.tickName,
       lastFiredAt: sql<string | null>`max(${cronHeartbeatsTable.firedAt})`,
+      // F-3.7c: computed HERE, by the database, in the same snapshot as the two
+      // counters beside it. It used to be `new Date()` in the route minus this
+      // timestamp — the app's clock against the database's — which is the one
+      // way these three figures could contradict each other while every row
+      // they read agreed. `greatest(0, …)` because an age is never negative and
+      // a status endpoint is the wrong place to discover a clock going
+      // backwards.
+      ageSeconds: sql<
+        number | null
+      >`greatest(0, round(extract(epoch from (now() - max(${cronHeartbeatsTable.firedAt})))))::int`,
       ticks24h: sql<number>`count(*) filter (where ${cronHeartbeatsTable.firedAt} > now() - interval '24 hours')::int`,
-      errors24h: sql<number>`count(*) filter (where ${cronHeartbeatsTable.firedAt} > now() - interval '24 hours' and ${cronHeartbeatsTable.outcome} <> 'ok')::int`,
+      // F-3.7c: `not in ('ok', 'running')` rather than `<> 'ok'`. A row sits at
+      // `running` between its tick's firing and its result, and an in-flight
+      // tick is not a failed one — with the 15-minute ticks running for minutes
+      // at a time, `<> 'ok'` would report an error on nearly every probe.
+      // Written as an exclusion rather than as `in ('partial','error')` so that
+      // an outcome nobody here has thought of yet counts as a problem instead
+      // of disappearing.
+      errors24h: sql<number>`count(*) filter (where ${cronHeartbeatsTable.firedAt} > now() - interval '24 hours' and ${cronHeartbeatsTable.outcome} not in ('ok', ${HEARTBEAT_RUNNING}))::int`,
     })
     .from(cronHeartbeatsTable)
+    // F-3.7c: the restart marker and anything else without a cadence is
+    // withheld. The Chief's staleness rule is "age over a sane multiple of
+    // this tick's cadence" (C-3.7b §4), and `process_start`'s age is the
+    // process's uptime — a number that is SUPPOSED to grow without bound. It
+    // stays on the admin surface, which is where a hole gets explained.
+    .where(notInArray(cronHeartbeatsTable.tickName, [...NON_CADENCE_TICKS]))
     .groupBy(cronHeartbeatsTable.tickName)
     .orderBy(cronHeartbeatsTable.tickName);
 
   return rows.map((r) => {
     const last = r.lastFiredAt ? new Date(r.lastFiredAt) : null;
     const valid = last && !Number.isNaN(last.getTime()) ? last : null;
+    const age = Number(r.ageSeconds);
     return {
       tick_name: r.tickName,
       last_fired_at: valid ? valid.toISOString() : null,
-      age_seconds: ageSeconds(now, valid),
+      age_seconds: Number.isFinite(age) ? age : null,
       ticks_24h: Number(r.ticks24h ?? 0),
       errors_24h: Number(r.errors24h ?? 0),
     };

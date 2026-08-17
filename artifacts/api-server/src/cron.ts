@@ -6,7 +6,10 @@ import { pruneSharedDrafts } from "./services/companyDraftCache";
 import { runWeeklyDigest } from "./services/weeklyDigest";
 import { logger } from "./lib/logger";
 // Phase 7n: per-tick heartbeat recording for cron-firing observability.
-import { recordHeartbeat } from "./lib/cronHeartbeat";
+// F-3.7c: a tick records its FIRING (beginHeartbeat) and then its result
+// (hb.finish), so the liveness signal no longer waits for the work to end
+// and cannot be lost by an early return. See lib/heartbeatLifecycle.ts.
+import { beginHeartbeat, recordProcessStart } from "./lib/cronHeartbeat";
 // F-3.7a: outbound spend reporting to the Chief. Registers its own tick, and
 // only when CHIEF_URL + CHIEF_INGEST_TOKEN are both set.
 import { startChiefSpendReporting } from "./lib/chiefSpendSweep";
@@ -17,11 +20,26 @@ import { startChiefSpendReporting } from "./lib/chiefSpendSweep";
 // applies to the failed-row rules.
 import { claimProcessingGuard } from "./lib/processingGuard";
 
+/**
+ * The armed schedule, in one string.
+ *
+ * Logged at boot, as it always was, and — F-3.7c — also written into the
+ * `process_start` heartbeat's details, so the table itself says which tick set
+ * this process came up with. A hole in the stream is then readable after the
+ * fact by somebody who no longer has the log lines.
+ */
+const TICK_SET_SUMMARY =
+  "sync+auto-queue @*/15, process @5,20,35,50, draft-stall @00:30, " +
+  "campaign-expiry @00:15, over-cap @00:20, archive-sweep @00:45, " +
+  "shared-draft-prune @01:00, weekly-digest @Tue 00:00 UTC + retry @Tue " +
+  "06:00 UTC, fast-tick @*/3, chief-spend @*/5 (only when the Chief seam is " +
+  "configured)";
+
 export function startCronJobs(): void {
   // Gmail sync + auto-queue every 15 minutes.
   // Phase 7n: heartbeat tickName="sync_and_autoqueue".
   cron.schedule("*/15 * * * *", async () => {
-    const startedAt = Date.now();
+    const hb = await beginHeartbeat("sync_and_autoqueue");
     let outcome: "ok" | "partial" | "error" = "ok";
     const details: Record<string, unknown> = {};
     try {
@@ -96,12 +114,7 @@ export function startCronJobs(): void {
       details.wrapperError = err instanceof Error ? err.message : String(err);
       logger.error({ err }, "sync_and_autoqueue wrapper error");
     } finally {
-      await recordHeartbeat({
-        tickName: "sync_and_autoqueue",
-        durationMs: Date.now() - startedAt,
-        outcome,
-        details,
-      });
+      await hb.finish({ outcome, details });
     }
   });
 
@@ -114,7 +127,7 @@ export function startCronJobs(): void {
   // pause the prospect and move the row to stalled_awaiting_manual_send.
   // Phase 7n: heartbeat tickName="draft_stall_watcher".
   cron.schedule("30 0 * * *", async () => {
-    const startedAt = Date.now();
+    const hb = await beginHeartbeat("draft_stall_watcher");
     let outcome: "ok" | "partial" | "error" = "ok";
     const details: Record<string, unknown> = {};
     try {
@@ -129,12 +142,7 @@ export function startCronJobs(): void {
       details.error = err instanceof Error ? err.message : String(err);
       logger.error({ err }, "Draft stall watcher error");
     } finally {
-      await recordHeartbeat({
-        tickName: "draft_stall_watcher",
-        durationMs: Date.now() - startedAt,
-        outcome,
-        details,
-      });
+      await hb.finish({ outcome, details });
     }
   });
 
@@ -144,7 +152,7 @@ export function startCronJobs(): void {
   // the archival sweep (00:45), so an expired campaign is paused first and
   // then follows the normal paused -> archived lifecycle.
   cron.schedule("15 0 * * *", async () => {
-    const startedAt = Date.now();
+    const hb = await beginHeartbeat("campaign_expiry_sweep");
     let outcome: "ok" | "partial" | "error" = "ok";
     const details: Record<string, unknown> = {};
     try {
@@ -159,12 +167,7 @@ export function startCronJobs(): void {
       details.error = err instanceof Error ? err.message : String(err);
       logger.error({ err }, "Campaign expiry sweep error");
     } finally {
-      await recordHeartbeat({
-        tickName: "campaign_expiry_sweep",
-        durationMs: Date.now() - startedAt,
-        outcome,
-        details,
-      });
+      await hb.finish({ outcome, details });
     }
   });
 
@@ -174,7 +177,7 @@ export function startCronJobs(): void {
   // (00:15) and before the draft stall watcher (00:30). Paused rows then
   // follow the normal paused -> archived lifecycle.
   cron.schedule("20 0 * * *", async () => {
-    const startedAt = Date.now();
+    const hb = await beginHeartbeat("over_cap_sweep");
     let outcome: "ok" | "partial" | "error" = "ok";
     const details: Record<string, unknown> = {};
     try {
@@ -189,19 +192,14 @@ export function startCronJobs(): void {
       details.error = err instanceof Error ? err.message : String(err);
       logger.error({ err }, "Over-cap sweep error");
     } finally {
-      await recordHeartbeat({
-        tickName: "over_cap_sweep",
-        durationMs: Date.now() - startedAt,
-        outcome,
-        details,
-      });
+      await hb.finish({ outcome, details });
     }
   });
 
   // Daily archival sweep: archive campaigns paused for >= 14 days.
   // Runs at 00:45, after the draft stall watcher at 00:30.
   cron.schedule("45 0 * * *", async () => {
-    const startedAt = Date.now();
+    const hb = await beginHeartbeat("archive_sweep");
     let outcome: "ok" | "partial" | "error" = "ok";
     const details: Record<string, unknown> = {};
     try {
@@ -216,12 +214,7 @@ export function startCronJobs(): void {
       details.error = err instanceof Error ? err.message : String(err);
       logger.error({ err }, "Archival sweep error");
     } finally {
-      await recordHeartbeat({
-        tickName: "archive_sweep",
-        durationMs: Date.now() - startedAt,
-        outcome,
-        details,
-      });
+      await hb.finish({ outcome, details });
     }
   });
 
@@ -237,7 +230,7 @@ export function startCronJobs(): void {
   // accidental rerun within the same Tuesday is a no-op.
   // Phase 7n: heartbeat tickName="weekly_digest".
   cron.schedule("0 0 * * 2", async () => {
-    const startedAt = Date.now();
+    const hb = await beginHeartbeat("weekly_digest");
     let outcome: "ok" | "partial" | "error" = "ok";
     const details: Record<string, unknown> = {};
     try {
@@ -256,12 +249,7 @@ export function startCronJobs(): void {
       details.error = err instanceof Error ? err.message : String(err);
       logger.error({ err }, "Weekly digest error");
     } finally {
-      await recordHeartbeat({
-        tickName: "weekly_digest",
-        durationMs: Date.now() - startedAt,
-        outcome,
-        details,
-      });
+      await hb.finish({ outcome, details });
     }
   }, { timezone: "UTC" });
 
@@ -271,7 +259,7 @@ export function startCronJobs(): void {
   // FAILED earlier today (lastWeeklyDigestAt is older than 6 days, or
   // unset) actually get a fresh send.
   cron.schedule("0 6 * * 2", async () => {
-    const startedAt = Date.now();
+    const hb = await beginHeartbeat("weekly_digest_retry");
     let outcome: "ok" | "partial" | "error" = "ok";
     const details: Record<string, unknown> = {};
     try {
@@ -290,12 +278,7 @@ export function startCronJobs(): void {
       details.error = err instanceof Error ? err.message : String(err);
       logger.error({ err }, "Weekly digest retry error");
     } finally {
-      await recordHeartbeat({
-        tickName: "weekly_digest_retry",
-        durationMs: Date.now() - startedAt,
-        outcome,
-        details,
-      });
+      await hb.finish({ outcome, details });
     }
   }, { timezone: "UTC" });
 
@@ -303,7 +286,7 @@ export function startCronJobs(): void {
   // Runs at 01:00, after the archival sweep at 00:45. Fail-open inside
   // pruneSharedDrafts(); the heartbeat records the outcome either way.
   cron.schedule("0 1 * * *", async () => {
-    const startedAt = Date.now();
+    const hb = await beginHeartbeat("shared_draft_prune");
     let outcome: "ok" | "partial" | "error" = "ok";
     const details: Record<string, unknown> = {};
     try {
@@ -317,12 +300,7 @@ export function startCronJobs(): void {
       details.error = err instanceof Error ? err.message : String(err);
       logger.error({ err }, "CSD: shared-draft prune error");
     } finally {
-      await recordHeartbeat({
-        tickName: "shared_draft_prune",
-        durationMs: Date.now() - startedAt,
-        outcome,
-        details,
-      });
+      await hb.finish({ outcome, details });
     }
   });
 
@@ -334,7 +312,16 @@ export function startCronJobs(): void {
   // `chief_spend_report` @*/5 when configured.
   startChiefSpendReporting();
 
-  logger.info("Cron jobs active: sync+auto-queue @*/15, process @5,20,35,50, draft-stall @00:30, campaign-expiry @00:15, over-cap @00:20, archive-sweep @00:45, shared-draft-prune @01:00, weekly-digest @Tue 00:00 UTC + retry @Tue 06:00 UTC, fast-tick @*/3, chief-spend @*/5 (only when the Chief seam is configured)");
+  // F-3.7c: one row per process start, written now that the tick set is
+  // registered and firing again. This is the difference between "the cron
+  // died" and "the app restarted" — the in-process scheduler fires nothing
+  // while the process is down, so a restart leaves the same hole in the
+  // heartbeat stream that a dead tick does, and until this row existed
+  // nothing in the database could tell an operator which one had happened.
+  // Fire-and-forget: boot waits on nothing and fails on nothing here.
+  recordProcessStart({ tickSet: TICK_SET_SUMMARY });
+
+  logger.info(`Cron jobs active: ${TICK_SET_SUMMARY}`);
 }
 
 /**
@@ -345,15 +332,13 @@ export function startCronJobs(): void {
  * that could drift from the thing production runs.
  */
 export async function runProcessDueTick(): Promise<void> {
-  const startedAt = Date.now();
+  const hb = await beginHeartbeat("process_due");
   let outcome: "ok" | "partial" | "error" = "ok";
   const details: Record<string, unknown> = {};
   const claim = claimProcessingGuard("process_due");
   if (!claim.claimed) {
     logger.warn("Previous follow-up processing pass still running — skipping process_due tick");
-    await recordHeartbeat({
-      tickName: "process_due",
-      durationMs: 0,
+    await hb.finish({
       outcome: "ok",
       details: {
         skipped: "previous processing pass still running",
@@ -386,12 +371,7 @@ export async function runProcessDueTick(): Promise<void> {
     logger.error({ err }, "Scheduler error");
   } finally {
     claim.release();
-    await recordHeartbeat({
-      tickName: "process_due",
-      durationMs: Date.now() - startedAt,
-      outcome,
-      details,
-    });
+    await hb.finish({ outcome, details });
   }
 }
 
@@ -403,7 +383,7 @@ export async function runProcessDueTick(): Promise<void> {
  * heartbeat — lives in here, so the proof has to be able to call in here.
  */
 export async function runFastTick(): Promise<void> {
-  const startedAt = Date.now();
+  const hb = await beginHeartbeat("fast_tick");
   let outcome: "ok" | "partial" | "error" = "ok";
   const details: Record<string, unknown> = {};
   const claim = claimProcessingGuard("fast_tick");
@@ -428,9 +408,17 @@ export async function runFastTick(): Promise<void> {
     // replaces a row this tick would have written anyway on a pass it did
     // not have to skip. The ceiling is unchanged at one row per firing,
     // 480/day, which is what the tick has always been budgeted for.
-    await recordHeartbeat({
-      tickName: "fast_tick",
-      durationMs: 0,
+    //
+    // ── F-3.7c: and now it cannot be un-recorded. ─────────────────────
+    //
+    // The row was inserted by `beginHeartbeat` above, before the guard was
+    // even consulted, so this branch is finishing a row that already
+    // exists rather than deciding whether one gets written. F-3.7b's fix
+    // stopped being a code path an early return could skip and became a
+    // property of the shape: every path out of this function, including
+    // one somebody adds later without reading this comment, leaves the
+    // firing recorded.
+    await hb.finish({
       outcome: "ok",
       details: {
         skipped: "previous processing pass still running",
@@ -462,11 +450,6 @@ export async function runFastTick(): Promise<void> {
     logger.error({ err }, "Fast-tick error");
   } finally {
     claim.release();
-    await recordHeartbeat({
-      tickName: "fast_tick",
-      durationMs: Date.now() - startedAt,
-      outcome,
-      details,
-    });
+    await hb.finish({ outcome, details });
   }
 }
