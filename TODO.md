@@ -187,14 +187,77 @@
   ── THE ONE COORDINATION POINT WITH THE CHIEF ─────────────────────────────
 
   Two things the Chief-side order needs to know, neither of which this side can
-  decide alone. **(a)** `age_seconds` now measures from the FIRING, so a tick's
-  age legitimately climbs to its full cadence — up to 900s for the two
-  15-minute ticks — where before it was shortened by however long the body ran
-  (`sync_and_autoqueue` fired at 18:00:00 and stamped 18:05:19). A staleness
-  threshold of exactly 1x cadence will alarm on a healthy tick; the "sane
-  multiple" C-3.7b §4 specifies will not. **(b)** `result_age_seconds` is a new
-  additive field, and it is the one to alarm on for "fired but did nothing" —
-  with a threshold well above cadence plus a normal body.
+  decide alone. **(a)** `age_seconds` now measures from the FIRING, so at any
+  given instant it reads up to one body-duration larger than it used to, and
+  `last_fired_at` finally names the firing rather than the completion. **This
+  does NOT widen the range it can reach — see the correction below, which the
+  measured data forced.** **(b)** `result_age_seconds` is a new additive field,
+  and it is the one to alarm on for "fired but did nothing" — with a threshold
+  well above cadence plus a normal body.
+
+  ── ROUND-1 SQL RESULTS, AND A CORRECTION TO THIS ENTRY ────────────────────
+
+  Michael ran `DIAG-heartbeats-f37c.sql` against production, read-only, at
+  19:10Z on 2026-08-17 (database clock GMT, agreeing with the app's to within
+  the second — so the two-clock defect was latent, as stated, and never the
+  cause). Everything the diagnosis inferred from outside is confirmed, and two
+  things it could not see are now measured.
+  **The sync tick, settled.** 96 of 96 passes are `partial` and **not one is
+  `error`**; `syncError`, `autoQueueError`, `strandedDetectorError`,
+  `noConnectedAccounts`, `wrapperError` and `skipped` are all **zero**. Every
+  partial comes from the per-user path. Account 5 fails ingest on **96 of 96**
+  passes with `invalid_grant`, syncing nothing. **Account 3 — which reports
+  `connected` — fails on 49 of 96 with `unauthorized_client` while syncing 32
+  messages in the others.** That is new, and it matters: `nextAuthState()` has
+  no hysteresis (one auth failure marks an account dead, one healthy ingest
+  clears it), and the Chief mails once per transition INTO auth_dead. If those
+  49 failures alternate rather than sit in one window, they are dozens of
+  mails a day on their own. `DIAG-heartbeats-f37c-round2.sql` settles it and
+  counts the transitions directly.
+  **The holes, and at least one of their causes.** `fast_tick` wrote 479 of 480
+  rows in 24h and 1435 of 1440 in 72h. Four holes in the last 48h — 2026-08-16
+  08:57→09:03, 09:27→09:33 and 14:51→14:57, and 2026-08-17 15:21→15:27 — each
+  **exactly one missed firing** (gaps of 358-374s). **The Aug 16 publish
+  committed at 14:53:55Z, five seconds before the firing missing from the third
+  hole**, so that one is a restart, not a lost write: publishing this app costs
+  one `fast_tick` firing and, at a 2x-cadence threshold, one "cron stale" mail.
+  `process_start` now names that case in the table. `chief_spend_report` lost
+  four firings in 72h too (860 of 864, max gap 600s = one missed */5), so the
+  round-2 clustering query can tell restart from lost write for the rest.
+  **The overlap guard never bit**: `skipped` and `wedge` are both 0 across
+  `fast_tick`, `process_due` and `sync_and_autoqueue` for 24h — bodies are well
+  inside their cadences (max 84.8s, 58.9s and 436.1s) — so F-3.7b's recorded
+  skip was not involved in any of this window's alarms.
+  **The frozen queue is bigger than the Chief seam shows.** 253 follow-ups are
+  queued behind account 5's dead grant, oldest due **2026-06-23**, not the 189
+  the Chief reports — `queue_depth` there excludes paused and archived
+  campaigns by design, and both figures are right for their own question.
+  **CORRECTION to (a) above, and to the commit message that carried it.** Both
+  said the honest age is "larger" and climbs to the full cadence "where before
+  it was shortened by however long the body ran", with the implication that a
+  1x-cadence threshold newly becomes unsafe. The measured gaps say otherwise.
+  Rows used to land a body-duration after the firing, so the gap between
+  CONSECUTIVE ROWS varied with the body and already exceeded one cadence:
+  1017s for `sync_and_autoqueue` (900s cadence), 958s for `process_due`, 600s
+  for `chief_spend_report` (300s). After this order the rows are one cadence
+  apart by construction, so the reachable maximum gets **tighter**, not wider.
+  What is true pointwise stands: at a given instant the figure now reads up to
+  one body-duration larger — an average of 5.3 minutes for
+  `sync_and_autoqueue`, whose passes average 320.6s — and that is the honest
+  number. A 1x-cadence threshold was already unsafe before this order; it is no
+  more unsafe after it.
+
+  ── THE NEXT ORDER THIS DATA ARGUES FOR (not taken here) ───────────────────
+
+  **Hysteresis on the auth-dead state machine.** F-3.6a marks an account dead on
+  a single auth failure and alive on a single healthy ingest, which is right for
+  detection speed and wrong for a grant that answers intermittently: the account
+  flips on every alternation, each flip is a held-then-released queue and a
+  Chief mail, and nobody learns anything after the first one. The trade is real
+  in both directions — six auth-dead grants once sat unnoticed for ten days, and
+  requiring N consecutive failures delays that discovery by N passes (15 minutes
+  each) — so it is a decision, not a cleanup. Round-2 block 2 says how many
+  transitions a day are actually at stake before anyone decides.
 
   ── PUSHED, NOT PUBLISHED ─────────────────────────────────────────────────
 
