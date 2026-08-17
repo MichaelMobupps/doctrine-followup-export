@@ -52,12 +52,31 @@ ORDER BY 1;
 -- account's auth-failure state differs from the pass before it is one
 -- transition; `into_dead` is one WARN and a Pushover each, `recovered`
 -- is one INFO each.
+--
+-- CORRECTED 2026-08-17, after its first run returned 0 and 0 for an
+-- account that had demonstrably recovered. `authFailure` is written
+-- into details ONLY when it is true, so `->>'authFailure' = 'true'`
+-- yields NULL — not false — on every successful pass. `NOT NULL` and
+-- `NULL IS FALSE` are both unknown/false, so neither transition ever
+-- matched: the query would have reported "no flaps" for an account
+-- flapping every pass, which is a false negative on the one question
+-- it exists to answer. COALESCE fixes it. The fixture that first
+-- validated this query used real booleans and so could not see it;
+-- a fixture has to carry the shape of the real payload, absent keys
+-- included.
+--
+-- Note what is still invisible on purpose: a transition in the FIRST
+-- pass of the window has no predecessor, so an account that went dead
+-- before the window opened reports into_dead = 0. That is honest —
+-- the transition happened outside the window — and block 3's
+-- updated_at is where its timing comes from.
 
 WITH s AS (
   SELECT
     (u.value->>'userId')::int                     AS user_id,
     h.fired_at,
-    (u.value->>'authFailure' = 'true')            AS auth_failed
+    COALESCE(u.value->>'authFailure' = 'true', false)
+                                                  AS auth_failed
   FROM cron_heartbeats h
   CROSS JOIN LATERAL
     jsonb_array_elements(h.details->'perUser') AS u

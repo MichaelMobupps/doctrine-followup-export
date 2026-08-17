@@ -258,6 +258,55 @@
   requiring N consecutive failures delays that discovery by N passes (15 minutes
   each) — so it is a decision, not a cleanup. Round-2 block 2 says how many
   transitions a day are actually at stake before anyone decides.
+  **[ANSWERED by round 2, 2026-08-17 19:20Z]: not urgent on this evidence.**
+  Account 3 did not flap. Its 48 failures are ONE contiguous window —
+  every pass from 2026-08-16 19:35Z to 2026-08-17 ~07:28Z failed with
+  `unauthorized_client`, then one recovery, then twelve clean hours (32
+  messages synced since). One window is at most one WARN and one INFO from the
+  Chief, not dozens of mails; the flap hypothesis the round-1 data raised is
+  refuted, and hysteresis stays an option, not a need. What replaces it as the
+  open question: **a grant that Google refused for twelve hours and then
+  honoured again, with `users.updated_at` showing no operator write between**
+  (the 07:28 write IS the automatic recovery). `unauthorized_client` is
+  normally a Workspace-admin decision, not a transient — the window is worth
+  matching against the Workspace audit log for that mailbox, because if a
+  policy or token rotation did it, account 5's permanent version of the same
+  reason may share the cause, and reconnecting it without that answer may not
+  stick.
+
+  ── ROUND-2 RESULTS: the holes split, and a defect in my own block 2 ───────
+
+  **The holes are BOTH failure modes, and F-3.7c addressed both.** Block 4's
+  clustering: the two Aug-16-morning `fast_tick` holes (08:57→09:03 and
+  09:27→09:33) each pair with a `chief_spend_report` hole in the same minutes —
+  two ticks losing firings together is the process being down: **restarts**,
+  now named in the table by `process_start`. The publish-anchored hole
+  (14:51→14:57, commit 14:53:55Z) lost only `fast_tick`, consistent with a
+  short publish restart that was back up before the next */5. And the
+  2026-08-15 13:40→13:50 `chief_spend_report` hole stands ALONE — `fast_tick`
+  and `chief_spend_report` both fire at :45, `fast_tick`'s 13:45 row exists and
+  the spend tick's does not, so the process was demonstrably up: **that one is
+  a lost write** (or the old unrecorded `sweepRunning` skip this order also
+  removed), the retry-ladder case. The Aug-17 15:21→15:27 solo `fast_tick` hole
+  is the one genuinely ambiguous entry — a sub-minute restart straddling 15:24
+  but not 15:25 reads the same as a dropped insert; after this order publishes,
+  `process_start` disambiguates that class too.
+  **A false negative in my own round-2 block 2, found by its own results and
+  fixed in the file.** Block 2 reported `recovered: 0` for account 3 while
+  block 6's timeline shows the recovery plainly. Cause: `authFailure` is
+  written into `details.perUser[]` ONLY when true, so on every healthy pass
+  `->>'authFailure' = 'true'` is NULL rather than false, and both transition
+  filters (`prev IS FALSE`, `NOT auth_failed`) go unknown — the query answers
+  "no flaps" for an account flapping every pass, a false negative on the one
+  question it exists for. `COALESCE(…, false)` fixes it; proven on a fixture
+  carrying the REAL payload shape (key absent on success), where the broken
+  spelling counts 0/0 and the fix counts the true 2/2. The first fixture used
+  real booleans and so could not catch it — a fixture must carry the absent
+  keys of the payload it stands in for. `into_dead: 0` for account 3 was
+  honest either way: its transition into failure predates the 24h window.
+  **Account 5, final figures:** 96/96 failing, zero transitions (it has been
+  dead the whole window — `auth_dead_at` 2026-08-09 16:35Z), 253 queued, all
+  253 due now, oldest 2026-06-23.
 
   ── PUSHED, NOT PUBLISHED ─────────────────────────────────────────────────
 
