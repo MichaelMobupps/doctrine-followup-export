@@ -49,6 +49,7 @@ import { detectStructuralViolations, mergeViolationReports } from "../lib/struct
 import { buildWriterExemplarBlock } from "../lib/exemplarLibrary";
 import { buildWriterCompetitorBlock } from "../lib/competitorLibrary";
 import { stripClosingFromBody } from "../services/signatureStripper";
+import { shapeFollowupBody, selectLayoutProfile } from "../lib/layoutShaper";
 
 /**
  * Ship-normalization — the deterministic passes production applies to the body
@@ -64,11 +65,17 @@ import { stripClosingFromBody } from "../services/signatureStripper";
  * passes (smart quotes, ellipsis, AI-phrase swaps) are intentionally omitted:
  * they do not correspond to any deterministic doctrine/structural lint class.
  */
-function shipNormalize(body: string): string {
+function shipNormalize(body: string, ctx: FollowupContext): string {
   let r = body;
   r = r.replace(/\s*\u2014\s*/g, " - "); // em dash -> hyphen
   r = r.replace(/\s*\u2013\s*/g, " - "); // en dash -> hyphen
-  return stripClosingFromBody(r);
+  // 2026-08-26: production's humanizeFollowup now ends with the layout
+  // shaper. Without mirroring it here every shipped body would flag the
+  // LAYOUT lint classes this harness is supposed to prove are fixed.
+  return shapeFollowupBody(stripClosingFromBody(r), {
+    profile: selectLayoutProfile(ctx),
+    languageTag: ctx.original_language,
+  });
 }
 
 const ALL_LANGS: string[] = [
@@ -174,7 +181,7 @@ async function runCellHeal(lang: string, vertical: string, stage: number): Promi
     // Production ships humanizeFollowup(draft), not the raw draft. Lint the
     // humanized body for the true ship verdict so we don't over-report classes
     // the humanizer fixes (dashes, closing/sign-off lines).
-    const shipBody = shipNormalize(draft.body);
+    const shipBody = shipNormalize(draft.body, ctx);
     const shipReport = lintFull(shipBody, ctx);
     const shipClean = !shipReport.found;
 

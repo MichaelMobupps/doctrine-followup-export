@@ -20,12 +20,67 @@ function hasIssue(report: { issues: string[] }, code: string): boolean {
 // clean control
 // ---------------------------------------------------------------------------
 test("clean english follow-up passes", () => {
+  // 2026-08-26: the control gained blank lines. Rule E treats "greeting glued
+  // to the body by a single newline, then one unbroken block" as a violation,
+  // so the old fixture — which was exactly that shape — is no longer clean.
+  const body =
+    "Hi John,\n\n" +
+    "Following up on my note about the Brazil campaign. We delivered 250 installs last month.\n\n" +
+    "The D7 retention held steady. Worth a quick call next week?";
+  const r = detectStructuralViolations(body, { languageTag: "en" });
+  assert.equal(r.found, false);
+});
+
+// ---------------------------------------------------------------------------
+// E. layout
+// ---------------------------------------------------------------------------
+test("greeting run into the first sentence flags LAYOUT-GREETING-RUNON", () => {
+  const body =
+    "Hi there, following up on my previous note about the Gulf campaign.\n\n" +
+    "We are scaling to 125 subscriptions per day.\n\n" +
+    "Open to a quick look?";
+  const r = detectStructuralViolations(body, { languageTag: "en" });
+  assert.equal(r.found, true);
+  assert.ok(hasIssue(r, "LAYOUT-GREETING-RUNON"));
+});
+
+test("a body delivered as one block flags LAYOUT-SINGLE-BLOCK", () => {
   const body =
     "Hi John,\n" +
     "Following up on my note about the Brazil campaign. We delivered 250 installs last month. " +
     "The D7 retention held steady. Worth a quick call next week?";
   const r = detectStructuralViolations(body, { languageTag: "en" });
+  assert.equal(r.found, true);
+  assert.ok(hasIssue(r, "LAYOUT-SINGLE-BLOCK"));
+});
+
+test("a two-sentence body is too short to count as a wall", () => {
+  const body = "Hi John,\n\nFollowing up on my note. Worth a quick call?";
+  const r = detectStructuralViolations(body, { languageTag: "en" });
   assert.equal(r.found, false);
+});
+
+test("layout single-block rule is skipped for thai", () => {
+  const body =
+    "\u0e2a\u0e27\u0e31\u0e2a\u0e14\u0e35\n\u0e15\u0e34\u0e14\u0e15\u0e32\u0e21\u0e2d\u0e35\u0e40\u0e21\u0e25\u0e01\u0e48\u0e2d\u0e19\u0e2b\u0e19\u0e49\u0e32\u0e40\u0e01\u0e35\u0e48\u0e22\u0e27\u0e01\u0e31\u0e1a\u0e41\u0e04\u0e21\u0e40\u0e1b\u0e0d";
+  const r = detectStructuralViolations(body, { languageTag: "th" });
+  assert.ok(!hasIssue(r, "LAYOUT-SINGLE-BLOCK"));
+});
+
+test("STRUCTURAL_CHECK_LAYOUT=0 disables only the layout rule", () => {
+  const prev = process.env.STRUCTURAL_CHECK_LAYOUT;
+  process.env.STRUCTURAL_CHECK_LAYOUT = "0";
+  try {
+    const body =
+      "Hi there, following up on my note. We delivered 250 installs. " +
+      "The D7 retention held. Worth a call?";
+    const r = detectStructuralViolations(body, { languageTag: "en" });
+    assert.ok(!hasIssue(r, "LAYOUT-SINGLE-BLOCK"));
+    assert.ok(!hasIssue(r, "LAYOUT-GREETING-RUNON"));
+  } finally {
+    if (prev === undefined) delete process.env.STRUCTURAL_CHECK_LAYOUT;
+    else process.env.STRUCTURAL_CHECK_LAYOUT = prev;
+  }
 });
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,6 @@
 import { buildNativenessBlock, buildCriticNativenessBlock } from "../lib/languageNativeness";
 import { wrapUntrusted } from "../lib/promptInjection";
+import { selectLayoutProfile, buildLayoutDirective } from "../lib/layoutShaper";
 
 export interface PreviousFollowup {
   stage: number;
@@ -56,6 +57,7 @@ CRITICAL RULES:
 - Reference the original email's value proposition naturally, do NOT repeat it verbatim.
 - Do NOT re-introduce yourself or the company from scratch. The prospect already knows who you are from the original email.
 - Do NOT use "just checking in" or "touching base" or "circling back" — these are spam signals.
+- OPENER VARIATION (hard rule, severity: block, 2026-08-26 Robotic.jpeg incident): when PREVIOUS FOLLOW-UPS are provided below, your opening clause MUST NOT reuse theirs. Three follow-ups that all begin "Following up on my previous note regarding [same topic]" read as a machine running a template, and the recipient sees the repetition before anything else. Vary BOTH the verb phrase and what you name. Rotate across the full range the language offers — in English: "Wanted to come back to you on ___" / "One more thought on ___" / "I mentioned ___ last week" / "Still think ___ is worth a look" / "Picking up the thread on ___" / "Quick addition to what I sent about ___", and their natural equivalents in the target language. Also vary WHAT you reference: the topic, the specific number you quoted, the competitor you named, the question you asked. Read the previous follow-ups below and deliberately open differently. The follow-up acknowledgment rule above is unchanged — you still reference the prior outreach, you just do not phrase it the way you did last time.
 - Each follow-up stage has a different angle. Rotate through these strategies:
   - Stage 1: Add a new insight, data point, or relevant industry development. Quick and valuable.
   - Stage 2: Shift angle - reference a competitor move, a market trend, or a case study result. Acknowledge this is a second follow-up naturally.
@@ -226,6 +228,11 @@ ${wrapUntrusted("ORIGINAL_EMAIL", rawBody).block}`
   // use the same per-language knowledge base as cold emails.
   const nativenessBlock = buildNativenessBlock(ctx.original_language);
 
+  // Layer 1 of the layout fix. The shape is chosen per thread-and-stage so
+  // consecutive follow-ups in one thread never share it; layoutShaper.ts
+  // normalises the result deterministically if the model ignores this.
+  const layoutBlock = buildLayoutDirective(selectLayoutProfile(ctx));
+
   return `Write a Stage ${ctx.stage} follow-up email for this prospect:
 
 LANGUAGE: ${langDisplay} (you MUST write the entire email — subject and body — in ${langDisplay})
@@ -239,6 +246,8 @@ ${topicBlock}
 
 ${bodyBlock}
 ${previousContext}${nativenessBlock ? `\n${nativenessBlock}\n` : ""}
+${layoutBlock}
+
 Write the follow-up now. Pull one concrete detail from the original email and make it the spine of your follow-up.`;
 }
 
@@ -265,6 +274,10 @@ EVALUATION CRITERIA (score each 1-5):
 
 5. CONCISENESS: Is it 4-6 sentences maximum? No padding, no filler, no unnecessary repetition?
 
+5a. LAYOUT (severity: block, 2026-08-26 Robotic.jpeg incident): score the SHAPE of the text, independently of its content. Two failures are blocking. (a) GREETING RUN-ON: the greeting shares a line with the first sentence ("Hi there, following up on my previous note..."). A human puts the greeting on its own line and leaves a blank line under it. (b) SINGLE BLOCK: the whole body is one unbroken paragraph. A follow-up of 4+ sentences with no blank line anywhere is the single most recognisable machine-written shape there is, and it is judged before a word is read. The email must carry at least two blocks separated by a blank line, and it must match the LAYOUT block supplied with the draft below when one is present. If either failure is present, score 'layout' 1 and set needs_rewrite = true. Do NOT ask for bullet points or numbered lines to fix this — the deliverability ban on lists is unchanged; blocks are prose separated by blank lines.
+
+5b. OPENER REPETITION (severity: block, applies only when PREVIOUS FOLLOW-UPS are shown below): does this draft open with the same clause as an earlier stage in the thread? Three messages that all begin "Following up on my previous note regarding [same topic]" are a template running, and the recipient sees it immediately. Compare the opening clause against every previous follow-up. If the verb phrase AND the thing referenced are both substantially the same as an earlier stage, score 'layout' 1-2 and set needs_rewrite = true, quoting both openers in "issues".
+
 6. RELEVANCE: Does it relate back to the original email's topic without repeating the original pitch verbatim?
 
 7. DIFFERENTIATION: Does it bring a genuinely new angle vs the original email and any previous follow-ups?
@@ -288,14 +301,14 @@ EVALUATION CRITERIA (score each 1-5):
 OUTPUT FORMAT:
 Return ONLY a JSON object:
 {
-  "scores": { "no_meta_language": 1-5, "followup_ack": 1-5, "language_match": 1-5, "language_naturalness": 1-5, "conciseness": 1-5, "relevance": 1-5, "differentiation": 1-5, "tone": 1-5, "doctrine_compliance": 1-5, "closing_strip": 1-5, "deliverability": 1-5 },
+  "scores": { "no_meta_language": 1-5, "followup_ack": 1-5, "language_match": 1-5, "language_naturalness": 1-5, "conciseness": 1-5, "layout": 1-5, "relevance": 1-5, "differentiation": 1-5, "tone": 1-5, "doctrine_compliance": 1-5, "closing_strip": 1-5, "deliverability": 1-5 },
   "overall": 1-5,
   "issues": ["list of specific problems with quoted phrases from the email"],
   "suggestions": ["list of specific concrete rewrites"],
   "needs_rewrite": true/false
 }
 
-Set needs_rewrite to true if overall < 4 OR no_meta_language < 4 OR followup_ack < 4 OR language_match < 4 OR language_naturalness < 4 OR doctrine_compliance < 4 OR closing_strip < 4 OR deliverability < 4. If deliverability is 1 or 2, needs_rewrite MUST be true — a spam-folder delivery damages the sender's domain reputation for every future email they send. If doctrine_compliance is 1 or 2, needs_rewrite MUST be true. If no_meta_language is 1 or 2, needs_rewrite MUST be true — meta-language is the most serious failure mode. If followup_ack is 1 or 2, needs_rewrite MUST be true. If language_match is 1 or 2, needs_rewrite MUST be true. If language_naturalness is 1 or 2, needs_rewrite MUST be true — a non-English email with English jargon leaking in is as bad as a language mismatch. If closing_strip is 1 or 2 (a closing line or signature line is present), needs_rewrite MUST be true — the recipient would see a duplicated sign-off because the email client appends its own signature.
+Set needs_rewrite to true if overall < 4 OR no_meta_language < 4 OR followup_ack < 4 OR language_match < 4 OR language_naturalness < 4 OR doctrine_compliance < 4 OR closing_strip < 4 OR deliverability < 4 OR layout < 4. If deliverability is 1 or 2, needs_rewrite MUST be true — a spam-folder delivery damages the sender's domain reputation for every future email they send. If doctrine_compliance is 1 or 2, needs_rewrite MUST be true. If no_meta_language is 1 or 2, needs_rewrite MUST be true — meta-language is the most serious failure mode. If followup_ack is 1 or 2, needs_rewrite MUST be true. If language_match is 1 or 2, needs_rewrite MUST be true. If language_naturalness is 1 or 2, needs_rewrite MUST be true — a non-English email with English jargon leaking in is as bad as a language mismatch. If closing_strip is 1 or 2 (a closing line or signature line is present), needs_rewrite MUST be true — the recipient would see a duplicated sign-off because the email client appends its own signature. If layout is 1 or 2, needs_rewrite MUST be true — a greeting run into the first sentence, or a body delivered as one unbroken block, is read as machine-written before the content is judged.
 Do not include any other text, markdown, or explanation.`;
 }
 
@@ -317,6 +330,10 @@ export function getCriticUserPrompt(
 
   const nativenessBlock = buildCriticNativenessBlock(ctx.original_language);
 
+  // The shape criterion 5a measures against. Same profile the writer was
+  // given, so the critic is checking compliance rather than taste.
+  const layoutBlock = `EXPECTED ${buildLayoutDirective(selectLayoutProfile(ctx))}`;
+
   // CSD v1.1: in shared mode the critic must treat the neutral greeting as
   // REQUIRED and flag any personal name as blocking, inverting the usual
   // criterion-13a pressure to name the recipient.
@@ -330,6 +347,8 @@ ORIGINAL EMAIL LANGUAGE: ${ctx.original_language} (the follow-up MUST be written
 ORIGINAL EMAIL SUBJECT: ${ctx.original_subject}
 ORIGINAL EMAIL CONTEXT (what was pitched — the follow-up should NOT repeat this): ${ctx.original_body_summary}${bodyBlock}
 ${nativenessBlock ? `\n${nativenessBlock}\n` : ""}${sharedBlock}${previousContext}
+${layoutBlock}
+
 DRAFT TO EVALUATE:
 Subject: ${draft.subject}
 Body: ${draft.body}
@@ -355,6 +374,7 @@ RULES:
 - Maintain the original email's intent and value proposition connection.
 - Keep tone professional but conversational.
 - No spam signals, no exclamation marks, max one question mark.
+- LAYOUT (2026-08-26 incident, severity: block): the rewrite must satisfy the LAYOUT block supplied below. Keep the greeting alone on the first line with a blank line under it, and keep the body in more than one block separated by blank lines. Fixing a wording issue is never a reason to collapse the email back into a single paragraph, and joining blocks to "tighten" it is a regression, not an improvement. Blocks are prose — the ban on bullets, numbered lines and dash-prefixed lines is unchanged.
 - DELIVERABILITY (2026-07-23 incident, severity: block): while fixing the critic's issues, NEVER introduce — and always remove — (a) contact-count phrasing ("reached out N times", "my third email", "final attempt", any language); reference prior outreach naturally without counting; (b) list formatting (bullets, numbered lines, comma chains of 4+ items) — rewrite as prose with at most 2-3 named examples in context; (c) spam-trigger vocabulary not present in the original email ("Bitcoin(s)", "crypto", "free money", "guaranteed", "risk-free", "act now", "limited time", "last chance", "click here", "buy now", "exclusive deal", "congratulations", and equivalents) — words the original email itself uses (brands like "Mercado Bitcoin", the prospect's own vocabulary) may stay; (d) ALL-CAPS words beyond curated acronyms and repeated punctuation; (e) extra URLs or shortened URLs; (f) subject-line trigger words, emoji, exclamation, or ALL-CAPS — keep the subject a plain "Re:" variant. Preserve the follow-up acknowledgment while doing this; deliverability fixes must never delete the reference to prior outreach.
 - DOCTRINE (v3 rewriter universal X-NOT-Y): cut hedge-on-number ("around 250" → "250"), hype adjectives ("strong", "powerful", "significant", "innovative", "best-in-class", "industry-leading", and target-language equivalents), and multi-event optimization claims (anchor on EXACTLY ONE event). Eliminate the X-NOT-Y comma-negation pattern in EVERY language including English — "performance partners, not raw installs" is forbidden; rewrite as "performance partners rather than raw installs" or rephrase to drop the contrast. Target-language equivalents to remove: ", no" (es/pt), ", nicht" (de), ", не" (ru), ", ไม่ใช่" (th), ", không phải" (vi), ", 不是" (zh), ", ではなく" (ja), etc. For non-English target languages (Reading-A++), no multi-word English phrases and no single non-acronym English content words inside the prose — only curated acronyms and proper nouns may remain in Latin script.
 - CLOSING / SIGN-OFF (B8a, hard rule, severity: block): The email body MUST end with the final business sentence. If the draft contains any closing line — "Best regards", "Best", "Kind regards", "Regards", "Sincerely", "Thanks", "Thank you", "Cheers", "Talk soon", "Looking forward", or any target-language equivalent ("Saludos" / "Atentamente" / "Cordialmente" (es), "Atenciosamente" / "Cumprimentos" / "Abraços" (pt), "Cordialement" / "Salutations" (fr), "Mit freundlichen Grüßen" / "Viele Grüße" / "MFG" / "LG" (de), "Cordiali saluti" / "Saluti" (it), "Met vriendelijke groet" / "Groeten" (nl), "С уважением" / "Спасибо" (ru), "З повагою" (uk), "敬具" / "よろしくお願いいたします" (ja), "此致" / "敬礼" / "祝好" (zh), "감사합니다" / "안녕히 계세요" (ko), "مع تحياتي" / "تحياتي" / "بإحترام" (ar), "בברכה" / "בכבוד רב" / "תודה" (he), "सादर" / "धन्यवाद" (hi), "ขอแสดงความนับถือ" / "ขอบคุณครับ" (th), "Trân trọng" / "Kính chào" (vi), "Saygılarımla" (tr), "Pozdrawiam" (pl)) — STRIP it. If the draft contains a trailing line with only the sender's name, STRIP it. Do not produce any closing or signature line in the rewrite. The recipient's email client appends the sender's signature automatically.
@@ -388,6 +408,12 @@ export function getRewriterUserPrompt(
 
   const nativenessBlock = buildNativenessBlock(ctx.original_language);
 
+  // The rewriter flattened multi-block drafts back into one paragraph
+  // before this block existed: it optimised for the critic's wording
+  // issues and treated whitespace as noise. The shape is restated here as
+  // a rule it must satisfy, not preserve by luck.
+  const layoutBlock = buildLayoutDirective(selectLayoutProfile(ctx));
+
   // CSD v1.1: in shared mode the rewriter must keep the neutral greeting
   // and strip any personal name, even when a critic issue or the original
   // email mentions one.
@@ -404,6 +430,8 @@ ${nativenessBlock ? `\n${nativenessBlock}\n` : ""}${sharedBlock}${previousContex
 CURRENT DRAFT:
 Subject: ${draft.subject}
 Body: ${draft.body}
+
+${layoutBlock}
 
 CRITIC ISSUES:
 ${critique.issues.map((i) => `- ${i}`).join("\n")}

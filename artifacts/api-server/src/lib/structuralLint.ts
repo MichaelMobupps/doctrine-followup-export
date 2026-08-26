@@ -22,11 +22,19 @@
  *      reference prior outreach in the opening. Flags the absence of any
  *      acknowledgment marker. Applied only for languages with a marker table,
  *      to keep false positives bounded; skipped for untabled languages.
+ *   E. LAYOUT-SINGLE-BLOCK. A greeting run into the first sentence, or a
+ *      multi-sentence body with no blank line anywhere, is the shape every
+ *      follow-up shipped in before 2026-08-26 and the fastest way to be read
+ *      as machine-written. layoutShaper.ts normalises the shape on the way
+ *      out regardless; this rule exists so the rewrite loop gets a chance to
+ *      produce the blocks itself, which reads better than a body cut up
+ *      after the fact.
  *
  * Returns a ViolationReport in the exact shape doctrineLint uses, so callers
  * can merge it into the existing deterministic gate with no shape changes.
  */
 import type { ViolationReport } from "./doctrineLint";
+import { splitGreetingLine } from "./layoutShaper";
 
 const EMPTY: ViolationReport = { found: false, issues: [], suggestions: [], matches: [] };
 
@@ -370,6 +378,49 @@ export function detectStructuralViolations(body: string, opts: StructuralOpts): 
         ],
         matches: ["no acknowledgment marker in opening"],
       });
+    }
+  }
+
+  // E. layout: greeting run-on, or the whole body as one block.
+  if (envFlag("STRUCTURAL_CHECK_LAYOUT", true)) {
+    const normalised = body.replace(/\r\n/g, "\n").replace(/\\n/g, "\n").trim();
+    const firstLine = normalised.split("\n")[0] || "";
+
+    if (splitGreetingLine(firstLine, opts.languageTag)) {
+      reports.push({
+        found: true,
+        issues: [
+          `LAYOUT-GREETING-RUNON - the greeting shares a line with the first sentence: ` +
+          `"${firstLine.slice(0, 70)}". A person puts the greeting on its own line.`,
+        ],
+        suggestions: [
+          "Put the greeting alone on the first line and leave a completely blank line " +
+          "under it before the first sentence.",
+        ],
+        matches: [firstLine.slice(0, 70)],
+      });
+    }
+
+    // The block check needs a sentence count, so it is skipped for the same
+    // scripts rule A skips.
+    if (!NON_DELIMITED_SENTENCE_LANGS.has(lang) && !/\n\s*\n/.test(normalised)) {
+      const n = countSentences(normalised);
+      if (n >= 3) {
+        reports.push({
+          found: true,
+          issues: [
+            `LAYOUT-SINGLE-BLOCK - the body is ${n} sentences delivered as one ` +
+            `unbroken block with no blank line anywhere. This is the shape a ` +
+            `recipient reads as machine-written before judging a single word.`,
+          ],
+          suggestions: [
+            "Break the body into at least two blocks separated by a blank line, " +
+            "following the LAYOUT block supplied with the draft. Use prose blocks, " +
+            "never bullets or numbered lines.",
+          ],
+          matches: [`${n} sentences, 0 blank lines`],
+        });
+      }
     }
   }
 

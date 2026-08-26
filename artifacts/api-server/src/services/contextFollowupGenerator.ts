@@ -44,6 +44,10 @@ import { detectSpamRiskViolations } from "../lib/spamRiskLint";
 // return path of generateContextFollowup so the body is always free of
 // a sign-off before the email client appends the user signature.
 import { stripClosingFromBody } from "./signatureStripper";
+// 2026-08-26 layout fix. Shared with the doctrine and anti-ghosting
+// pipelines so a context follow-up is shaped by the same rules — the
+// recipient cannot tell which pipeline wrote it and neither should the shape.
+import { shapeFollowupBody, selectLayoutProfile } from "../lib/layoutShaper";
 import { checkOutputIntegrity, UNTRUSTED_DATA_SYSTEM_CLAUSE } from "../lib/promptInjection";
 
 export interface GeneratedContextFollowup {
@@ -212,7 +216,13 @@ export async function generateContextFollowup(
   // runs on every exit path (initial draft, post-critique no-rewrite,
   // post-critique rewritten, rewriter-failure fallback).
   const finalize = (draft: GeneratedContextFollowup): GeneratedContextFollowup => {
-    const out = { subject: draft.subject, body: stripClosingFromBody(draft.body) };
+    const out = {
+      subject: draft.subject,
+      body: shapeFollowupBody(stripClosingFromBody(draft.body), {
+        profile: selectLayoutProfile(ctx),
+        languageTag: ctx.original_language,
+      }),
+    };
     const _egress = checkOutputIntegrity(`${out.subject}\n${out.body}`);
     if (_egress.compromised) throw new Error(`Output integrity check failed: ${_egress.reasons.join("; ")}`);
     return out;

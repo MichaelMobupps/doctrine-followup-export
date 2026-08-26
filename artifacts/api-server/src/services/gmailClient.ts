@@ -3,6 +3,12 @@ import { logger } from "../lib/logger";
 import { classifyBounce, type BounceKind } from "../lib/bounceDetection";
 import { isOutOfOffice, type AutoReplyHeaders } from "../lib/replyClassification";
 import { newGoogleOAuthClient, newGmailClient } from "../lib/googleApi";
+import {
+  extractFontFromHtml,
+  fontStyleAttr,
+  buildBodyHtml,
+  type InheritedFont,
+} from "../lib/emailTypography";
 
 export interface GmailMessageMeta {
   id: string;
@@ -385,24 +391,6 @@ function mimeEncodeHeader(value: string): string {
   return `=?UTF-8?B?${encoded}?=`;
 }
 
-async function getRfc822MessageId(gmail: gmail_v1.Gmail, messageId: string): Promise<string | null> {
-  try {
-    const msg = await gmail.users.messages.get({
-      userId: "me",
-      id: messageId,
-      format: "metadata",
-      metadataHeaders: ["Message-ID", "Message-Id"],
-    });
-    const headers = msg.data.payload?.headers || [];
-    const messageIdHeader = headers.find(
-      (h) => h.name?.toLowerCase() === "message-id"
-    );
-    return messageIdHeader?.value || null;
-  } catch {
-    return null;
-  }
-}
-
 async function getGmailSignatureHtml(gmail: gmail_v1.Gmail, senderEmail: string): Promise<string> {
   try {
     const res = await gmail.users.settings.sendAs.get({
@@ -415,14 +403,57 @@ async function getGmailSignatureHtml(gmail: gmail_v1.Gmail, senderEmail: string)
   }
 }
 
-function plainTextToHtml(text: string): string {
-  let result = text;
-  result = result.replace(/\\n/g, "\n");
-  result = result.replace(/&/g, "&amp;");
-  result = result.replace(/</g, "&lt;");
-  result = result.replace(/>/g, "&gt;");
-  result = result.replace(/\n/g, "<br>");
-  return result;
+/**
+ * The two things the reply needs from the message it is answering: its
+ * RFC822 Message-ID (for threading) and the font it was composed in.
+ *
+ * Both come from one `format: "full"` fetch. They used to be two calls —
+ * a metadata fetch for the id, and the font read added alongside it — and
+ * one message cannot need two round trips to describe itself.
+ *
+ * The font is {} when the message declares none, when it has no HTML
+ * part, or when the fetch fails. All three mean "declare no font either",
+ * which renders the follow-up in the recipient's own client default
+ * exactly as a hand-typed Gmail message does. The previous behaviour was
+ * a hardcoded "Calibri Light", Calibri, sans-serif at 11pt on every
+ * follow-up in every thread, which could and did render in a different
+ * face from the email directly above it.
+ */
+async function readOriginalMessage(
+  gmail: gmail_v1.Gmail,
+  messageId: string,
+): Promise<{ rfc822Id: string | null; font: InheritedFont }> {
+  try {
+    const msg = await gmail.users.messages.get({
+      userId: "me",
+      id: messageId,
+      format: "full",
+    });
+    const headers = msg.data.payload?.headers || [];
+    const rfc822Id =
+      headers.find((h) => h.name?.toLowerCase() === "message-id")?.value || null;
+    const html = findHtmlPart(msg.data.payload);
+    return { rfc822Id, font: html ? extractFontFromHtml(html) : {} };
+  } catch (err) {
+    logger.warn(
+      { err: String(err), messageId },
+      "Could not read the original message; threading falls back to the Gmail id and the follow-up sends in the recipient's default font",
+    );
+    return { rfc822Id: null, font: {} };
+  }
+}
+
+/** Depth-first search for a message's text/html body part. */
+function findHtmlPart(payload?: gmail_v1.Schema$MessagePart): string | null {
+  if (!payload) return null;
+  if (payload.mimeType === "text/html" && payload.body?.data) {
+    return decodeGmailPart(payload.body.data);
+  }
+  for (const part of payload.parts || []) {
+    const found = findHtmlPart(part);
+    if (found) return found;
+  }
+  return null;
 }
 
 function encodeRawMessage(rawMessage: string): string {
@@ -444,16 +475,21 @@ async function buildFollowupReplyRawMessage(params: {
   gmail: gmail_v1.Gmail;
   doctrineFollowupId?: number;
 }): Promise<string> {
-  const rfc822Id = await getRfc822MessageId(params.gmail, params.originalMessageId);
-  const inReplyTo = rfc822Id || `<${params.originalMessageId}>`;
-  const references = rfc822Id || `<${params.originalMessageId}>`;
-
-  const signatureHtml = await getGmailSignatureHtml(params.gmail, params.senderEmail);
-  const bodyHtml = plainTextToHtml(params.body);
-  const fontStyle = 'font-family: "Calibri Light", Calibri, sans-serif; font-size: 11pt;';
+  const [signatureHtml, original] = await Promise.all([
+    getGmailSignatureHtml(params.gmail, params.senderEmail),
+    readOriginalMessage(params.gmail, params.originalMessageId),
+  ]);
+  const inReplyTo = original.rfc822Id || `<${params.originalMessageId}>`;
+  const references = original.rfc822Id || `<${params.originalMessageId}>`;
+  const inheritedFont = original.font;
+  const bodyHtml = buildBodyHtml(params.body);
+  // Empty when the original declared no font: we then declare none either
+  // and the message renders in the recipient's client default.
+  const fontStyle = fontStyleAttr(inheritedFont);
+  const styleAttr = fontStyle ? ` style="${fontStyle}"` : "";
   const fullHtml = signatureHtml
-    ? `<div dir="ltr" style="${fontStyle}">${bodyHtml}<br><br><div class="gmail_signature">${signatureHtml}</div></div>`
-    : `<div dir="ltr" style="${fontStyle}">${bodyHtml}</div>`;
+    ? `<div dir="ltr"${styleAttr}>${bodyHtml}<div><br></div><div class="gmail_signature">${signatureHtml}</div></div>`
+    : `<div dir="ltr"${styleAttr}>${bodyHtml}</div>`;
 
   const replySubject = params.subject.startsWith("Re:")
     ? params.subject

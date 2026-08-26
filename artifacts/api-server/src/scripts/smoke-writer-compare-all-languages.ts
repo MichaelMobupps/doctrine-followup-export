@@ -53,6 +53,7 @@ import { detectStructuralViolations, mergeViolationReports } from "../lib/struct
 import { buildWriterExemplarBlock } from "../lib/exemplarLibrary";
 import { buildWriterCompetitorBlock } from "../lib/competitorLibrary";
 import { stripClosingFromBody } from "../services/signatureStripper";
+import { shapeFollowupBody, selectLayoutProfile } from "../lib/layoutShaper";
 import { geminiGenerateJson, isGeminiConfigured } from "../lib/gemini";
 import { getPrimaryGeminiModel } from "../services/writerProvider";
 import { computeCostUsd } from "../lib/pricing";
@@ -102,11 +103,15 @@ function buildCtx(lang: string, vertical: string, stage: number): FollowupContex
 // (humanizeText dash-normalization + stripClosingFromBody). Lint the SHIPPED
 // shape, not the raw draft, so neither writer is dinged for classes the humanizer
 // already fixes. Mirrors smoke-writer-heal-all-languages.shipNormalize.
-function shipNormalize(body: string): string {
+function shipNormalize(body: string, ctx: FollowupContext): string {
   let r = body;
   r = r.replace(/\s*—\s*/g, " - "); // em dash -> hyphen
   r = r.replace(/\s*–\s*/g, " - "); // en dash -> hyphen
-  return stripClosingFromBody(r);
+  // 2026-08-26: mirrors the layout shaper production applies on ship.
+  return shapeFollowupBody(stripClosingFromBody(r), {
+    profile: selectLayoutProfile(ctx),
+    languageTag: ctx.original_language,
+  });
 }
 
 // The exact production lint gate (mirrors smoke-writer / all-languages lintBody).
@@ -212,7 +217,7 @@ async function runCell(lang: string, vertical: string, stage: number, dryRun: bo
   async function one(gen: () => Promise<Draft>) {
     try {
       const d = await gen();
-      const lint = lintBody(shipNormalize(d.body), ctx);
+      const lint = lintBody(shipNormalize(d.body, ctx), ctx);
       return { verdict: (lint.pass ? "PASS" : "FAIL") as Verdict, issues: lint.issues, subject: d.subject, body: d.body, costUsd: d.costUsd };
     } catch (err) {
       return { verdict: "ERROR" as Verdict, issues: [err instanceof Error ? err.message : String(err)], subject: "", body: "", costUsd: 0 };
