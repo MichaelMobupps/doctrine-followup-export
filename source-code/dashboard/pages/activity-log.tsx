@@ -7,6 +7,7 @@ import {
   ChevronDown, ChevronUp, Mail, Zap, AlertCircle,
   CheckCircle2, Loader2, Target, BarChart3,
 } from "lucide-react";
+import { BASE_PATH } from "@/lib/app-urls";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -304,7 +305,7 @@ export default function ActivityLog() {
     else setRefreshing(true);
     setError(null);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/campaign/status`, {
         headers: { "x-api-key": apiKey },
       });

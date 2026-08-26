@@ -25,10 +25,24 @@
  * text. It carries each exemplar's register_notes, which state exactly why the
  * exemplar is compliant.
  *
+ * LAYOUT (2026-08-26). The stored exemplar bodies teach the wrong SHAPE: of
+ * the 1272 in followupExemplarsData.ts, 1209 are a greeting plus one
+ * undifferentiated block, 54 have no line break at all, and 9 contain a blank
+ * line. That is the single strongest reason the writer kept producing walls of
+ * text — a prompt rule asking for paragraph breaks was arguing with 1209
+ * counter-examples. The bodies are therefore re-shaped HERE, at render time,
+ * rather than in the data file, whose header states it is generated from
+ * Followupper_exemplars_widened.jsonl and must not be hand-edited. Each
+ * exemplar in a block gets a DIFFERENT layout profile, so the few-shot set
+ * demonstrates the variation the LAYOUT directive asks for instead of one
+ * repeated shape. Only whitespace changes; the wording, register and doctrine
+ * content of every exemplar are untouched.
+ *
  * Disabled with WRITER_EXEMPLARS=off. Count tunable with WRITER_EXEMPLAR_COUNT
  * (default 2, clamped 1..4).
  */
 import { FOLLOWUP_EXEMPLARS, type FollowupExemplar } from "./followupExemplarsData";
+import { shapeFollowupBody, LAYOUT_PROFILES } from "./layoutShaper";
 
 export interface ExemplarContext {
   vertical?: string | null;
@@ -207,10 +221,20 @@ function renderOne(ex: FollowupExemplar, index: number): string {
     ex.illustrative_flags && ex.illustrative_flags.length > 0
       ? `\nIllustrative figures (these are examples only, do not copy them): ${ex.illustrative_flags.join("; ")}`
       : "";
+  // Give each exemplar in the block a different shape, so the few-shot set
+  // teaches variation rather than one repeated layout. index is 1-based.
+  const profile = LAYOUT_PROFILES[(index - 1) % LAYOUT_PROFILES.length];
+  const body = shapeFollowupBody(ex.body, { profile, languageTag: ex.language });
+  // The body is multi-line now, so it gets its own delimited section instead
+  // of sitting inline after a "Body:" label where the line breaks would be
+  // ambiguous against the surrounding prompt structure.
   return [
     `EXEMPLAR ${index} (language=${ex.language}, vertical=${ex.vertical}, offer=${ex.offer_type}, stage=${ex.stage}, angle: ${ex.angle})`,
     `Subject: ${ex.subject}`,
-    `Body: ${ex.body}`,
+    `Body:`,
+    `<<<`,
+    body,
+    `>>>`,
     `Why it works: ${ex.register_notes}${flags}`,
   ].join("\n");
 }
@@ -237,6 +261,10 @@ export function buildWriterExemplarBlock(ctx: ExemplarContext): string {
         "translate or reuse their wording. Reproduce the pattern: open with a",
         "reference to the prior outreach, restate exactly one proof point, optionally",
         "add one fresh sourced angle, close with one soft question, no sign-off.",
+        "Reproduce their SHAPE as well: greeting alone on the first line, a blank line",
+        "under it, and the body broken into blocks rather than delivered as one",
+        "paragraph. Follow the LAYOUT block given for THIS email for the exact",
+        "block pattern.",
       ].join(" ")
     : [
         "STUDY THESE GOLD-STANDARD FOLLOW-UPS, THEN WRITE YOUR OWN.",
@@ -246,6 +274,10 @@ export function buildWriterExemplarBlock(ctx: ExemplarContext): string {
         "optionally add one fresh sourced angle, close with one soft question, and use",
         "no sign-off. Write a new email for the prospect below, do not copy or",
         "paraphrase any exemplar sentence.",
+        "Note their SHAPE too: greeting alone on the first line, a blank line under it,",
+        "and the body broken into blocks. Each exemplar is broken up differently on",
+        "purpose — do not copy one exemplar's block pattern, follow the LAYOUT block",
+        "given for THIS email.",
       ].join(" ");
 
   const rendered = exemplars.map((e, i) => renderOne(e, i + 1)).join("\n\n");

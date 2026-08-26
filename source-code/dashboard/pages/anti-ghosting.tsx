@@ -30,6 +30,7 @@ import {
   CheckCircle2,
   Inbox,
 } from "lucide-react";
+import { apiUrl } from "@/lib/app-urls";
 
 // Inline SVG logo (full wordmark). Kept inline rather than imported as an
 // asset URL so the component has no dependency on the host's Vite asset
@@ -179,7 +180,7 @@ export default function AntiGhosting() {
     enabled: Boolean(apiKey && user?.email),
     queryFn: async () => {
       const res = await fetch(
-        `/api/anti-ghosting/candidates?email=${encodeURIComponent(user!.email)}`,
+        apiUrl(`/api/anti-ghosting/candidates?email=${encodeURIComponent(user!.email)}`),
         { headers: { "x-api-key": apiKey! } },
       );
       if (!res.ok) {
@@ -192,7 +193,7 @@ export default function AntiGhosting() {
 
   const markMutation = useMutation<MarkResponse, Error, { gmailThreadId: string }>({
     mutationFn: async (input) => {
-      const res = await fetch("/api/anti-ghosting/mark", {
+      const res = await fetch(apiUrl("/api/anti-ghosting/mark"), {
         method: "POST",
         headers: { "x-api-key": apiKey!, "content-type": "application/json" },
         body: JSON.stringify({ email: user!.email, gmailThreadId: input.gmailThreadId }),

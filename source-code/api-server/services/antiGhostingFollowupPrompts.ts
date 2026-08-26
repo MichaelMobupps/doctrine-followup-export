@@ -36,6 +36,7 @@
 // ──────────────────────────────────────────────────────────────────────
 
 import { wrapUntrusted } from "../lib/promptInjection";
+import { selectLayoutProfile, buildLayoutDirective } from "../lib/layoutShaper";
 
 export type DaysSinceSeedTier = "lt_30d" | "30d_to_6mo" | "gt_6mo";
 
@@ -323,6 +324,15 @@ CYCLE CONTEXT:
 ${cycleAwareness(ctx.cycle)}
 
 INSTRUCTIONS:
+${buildLayoutDirective(
+    selectLayoutProfile({
+      company: ctx.company,
+      prospect_name: ctx.prospect_name,
+      original_subject: ctx.seed_subject,
+      stage: ctx.stage,
+    }),
+  )}
+
 Write the AntiGhosting follow-up. ACKNOWLEDGE the last inbound specifically, BRIDGE with a concrete reason, ASK one clear next step. Apply every hard constraint. Output JSON only.`;
 }
 

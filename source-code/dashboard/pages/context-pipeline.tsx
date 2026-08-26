@@ -21,6 +21,7 @@ import {
   CheckSquare, MinusSquare,
 } from "lucide-react";
 import { ProspectKillControl } from "@/components/prospect-kill-control";
+import { BASE_PATH } from "@/lib/app-urls";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -528,7 +529,7 @@ export default function ContextPipeline() {
 
     async function fetchFollowups() {
       try {
-        const base = import.meta.env.BASE_URL || "/";
+        const base = BASE_PATH;
         const qs = new URLSearchParams();
         if (effectiveUserId) qs.set("userId", String(effectiveUserId));
         if (showArchived) qs.set("includeArchived", "1");
@@ -565,7 +566,7 @@ export default function ContextPipeline() {
   // contract `{ followup_ids: [...] }` — handled by /api/context/cancel-followup.
   async function cancelStageById(stageId: number) {
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/context/cancel-followup`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-api-key": apiKey || "" },
@@ -590,7 +591,7 @@ export default function ContextPipeline() {
     if (!confirm(`Send next-stage follow-up now for ${ids.length} prospect${ids.length !== 1 ? "s" : ""}? This bypasses the schedule.`)) return;
     setBulkSending(true);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/context/followup/send-bulk`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "", "Content-Type": "application/json" },
@@ -622,7 +623,7 @@ export default function ContextPipeline() {
     if (!confirm(`Pause campaigns for ${ids.length} prospect${ids.length !== 1 ? "s" : ""}? Queued follow-ups for these prospects will be cancelled.`)) return;
     setBulkPausing(true);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/context/prospect/pause-bulk`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "", "Content-Type": "application/json" },
@@ -679,7 +680,7 @@ export default function ContextPipeline() {
     if (!confirm("Restore this campaign? It returns to the pipeline in its current paused state. Use Resume afterward to reactivate sending.")) return;
     setRestoringId(prospectId);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/context/prospect/${prospectId}/restore`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "" },
@@ -701,7 +702,7 @@ export default function ContextPipeline() {
   const handleTogglePause = async (prospectId: number, currentlyPaused: boolean) => {
     setTogglingPauseId(prospectId);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const endpoint = currentlyPaused ? "resume" : "pause";
       const res = await fetch(`${base}api/context/prospect/${prospectId}/${endpoint}`, {
         method: "POST",
@@ -727,7 +728,7 @@ export default function ContextPipeline() {
   const handleAddStage = async (prospectId: number) => {
     setAddingStageId(prospectId);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/context/followup-now/${prospectId}`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "", "Content-Type": "application/json" },
@@ -747,7 +748,7 @@ export default function ContextPipeline() {
   const handleResumeStalled = async (prospectId: number) => {
     setResumingStalledId(prospectId);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       // The /api/prospect/:id/resume endpoint internally requeues the stalled
       // draft via requeueStalledDraftForProspect when one is present.
       const res = await fetch(`${base}api/context/prospect/${prospectId}/resume`, {
@@ -772,7 +773,7 @@ export default function ContextPipeline() {
   const handleApprove = async (id: number) => {
     setApprovingId(id);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/context/followups/${id}/approve`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "", "Content-Type": "application/json" },
@@ -789,7 +790,7 @@ export default function ContextPipeline() {
     if (!confirm("Reject this follow-up? It will be cancelled.")) return;
     setRejectingId(id);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/context/followups/${id}/reject`, {
         method: "POST",
         headers: { "x-api-key": apiKey || "", "Content-Type": "application/json" },

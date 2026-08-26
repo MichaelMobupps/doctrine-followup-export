@@ -25,7 +25,19 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 
-const SIDEBAR_COOKIE_NAME = "sidebar_state"
+// Bundle 2: the only cookie in this codebase (auth uses localStorage, and
+// there are no server sessions). This component is currently unused scaffold,
+// so the change has no runtime effect today — but under the gateway two tools
+// share one origin, and a `path=/` cookie named `sidebar_state` would be sent
+// to, and clobbered by, its sibling app. Scope and name it per-app, but ONLY
+// when BASE_PATH is set: with no env var the name and path are byte-for-byte
+// what they were before.
+const SIDEBAR_BASE_PATH = import.meta.env.BASE_URL || "/"
+const SIDEBAR_COOKIE_NAME =
+  SIDEBAR_BASE_PATH === "/"
+    ? "sidebar_state"
+    : `sidebar_state_${SIDEBAR_BASE_PATH.replace(/^\/+|\/+$/g, "").replace(/\W+/g, "_")}`
+const SIDEBAR_COOKIE_PATH = SIDEBAR_BASE_PATH
 const SIDEBAR_COOKIE_MAX_AGE = 60 * 60 * 24 * 7
 const SIDEBAR_WIDTH = "16rem"
 const SIDEBAR_WIDTH_MOBILE = "18rem"
@@ -83,7 +95,7 @@ function SidebarProvider({
       }
 
       // This sets the cookie to keep the sidebar state.
-      document.cookie = `${SIDEBAR_COOKIE_NAME}=${openState}; path=/; max-age=${SIDEBAR_COOKIE_MAX_AGE}`
+      document.cookie = `${SIDEBAR_COOKIE_NAME}=${openState}; path=${SIDEBAR_COOKIE_PATH}; max-age=${SIDEBAR_COOKIE_MAX_AGE}`
     },
     [setOpenProp, open]
   )

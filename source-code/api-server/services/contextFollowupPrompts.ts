@@ -13,6 +13,7 @@
 
 import type { FollowupContext, PreviousFollowup } from "./followupPrompts";
 import { wrapUntrusted } from "../lib/promptInjection";
+import { selectLayoutProfile, buildLayoutDirective } from "../lib/layoutShaper";
 
 /**
  * GENERATOR system prompt.
@@ -177,6 +178,8 @@ ${wrapUntrusted("PRIOR_EMAIL", bodyForContext).block}
 
 PREVIOUS FOLLOW-UPS in this thread:
 ${previousFollowupsText}
+
+${buildLayoutDirective(selectLayoutProfile(ctx))}
 
 INSTRUCTIONS:
 This is the ${stageLabel} follow-up. Apply every hard constraint. Reference the prior content faithfully. Output JSON only.`;

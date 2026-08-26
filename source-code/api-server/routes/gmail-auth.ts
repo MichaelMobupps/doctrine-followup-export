@@ -1,5 +1,4 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
-import { google } from "googleapis";
 import crypto from "crypto";
 import {
   db,
@@ -12,6 +11,13 @@ import {
 import { eq, lt, and, gt, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { HARD_FOLLOWUP_CAP } from "../lib/followupLimits";
+// Bundle 1: appPath (not redirectPath) — these callback redirects are
+// same-origin RELATIVE today and stay relative, unlike the login callback
+// in auth.ts which prefixes the configured public origin.
+import { publicUrl, appPath } from "../lib/appUrls";
+// F-3.6a: the connection-health vocabulary. Pure; see lib/connectionHealth.ts.
+import { connectionState, authDeadMessage } from "../lib/connectionHealth";
+import { newGoogleOAuthClient, newOAuth2InfoClient } from "../lib/googleApi";
 
 const router = Router();
 
@@ -31,19 +37,12 @@ async function cleanExpiredNonces() {
 }
 
 function getRedirectUri(): string {
-  if (process.env.APP_URL) {
-    return process.env.APP_URL.replace(/\/$/, '') + '/api/gmail/callback';
-  }
-  const domain = process.env.REPLIT_DEV_DOMAIN || process.env.REPLIT_DOMAINS?.split(",")[0] || "localhost";
-  return `https://${domain}/api/gmail/callback`;
+  return publicUrl("/api/gmail/callback");
 }
 
 function getOAuth2Client() {
-  return new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-    getRedirectUri(),
-  );
+  // F-3.7b: bounded token-refresh transporter — see lib/googleApi.ts.
+  return newGoogleOAuthClient(getRedirectUri());
 }
 
 function authMiddleware(req: Request, res: Response, next: NextFunction): void {
@@ -82,6 +81,12 @@ const ACCOUNT_SELECT = {
   // Activity page. Surfacing it here lets the dashboard warn the
   // operator on their own pages.
   pausedByAdmin: usersTable.pausedByAdmin,
+  // F-3.6a: the auth-dead state. Six accounts reported CONNECTED here on
+  // 2026-08-09 while Google refused every one of their grants; this is the
+  // column that stops that lie, and the two derived fields below are what
+  // the Accounts page actually renders.
+  authDeadAt: usersTable.authDeadAt,
+  authDeadReason: usersTable.authDeadReason,
 } as const;
 
 router.get("/gmail/auth", authMiddleware, async (req: Request, res: Response) => {
@@ -121,12 +126,12 @@ router.get("/gmail/callback", async (req: Request, res: Response) => {
 
     if (oauthError) {
       logger.warn({ oauthError }, "OAuth flow denied by user");
-      res.redirect("/?oauth_error=denied");
+      res.redirect(appPath("/?oauth_error=denied"));
       return;
     }
 
     if (!code || !state) {
-      res.redirect("/?oauth_error=missing_params");
+      res.redirect(appPath("/?oauth_error=missing_params"));
       return;
     }
 
@@ -139,7 +144,7 @@ router.get("/gmail/callback", async (req: Request, res: Response) => {
       .returning();
     if (!nonceData) {
       logger.warn("Invalid or expired OAuth nonce");
-      res.redirect("/?oauth_error=invalid_state");
+      res.redirect(appPath("/?oauth_error=invalid_state"));
       return;
     }
     cleanExpiredNonces().catch(() => {});
@@ -149,13 +154,14 @@ router.get("/gmail/callback", async (req: Request, res: Response) => {
 
     if (!tokens.refresh_token) {
       logger.error("No refresh token received from Google");
-      res.redirect("/accounts?oauth_error=no_refresh_token");
+      res.redirect(appPath("/accounts?oauth_error=no_refresh_token"));
       return;
     }
 
     oauth2Client.setCredentials(tokens);
 
-    const oauth2 = google.oauth2({ version: "v2", auth: oauth2Client });
+    // F-3.7b: bounded like every other Google call — see lib/googleApi.ts.
+    const oauth2 = newOAuth2InfoClient(oauth2Client);
     const userInfo = await oauth2.userinfo.get();
     // Normalize email at write time. Google occasionally returns
     // mixed-case emails depending on the tenant, and downstream lookups
@@ -166,7 +172,7 @@ router.get("/gmail/callback", async (req: Request, res: Response) => {
     const name = userInfo.data.name || email.split("@")[0];
 
     if (!email) {
-      res.redirect("/accounts?oauth_error=no_email");
+      res.redirect(appPath("/accounts?oauth_error=no_email"));
       return;
     }
 
@@ -178,10 +184,19 @@ router.get("/gmail/callback", async (req: Request, res: Response) => {
           googleRefreshToken: tokens.refresh_token,
           isConnected: true,
           name: name || existing[0].name,
+          // F-3.6a: a successful reconnect clears the auth-dead state
+          // immediately. Waiting for the next sync tick to notice would
+          // leave the operator staring at "dead since …" for up to 15
+          // minutes after doing exactly what the message asked them to do.
+          authDeadAt: null,
+          authDeadReason: null,
           updatedAt: new Date(),
         })
         .where(sql`LOWER(${usersTable.email}) = ${email}`);
-      logger.info({ email }, "Reconnected Gmail account via OAuth");
+      logger.info(
+        { email, clearedAuthDead: Boolean(existing[0].authDeadAt) },
+        "Reconnected Gmail account via OAuth",
+      );
     } else {
       await db.insert(usersTable).values({
         email,
@@ -193,17 +208,26 @@ router.get("/gmail/callback", async (req: Request, res: Response) => {
       logger.info({ email }, "Connected new Gmail account via OAuth");
     }
 
-    res.redirect("/accounts?oauth_success=true&email=" + encodeURIComponent(email));
+    res.redirect(appPath("/accounts?oauth_success=true&email=" + encodeURIComponent(email)));
   } catch (err) {
     logger.error({ err }, "OAuth callback failed");
-    res.redirect("/accounts?oauth_error=callback_failed");
+    res.redirect(appPath("/accounts?oauth_error=callback_failed"));
   }
 });
 
 router.get("/gmail/accounts", authMiddleware, async (_req: Request, res: Response) => {
   try {
     const users = await db.select(ACCOUNT_SELECT).from(usersTable).orderBy(usersTable.createdAt);
-    res.json({ accounts: users });
+    // F-3.6a: derive the state and the sentence server-side so the dashboard,
+    // the add-on and any future client all say the same thing. `isConnected`
+    // is left exactly as it was for backward compatibility — an old add-on
+    // build keeps working — and the new truth rides alongside it.
+    const accounts = users.map((u) => ({
+      ...u,
+      connectionState: connectionState(u),
+      authDeadMessage: authDeadMessage(u.authDeadAt),
+    }));
+    res.json({ accounts });
   } catch (err) {
     logger.error({ err }, "Failed to list accounts");
     res.status(500).json({ error: "Failed to list accounts" });
@@ -222,6 +246,12 @@ router.delete("/gmail/accounts/:id", authMiddleware, async (req: Request, res: R
       .set({
         googleRefreshToken: null,
         isConnected: false,
+        // F-3.6a: an explicit disconnect clears auth-dead too. There is no
+        // grant left to be dead, and connectionState() gives disconnect
+        // precedence anyway — leaving the columns set would only put stale
+        // "dead since …" data behind a state that no longer reads it.
+        authDeadAt: null,
+        authDeadReason: null,
         updatedAt: new Date(),
       })
       .where(eq(usersTable.id, userId));

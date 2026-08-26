@@ -1,7 +1,14 @@
-import { google, gmail_v1 } from "googleapis";
+import { gmail_v1 } from "googleapis";
 import { logger } from "../lib/logger";
 import { classifyBounce, type BounceKind } from "../lib/bounceDetection";
 import { isOutOfOffice, type AutoReplyHeaders } from "../lib/replyClassification";
+import { newGoogleOAuthClient, newGmailClient } from "../lib/googleApi";
+import {
+  extractFontFromHtml,
+  fontStyleAttr,
+  buildBodyHtml,
+  type InheritedFont,
+} from "../lib/emailTypography";
 
 export interface GmailMessageMeta {
   id: string;
@@ -27,23 +34,32 @@ export interface GmailCredentials {
 }
 
 function getAuth() {
-  return new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-  );
+  // F-3.7b: constructed through lib/googleApi so the OAuth token refresh —
+  // made on the auth library's own transporter, which service options never
+  // reach — is bounded too. An unbounded refresh hangs the row before the
+  // API call is even attempted.
+  return newGoogleOAuthClient();
 }
 
 export function getGmailForUser(creds: GmailCredentials): gmail_v1.Gmail {
   const auth = getAuth();
   auth.setCredentials({ refresh_token: creds.refreshToken });
-  return google.gmail({ version: "v1", auth });
+  return newGmailClient(auth);
 }
 
-function getGmail(): gmail_v1.Gmail {
-  const auth = getAuth();
-  auth.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
-  return google.gmail({ version: "v1", auth });
-}
+// ─── F-3.6b: `getGmail()` is deleted. ───────────────────────────────────
+//
+// It authorised with `process.env.GOOGLE_REFRESH_TOKEN` and every function
+// below took `gmail?` so it could fall back to it. That made a shared mailbox
+// the identity of last resort for the whole file: a caller that failed to
+// resolve an owner did not fail, it silently sent, read or deleted as
+// somebody else.
+//
+// The Gmail client is now a REQUIRED argument on every function here, so the
+// compiler — not a code review — is what guarantees each call carries the
+// account it belongs to. `getAuth()` above stays: the OAuth client id and
+// secret are the app's own credentials and are used for the real per-user
+// grant exchange.
 
 export async function ensureLabelsExist(
   labelNames: string[],
@@ -118,8 +134,10 @@ export interface FetchLabeledResult {
 
 export async function fetchLabeledSentEmails(
   labels: string[],
-  afterDate?: string,
-  gmail?: gmail_v1.Gmail,
+  // Undefined means "no date bound"; it stays explicit rather than optional
+  // because the Gmail client after it is required (F-3.6b).
+  afterDate: string | undefined,
+  gmail: gmail_v1.Gmail,
   // IDs the caller has already ingested. Passing this skips the expensive
   // per-message format:"full" fetch for every already-known message. Before
   // this existed, every 15-minute sync re-downloaded the full body of EVERY
@@ -127,8 +145,6 @@ export async function fetchLabeledSentEmails(
   // Gmail calls per tick, which is what stretched sync passes to hours.
   skipIds?: ReadonlySet<string>,
 ): Promise<FetchLabeledResult> {
-  if (!gmail) gmail = getGmail();
-
   const labelQuery = labels.map((l) => `label:${l.replace(/\s+/g, "-")}`).join(" OR ");
   let q = `in:sent (${labelQuery})`;
   if (afterDate) {
@@ -221,9 +237,8 @@ async function fetchMessageDetail(
 export async function checkThreadForReplies(
   threadId: string,
   senderEmail: string,
-  gmail?: gmail_v1.Gmail,
+  gmail: gmail_v1.Gmail,
 ): Promise<boolean> {
-  if (!gmail) gmail = getGmail();
   const res = await gmail.users.threads.get({
     userId: "me",
     id: threadId,
@@ -286,9 +301,8 @@ export interface ThreadInboundVerdict {
 export async function classifyThreadInbound(
   threadId: string,
   senderEmail: string,
-  gmail?: gmail_v1.Gmail,
+  gmail: gmail_v1.Gmail,
 ): Promise<ThreadInboundVerdict> {
-  if (!gmail) gmail = getGmail();
   const res = await gmail.users.threads.get({
     userId: "me",
     id: threadId,
@@ -377,24 +391,6 @@ function mimeEncodeHeader(value: string): string {
   return `=?UTF-8?B?${encoded}?=`;
 }
 
-async function getRfc822MessageId(gmail: gmail_v1.Gmail, messageId: string): Promise<string | null> {
-  try {
-    const msg = await gmail.users.messages.get({
-      userId: "me",
-      id: messageId,
-      format: "metadata",
-      metadataHeaders: ["Message-ID", "Message-Id"],
-    });
-    const headers = msg.data.payload?.headers || [];
-    const messageIdHeader = headers.find(
-      (h) => h.name?.toLowerCase() === "message-id"
-    );
-    return messageIdHeader?.value || null;
-  } catch {
-    return null;
-  }
-}
-
 async function getGmailSignatureHtml(gmail: gmail_v1.Gmail, senderEmail: string): Promise<string> {
   try {
     const res = await gmail.users.settings.sendAs.get({
@@ -407,14 +403,57 @@ async function getGmailSignatureHtml(gmail: gmail_v1.Gmail, senderEmail: string)
   }
 }
 
-function plainTextToHtml(text: string): string {
-  let result = text;
-  result = result.replace(/\\n/g, "\n");
-  result = result.replace(/&/g, "&amp;");
-  result = result.replace(/</g, "&lt;");
-  result = result.replace(/>/g, "&gt;");
-  result = result.replace(/\n/g, "<br>");
-  return result;
+/**
+ * The two things the reply needs from the message it is answering: its
+ * RFC822 Message-ID (for threading) and the font it was composed in.
+ *
+ * Both come from one `format: "full"` fetch. They used to be two calls —
+ * a metadata fetch for the id, and the font read added alongside it — and
+ * one message cannot need two round trips to describe itself.
+ *
+ * The font is {} when the message declares none, when it has no HTML
+ * part, or when the fetch fails. All three mean "declare no font either",
+ * which renders the follow-up in the recipient's own client default
+ * exactly as a hand-typed Gmail message does. The previous behaviour was
+ * a hardcoded "Calibri Light", Calibri, sans-serif at 11pt on every
+ * follow-up in every thread, which could and did render in a different
+ * face from the email directly above it.
+ */
+async function readOriginalMessage(
+  gmail: gmail_v1.Gmail,
+  messageId: string,
+): Promise<{ rfc822Id: string | null; font: InheritedFont }> {
+  try {
+    const msg = await gmail.users.messages.get({
+      userId: "me",
+      id: messageId,
+      format: "full",
+    });
+    const headers = msg.data.payload?.headers || [];
+    const rfc822Id =
+      headers.find((h) => h.name?.toLowerCase() === "message-id")?.value || null;
+    const html = findHtmlPart(msg.data.payload);
+    return { rfc822Id, font: html ? extractFontFromHtml(html) : {} };
+  } catch (err) {
+    logger.warn(
+      { err: String(err), messageId },
+      "Could not read the original message; threading falls back to the Gmail id and the follow-up sends in the recipient's default font",
+    );
+    return { rfc822Id: null, font: {} };
+  }
+}
+
+/** Depth-first search for a message's text/html body part. */
+function findHtmlPart(payload?: gmail_v1.Schema$MessagePart): string | null {
+  if (!payload) return null;
+  if (payload.mimeType === "text/html" && payload.body?.data) {
+    return decodeGmailPart(payload.body.data);
+  }
+  for (const part of payload.parts || []) {
+    const found = findHtmlPart(part);
+    if (found) return found;
+  }
+  return null;
 }
 
 function encodeRawMessage(rawMessage: string): string {
@@ -436,16 +475,21 @@ async function buildFollowupReplyRawMessage(params: {
   gmail: gmail_v1.Gmail;
   doctrineFollowupId?: number;
 }): Promise<string> {
-  const rfc822Id = await getRfc822MessageId(params.gmail, params.originalMessageId);
-  const inReplyTo = rfc822Id || `<${params.originalMessageId}>`;
-  const references = rfc822Id || `<${params.originalMessageId}>`;
-
-  const signatureHtml = await getGmailSignatureHtml(params.gmail, params.senderEmail);
-  const bodyHtml = plainTextToHtml(params.body);
-  const fontStyle = 'font-family: "Calibri Light", Calibri, sans-serif; font-size: 11pt;';
+  const [signatureHtml, original] = await Promise.all([
+    getGmailSignatureHtml(params.gmail, params.senderEmail),
+    readOriginalMessage(params.gmail, params.originalMessageId),
+  ]);
+  const inReplyTo = original.rfc822Id || `<${params.originalMessageId}>`;
+  const references = original.rfc822Id || `<${params.originalMessageId}>`;
+  const inheritedFont = original.font;
+  const bodyHtml = buildBodyHtml(params.body);
+  // Empty when the original declared no font: we then declare none either
+  // and the message renders in the recipient's client default.
+  const fontStyle = fontStyleAttr(inheritedFont);
+  const styleAttr = fontStyle ? ` style="${fontStyle}"` : "";
   const fullHtml = signatureHtml
-    ? `<div dir="ltr" style="${fontStyle}">${bodyHtml}<br><br><div class="gmail_signature">${signatureHtml}</div></div>`
-    : `<div dir="ltr" style="${fontStyle}">${bodyHtml}</div>`;
+    ? `<div dir="ltr"${styleAttr}>${bodyHtml}<div><br></div><div class="gmail_signature">${signatureHtml}</div></div>`
+    : `<div dir="ltr"${styleAttr}>${bodyHtml}</div>`;
 
   const replySubject = params.subject.startsWith("Re:")
     ? params.subject
@@ -484,9 +528,12 @@ export async function sendFollowupReply(params: {
   body: string;
   senderName: string;
   senderEmail: string;
-  gmail?: gmail_v1.Gmail;
+  // F-3.6b: REQUIRED. A send with no per-user client used to fall back to the
+  // shared `GOOGLE_REFRESH_TOKEN` mailbox, which is how an ownerless prospect
+  // was delivered under an identity unrelated to its campaign.
+  gmail: gmail_v1.Gmail;
 }): Promise<string> {
-  const gmail = params.gmail || getGmail();
+  const gmail = params.gmail;
   const raw = await buildFollowupReplyRawMessage({ ...params, gmail });
 
   const res = await gmail.users.messages.send({
@@ -509,9 +556,10 @@ export async function createFollowupDraft(params: {
   body: string;
   senderName: string;
   senderEmail: string;
-  gmail?: gmail_v1.Gmail;
+  // F-3.6b: REQUIRED — a draft lands in a real mailbox, so it needs a real owner.
+  gmail: gmail_v1.Gmail;
 }): Promise<{ draftId: string; messageId: string }> {
-  const gmail = params.gmail || getGmail();
+  const gmail = params.gmail;
   const raw = await buildFollowupReplyRawMessage({
     ...params,
     gmail,
@@ -536,10 +584,13 @@ export async function createFollowupDraft(params: {
 
 export async function deleteDraft(params: {
   draftId: string | null | undefined;
-  gmail?: gmail_v1.Gmail;
+  // F-3.6b: REQUIRED. Deleting is a mailbox mutation; the fallback made it
+  // possible to delete out of the shared mailbox on behalf of a row whose
+  // owner could not be resolved.
+  gmail: gmail_v1.Gmail;
 }): Promise<boolean> {
   if (!params.draftId) return false;
-  const gmail = params.gmail || getGmail();
+  const gmail = params.gmail;
 
   try {
     await gmail.users.drafts.delete({ userId: "me", id: params.draftId });
@@ -691,9 +742,9 @@ export async function detectManualFollowupSend(params: {
   after: Date;
   followupId: number;
   generatedBody?: string | null;
-  gmail?: gmail_v1.Gmail;
+  gmail: gmail_v1.Gmail;
 }): Promise<ManualFollowupSendDetection> {
-  const gmail = params.gmail || getGmail();
+  const gmail = params.gmail;
   const res = await gmail.users.threads.get({
     userId: "me",
     id: params.threadId,

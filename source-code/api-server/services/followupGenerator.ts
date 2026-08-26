@@ -1,5 +1,8 @@
 import { anthropic, MODEL_DRAFT_GENERATOR, MODEL_CRITIC, MODEL_REWRITER, withOpusReasoning, cachedSystem, assertCriticModelAllowed } from "../lib/anthropic";
 import { withAnthropicRetry } from "./anthropicRetry";
+// F-3.7b: a spent row budget is terminal for the row and must outrank every
+// fail-open path below it.
+import { GenerationDeadlineError } from "../lib/generationDeadline";
 // B7r: usage tracker import. recordUsageBestEffort is no-op when called
 // outside a runWithUsageContext scope, so safe to call from any path.
 import { recordUsageBestEffort } from "../lib/usageTracker";
@@ -26,6 +29,12 @@ import { dropFalseFollowupAck } from "../lib/followupAckConfirm";
 // safety net for the new prompt-level no-closing rule. Runs as the last
 // transformation in humanizeText so it cleans every doctrine return path.
 import { stripClosingFromBody } from "./signatureStripper";
+// 2026-08-26 layout fix: the deterministic shaper and the greeting-name
+// recovery. The shaper is the guarantee behind the LAYOUT prompt rules —
+// whatever the writer returns, the shipped body has its greeting on its own
+// line and more than one block.
+import { shapeFollowupBody, selectLayoutProfile } from "../lib/layoutShaper";
+import { extractGreetingName, hasUsableProspectName } from "../lib/greetingName";
 import { checkOutputIntegrity, UNTRUSTED_DATA_SYSTEM_CLAUSE } from "../lib/promptInjection";
 import { runCritic } from "./criticProvider";
 // Writer fallback chain (Gemini Flash -> Gemini Pro -> Sonnet) and its two
@@ -139,16 +148,27 @@ function humanizeText(text: string): string {
   return result;
 }
 
-function humanizeFollowup(followup: GeneratedFollowup): GeneratedFollowup {
+function humanizeFollowup(
+  followup: GeneratedFollowup,
+  ctx: FollowupContext,
+): GeneratedFollowup {
   // B8a: strip the closing/signature lines from the body AFTER the
   // humanize passes. Order matters — humanizeText normalises em
   // dashes and quotes first, then the closing stripper operates on
   // the canonicalised line shape. The subject never carries a
   // closing, so it is humanized only.
+  //
+  // 2026-08-26: the layout shaper runs LAST, after the closing stripper.
+  // Stripping a trailing "Best regards,\nSunil" can leave a dangling blank
+  // line, and the shaper's blank-line normalisation cleans that up in the
+  // same pass that gives the body its blocks.
   const humanizedBody = humanizeText(followup.body);
   const result = {
     subject: humanizeText(followup.subject),
-    body: stripClosingFromBody(humanizedBody),
+    body: shapeFollowupBody(stripClosingFromBody(humanizedBody), {
+      profile: selectLayoutProfile(ctx),
+      languageTag: ctx.original_language,
+    }),
   };
   const _egress = checkOutputIntegrity(`${result.subject}\n${result.body}`);
   if (_egress.compromised) {
@@ -488,6 +508,26 @@ export async function generateFollowupEmail(
     };
   }
 
+  // 2026-08-26 (Robotic.jpeg): the HALA thread opened "Hi Ibrahim, Sunil from
+  // MobUpps here." and every follow-up then addressed him as "Hi there,".
+  // The name was in the original email; the prospects row simply had an empty
+  // prospect_name, and the writer prompt correctly refuses to invent one.
+  // Recover it here, once, so the writer, critic and rewriter all see the
+  // same name. Never for a shared company draft: there the name in the
+  // original belongs to one of several recipients and using it would
+  // misaddress the rest — the same reason CSD v1.1 blocks the critic from
+  // mining it.
+  if (!ctx.shared_company_draft && !hasUsableProspectName(ctx.prospect_name)) {
+    const recovered = extractGreetingName(ctx.original_body, ctx.original_language);
+    if (recovered) {
+      logger.info(
+        { company: ctx.company, stage: ctx.stage, recovered },
+        "Recovered the recipient's name from the original email's greeting",
+      );
+      ctx = { ...ctx, prospect_name: recovered };
+    }
+  }
+
   // Writer-chain inputs, computed once and reused for the draft and every
   // rewrite. grey forces the Sonnet writer for regulated verticals; the study
   // block (in-region competitors followed by gold-standard exemplars) lifts
@@ -574,11 +614,17 @@ export async function generateFollowupEmail(
       try {
         critique = await runCritic(ctx, current, () => critiqueDraft(ctx, current));
       } catch (err) {
+        // F-3.7b: the critic is deliberately fail-open — a critic outage should
+        // ship the best draft rather than fail the row. A spent generation
+        // budget is NOT an outage: the pass has already abandoned this row, and
+        // "returning the best draft seen" would ship an un-critiqued email on
+        // the strength of a deadline. Let it through.
+        if (err instanceof GenerationDeadlineError) throw err;
         logger.warn(
           { err: String(err), prospect: ctx.prospect_name, iteration },
           "Critic unavailable after retries — returning best draft seen",
         );
-        return humanizeFollowup(best);
+        return humanizeFollowup(best, ctx);
       }
     }
 
@@ -640,7 +686,7 @@ export async function generateFollowupEmail(
 
     if (!critique.needs_rewrite) {
       logger.info({ prospect: ctx.prospect_name, iteration }, "Draft passed all checks");
-      return humanizeFollowup(current);
+      return humanizeFollowup(current, ctx);
     }
 
     logger.info(
@@ -656,7 +702,7 @@ export async function generateFollowupEmail(
         { err: String(err), prospect: ctx.prospect_name, iteration },
         "Rewriter unavailable after retries — returning best draft seen",
       );
-      return humanizeFollowup(best);
+      return humanizeFollowup(best, ctx);
     }
   }
 
@@ -667,5 +713,5 @@ export async function generateFollowupEmail(
     { prospect: ctx.prospect_name, bestOverall, iterations: maxHealingIterations },
     "Healing iterations exhausted — returning best draft seen",
   );
-  return humanizeFollowup(best);
+  return humanizeFollowup(best, ctx);
 }

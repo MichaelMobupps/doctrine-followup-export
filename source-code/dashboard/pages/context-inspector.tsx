@@ -16,6 +16,7 @@ import {
   MessageSquare, Building2, Sparkles, Database, Loader2, Zap,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { BASE_PATH } from "@/lib/app-urls";
 
 type SentEmail = {
   id: string;
@@ -110,7 +111,7 @@ function ThreadView({ threadId, apiKey }: { threadId: string; apiKey: string }) 
     if (!threadId) { setIsLoading(false); return; }
     let cancelled = false;
     setIsLoading(true);
-    const base = import.meta.env.BASE_URL || "/";
+    const base = BASE_PATH;
     fetch(`${base}api/gmail/thread/${threadId}`, {
       headers: { "x-api-key": apiKey || "" },
     })
@@ -440,7 +441,7 @@ export default function ContextEmailInspector() {
   useEffect(() => {
     if (!apiKey) return;
     let cancelled = false;
-    const base = import.meta.env.BASE_URL || "/";
+    const base = BASE_PATH;
     fetch(`${base}api/gmail/accounts`, {
       headers: { "x-api-key": apiKey || "" },
     })
@@ -476,7 +477,7 @@ export default function ContextEmailInspector() {
     if (search) params.set("search", search);
     if (selectedUserId) params.set("userId", selectedUserId);
 
-    const base = import.meta.env.BASE_URL || "/";
+    const base = BASE_PATH;
     fetch(`${base}api/context/gmail/sent-emails?${params.toString()}`, {
       headers: { "x-api-key": apiKey || "" },
     })
@@ -504,7 +505,7 @@ export default function ContextEmailInspector() {
     setSyncing(true);
     setSyncMsg(null);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/context/sync`, {
         method: "POST",
         headers: {

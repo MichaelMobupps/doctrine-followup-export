@@ -1,10 +1,11 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
-import { google, gmail_v1 } from "googleapis";
+import { gmail_v1 } from "googleapis";
 import { db, prospectsTable, usersTable } from "@workspace/db";
 import { eq, inArray } from "drizzle-orm";
 import { getGmailForUser, isOutboundMessage } from "../services/gmailClient";
 import { inferVertical } from "../lib/verticalClassifier";
 import { logger } from "../lib/logger";
+import { newGoogleOAuthClient, newGmailClient } from "../lib/googleApi";
 
 const router = Router();
 
@@ -19,12 +20,11 @@ function authMiddleware(req: Request, res: Response, next: NextFunction): void {
 router.use(authMiddleware);
 
 function getLegacyGmail(): gmail_v1.Gmail {
-  const auth = new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-  );
+  // F-3.7b: constructed through lib/googleApi so both the API requests and
+  // the token refresh carry GOOGLE_API_TIMEOUT_MS.
+  const auth = newGoogleOAuthClient();
   auth.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
-  return google.gmail({ version: "v1", auth });
+  return newGmailClient(auth);
 }
 
 async function getGmailForRequest(req: Request): Promise<{ gmail: gmail_v1.Gmail; senderEmail: string }> {

@@ -286,6 +286,106 @@ const STATEMENTS: string[] = [
   // after the first run no rows match.
   // ──────────────────────────────────────────────────────────────────
   `UPDATE users SET max_followups = 3 WHERE max_followups > 3 OR max_followups < 1`,
+
+  // ──────────────────────────────────────────────────────────────────
+  // F-3.6a: truth and flow.
+  //
+  // Six statements, every one additive and either nullable or defaulted, so
+  // a code rollback needs no schema rollback — the previous build simply
+  // stops reading columns it never knew about. Same property B7u's
+  // paused_by_admin has had since it shipped.
+  // ──────────────────────────────────────────────────────────────────
+
+  // users.auth_dead_at / auth_dead_reason — the auth-dead state, distinct
+  // from is_connected. NULL = healthy. See schema/users.ts for why this is
+  // not a disconnect.
+  `ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_dead_at TIMESTAMPTZ`,
+  `ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_dead_reason TEXT`,
+  // Read on every due-query pass. Deliberately a PLAIN index, byte-for-byte
+  // matching the declaration in lib/db/src/schema/users.ts. A partial index
+  // here (WHERE auth_dead_at IS NOT NULL) would be marginally tidier and
+  // would also make drizzle-kit diff it as undeclared and churn a
+  // DROP/CREATE on every Republish — the exact trap cron-heartbeats.ts
+  // records having been caught by. On a fifteen-row table the difference is
+  // nil; the churn is not.
+  `CREATE INDEX IF NOT EXISTS idx_users_auth_dead ON users(auth_dead_at)`,
+
+  // followups.retry_count / failure_reason / error_history — bounded retry
+  // policy replacing the 15-minute amnesia revive. Existing rows start at
+  // retry_count 0, which is correct: none of them has been retried under a
+  // policy, and the two July DB-error rows of user 8 stay exactly where they
+  // are (their owner is admin-paused, so no auto-queue pass reaches them).
+  `ALTER TABLE followups ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE followups ADD COLUMN IF NOT EXISTS failure_reason TEXT`,
+  `ALTER TABLE followups ADD COLUMN IF NOT EXISTS error_history JSONB`,
+
+  // ──────────────────────────────────────────────────────────────────
+  // F-3.6b: cron_heartbeats moves into the startup migration.
+  //
+  // Every other table the server depends on is created here; this one was
+  // created by `drizzle-kit push` alone because it predates this file. It
+  // exists in dev and production, so nothing has ever noticed — but a
+  // database brought up by boot alone would not have it and
+  // GET /api/admin/cron-heartbeats, the F-3.6a liveness surface, would 500
+  // on the one occasion an operator most needs it.
+  //
+  // F-3.6a declined to add it, on the grounds that a second definition of a
+  // table `push` already owns is how index churn starts. That risk is real
+  // and it is answered by matching the LIVE shape exactly rather than by
+  // staying out: the statements below were written from a read-only
+  // information_schema / pg_indexes dump of BOTH databases on 2026-08-10, so
+  // a fresh database lands on a byte-identical table and there is nothing for
+  // a diff to churn. Note `fired_at DESC` — the real index carries it and the
+  // drizzle declaration in lib/db/src/schema/cron-heartbeats.ts does not.
+  // The declaration is deliberately left alone: it describes what both
+  // databases already have closely enough that the publish diff is empty
+  // today, and rewriting it to chase the sort direction would risk exactly
+  // the churn this comment is about. Recorded in TODO Open items instead.
+  //
+  // IF NOT EXISTS on both, so on dev and production this is a no-op.
+  // ──────────────────────────────────────────────────────────────────
+  `CREATE TABLE IF NOT EXISTS cron_heartbeats (
+    id SERIAL PRIMARY KEY,
+    tick_name TEXT NOT NULL,
+    fired_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    outcome TEXT NOT NULL,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    details JSONB
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_cron_heartbeats_tick_fired_at
+     ON cron_heartbeats(tick_name, fired_at DESC)`,
+
+  // ──────────────────────────────────────────────────────────────────
+  // F-3.7a: the Chief spend cursor.
+  //
+  // One row per (UTC day, vendor) recording the running total this app has
+  // had ACCEPTED by the Chief, in whole cents. See
+  // lib/db/src/schema/chief-spend-cursor.ts for why it is a dollar total
+  // rather than a chunk count, and lib/chiefSpend.ts for how it makes a
+  // retry safe against the Chief's first-write-wins dedupe.
+  //
+  // Created unconditionally, not only when CHIEF_URL / CHIEF_INGEST_TOKEN
+  // are set. The reporter itself is fully inert while they are unset — it
+  // opens no socket and writes no row — but a table that only appears once
+  // a secret is set is a table whose first use races its own creation, and
+  // it would make the publish plan depend on which secrets happened to be
+  // present at boot. An empty four-column table costs nothing.
+  //
+  // The PRIMARY KEY constraint is NAMED explicitly. Postgres would call it
+  // `chief_spend_cursor_pkey` and drizzle-kit calls the same thing
+  // `chief_spend_cursor_day_key_vendor_pk`; a mismatch is precisely the
+  // shape of diff churn cron-heartbeats.ts records being bitten by. Both
+  // sides now spell it out, identically.
+  //
+  // IF NOT EXISTS, so re-running on every boot is a no-op.
+  // ──────────────────────────────────────────────────────────────────
+  `CREATE TABLE IF NOT EXISTS chief_spend_cursor (
+    day_key TEXT NOT NULL,
+    vendor TEXT NOT NULL,
+    reported_cents INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT chief_spend_cursor_day_key_vendor_pk PRIMARY KEY (day_key, vendor)
+  )`,
 ];
 
 export async function runStartupMigrations(): Promise<void> {
@@ -294,7 +394,7 @@ export async function runStartupMigrations(): Promise<void> {
       await pool.query(stmt);
     }
     logger.info(
-      "B7r/B7u/B9a + bounce/archive + company-cascade migrations applied (followup_usage, users.paused_by_admin, prospects.cycle/parent_prospect_id/pause_reason/bounce_type/paused_at/archived/archived_at/reply_class/cascade_paused_by_prospect_id/reply_classified_msg_id, followups.cycle + unique-constraint swap, users.anti_ghosting_label, thread_messages, app_settings, suppressed_addresses, partial indexes)",
+      "B7r/B7u/B9a + bounce/archive + company-cascade + F-3.6a + F-3.6b + F-3.7a migrations applied (followup_usage, users.paused_by_admin, prospects.cycle/parent_prospect_id/pause_reason/bounce_type/paused_at/archived/archived_at/reply_class/cascade_paused_by_prospect_id/reply_classified_msg_id, followups.cycle + unique-constraint swap, users.anti_ghosting_label, thread_messages, app_settings, suppressed_addresses, users.auth_dead_at/auth_dead_reason, followups.retry_count/failure_reason/error_history, cron_heartbeats, chief_spend_cursor, partial indexes)",
     );
   } catch (err) {
     logger.error({ err }, "B9a: startup migration failed (AntiGhosting flow will not function correctly until resolved)");

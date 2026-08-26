@@ -8,6 +8,7 @@ import { CurrentUserProvider } from "@/hooks/use-current-user";
 import { AdminProvider } from "@/hooks/use-admin";
 import { ApiKeyGate } from "@/components/api-key-provider";
 import { Layout } from "@/components/layout";
+import { ROUTER_BASE } from "@/lib/app-urls";
 
 import Pipeline from "@/pages/pipeline";
 import EmailInspector from "@/pages/email-inspector";
@@ -121,7 +122,7 @@ function App() {
       <ApiKeyContextProvider>
         <AdminProvider>
         <ApiKeyGate>
-          <WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, "")}>
+          <WouterRouter base={ROUTER_BASE}>
             <Layout>
               <Router />
             </Layout>

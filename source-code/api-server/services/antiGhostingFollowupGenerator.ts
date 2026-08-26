@@ -50,6 +50,10 @@ import { mergeViolationReports } from "../lib/structuralLint";
 // of "reached out N times" phrasing — its whole premise is repeated contact.
 import { detectSpamRiskViolations } from "../lib/spamRiskLint";
 import { stripClosingFromBody } from "./signatureStripper";
+// 2026-08-26 layout fix. The seed subject stands in for the thread identity
+// here; this context has no original_subject field but seed_subject is
+// equally stable per thread, which is all the profile seed needs.
+import { shapeFollowupBody, selectLayoutProfile } from "../lib/layoutShaper";
 import { scanForInjection, checkOutputIntegrity, UNTRUSTED_DATA_SYSTEM_CLAUSE } from "../lib/promptInjection";
 
 export interface GeneratedAntiGhostingFollowup {
@@ -243,7 +247,18 @@ export async function generateAntiGhostingFollowup(
   // B8a sign-off stripper applied as the very last step on every return
   // path. The subject never carries a closing, only the body.
   const finalize = (draft: GeneratedAntiGhostingFollowup): GeneratedAntiGhostingFollowup => {
-    const out = { subject: draft.subject, body: stripClosingFromBody(draft.body) };
+    const out = {
+      subject: draft.subject,
+      body: shapeFollowupBody(stripClosingFromBody(draft.body), {
+        profile: selectLayoutProfile({
+          company: ctx.company,
+          prospect_name: ctx.prospect_name,
+          original_subject: ctx.seed_subject,
+          stage: ctx.stage,
+        }),
+        languageTag: ctx.original_language,
+      }),
+    };
     const _egress = checkOutputIntegrity(`${out.subject}\n${out.body}`);
     if (_egress.compromised) throw new Error(`Output integrity check failed: ${_egress.reasons.join("; ")}`);
     return out;

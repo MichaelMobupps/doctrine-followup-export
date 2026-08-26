@@ -1,10 +1,11 @@
 import { Router, type Request, type Response } from "express";
-import { google } from "googleapis";
 import crypto from "crypto";
 import { db, oauthNoncesTable } from "@workspace/db";
 import { eq, lt, and, gt } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { resolveAdminGrant } from "../lib/adminAccess";
+import { publicUrl, redirectPath } from "../lib/appUrls";
+import { newGoogleOAuthClient, newOAuth2InfoClient } from "../lib/googleApi";
 
 const router = Router();
 
@@ -21,19 +22,12 @@ async function cleanExpired() {
 }
 
 function getRedirectUri(): string {
-  if (process.env.APP_URL) {
-    return process.env.APP_URL.replace(/\/$/, '') + '/api/auth/callback';
-  }
-  const domain = process.env.REPLIT_DEV_DOMAIN || process.env.REPLIT_DOMAINS?.split(",")[0] || "localhost";
-  return `https://${domain}/api/auth/callback`;
+  return publicUrl("/api/auth/callback");
 }
 
 function getOAuth2Client() {
-  return new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-    getRedirectUri(),
-  );
+  // F-3.7b: bounded token-refresh transporter — see lib/googleApi.ts.
+  return newGoogleOAuthClient(getRedirectUri());
 }
 
 router.get("/auth/google", async (_req: Request, res: Response) => {
@@ -68,19 +62,17 @@ router.get("/auth/google", async (_req: Request, res: Response) => {
 });
 
 router.get("/auth/callback", async (req: Request, res: Response) => {
-  const dashboardBase = process.env.APP_URL?.replace(/\/$/, '') || "";
-
   try {
     const { code, state, error: oauthError } = req.query;
 
     if (oauthError) {
       logger.warn({ oauthError }, "Login OAuth denied");
-      res.redirect(dashboardBase + "/?login_error=denied");
+      res.redirect(redirectPath("/?login_error=denied"));
       return;
     }
 
     if (!code || !state) {
-      res.redirect(dashboardBase + "/?login_error=missing_params");
+      res.redirect(redirectPath("/?login_error=missing_params"));
       return;
     }
 
@@ -93,7 +85,7 @@ router.get("/auth/callback", async (req: Request, res: Response) => {
       .returning();
     if (!nonceData) {
       logger.warn("Invalid or expired login nonce");
-      res.redirect(dashboardBase + "/?login_error=expired");
+      res.redirect(redirectPath("/?login_error=expired"));
       return;
     }
     cleanExpired().catch(() => {});
@@ -102,12 +94,13 @@ router.get("/auth/callback", async (req: Request, res: Response) => {
     const { tokens } = await oauth2Client.getToken(code as string);
     oauth2Client.setCredentials(tokens);
 
-    const oauth2 = google.oauth2({ version: "v2", auth: oauth2Client });
+    // F-3.7b: bounded like every other Google call — see lib/googleApi.ts.
+    const oauth2 = newOAuth2InfoClient(oauth2Client);
     const userInfo = await oauth2.userinfo.get();
     const email = userInfo.data.email || "";
 
     if (!email) {
-      res.redirect(dashboardBase + "/?login_error=no_email");
+      res.redirect(redirectPath("/?login_error=no_email"));
       return;
     }
 
@@ -122,7 +115,7 @@ router.get("/auth/callback", async (req: Request, res: Response) => {
     const emailDomain = email.split("@")[1]?.toLowerCase() || "";
     if (!allowedDomains.includes(emailDomain)) {
       logger.warn({ email, emailDomain, allowedDomains }, "Login denied: email domain not in allowlist");
-      res.redirect(dashboardBase + "/?login_error=unauthorized_domain");
+      res.redirect(redirectPath("/?login_error=unauthorized_domain"));
       return;
     }
 
@@ -135,10 +128,10 @@ router.get("/auth/callback", async (req: Request, res: Response) => {
     });
 
     logger.info({ email }, "Dashboard login successful");
-    res.redirect(dashboardBase + "/?login_code=" + loginCode);
+    res.redirect(redirectPath("/?login_code=" + loginCode));
   } catch (err) {
     logger.error({ err }, "Login OAuth callback failed");
-    res.redirect(dashboardBase + "/?login_error=failed");
+    res.redirect(redirectPath("/?login_error=failed"));
   }
 });
 

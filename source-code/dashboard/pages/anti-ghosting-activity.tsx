@@ -12,6 +12,7 @@ import {
   ChevronDown, ChevronUp, Mail, Zap, AlertCircle,
   CheckCircle2, Loader2, Target, BarChart3,
 } from "lucide-react";
+import { BASE_PATH } from "@/lib/app-urls";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -316,7 +317,7 @@ export default function AntiGhostingActivityLog() {
     else setRefreshing(true);
     setError(null);
     try {
-      const base = import.meta.env.BASE_URL || "/";
+      const base = BASE_PATH;
       const res = await fetch(`${base}api/anti-ghosting/campaign/status`, {
         headers: { "x-api-key": apiKey },
       });

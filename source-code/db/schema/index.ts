@@ -14,3 +14,5 @@ export * from "./app-settings";
 export * from "./suppressed-addresses";
 // CSD v1: company-shared follow-up drafts (one LLM run per company cohort).
 export * from "./company-shared-drafts";
+// F-3.7a: how much of each UTC day's spend the Chief has already confirmed.
+export * from "./chief-spend-cursor";
