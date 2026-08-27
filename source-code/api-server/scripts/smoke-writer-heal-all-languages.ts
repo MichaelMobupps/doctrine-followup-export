@@ -63,6 +63,7 @@ import { buildWriterExemplarBlock } from "../lib/exemplarLibrary";
 import { buildWriterCompetitorBlock } from "../lib/competitorLibrary";
 import { stripClosingFromBody } from "../services/signatureStripper";
 import { shapeFollowupBody, selectLayoutProfile } from "../lib/layoutShaper";
+import { applyJapaneseRegister, withJapaneseClosing } from "../lib/japaneseRegister";
 
 /**
  * Ship-normalization — the deterministic passes production applies to the body
@@ -85,10 +86,23 @@ function shipNormalize(body: string, ctx: FollowupContext): string {
   // 2026-08-26: production's humanizeFollowup now ends with the layout
   // shaper. Without mirroring it here every shipped body would flag the
   // LAYOUT lint classes this harness is supposed to prove are fixed.
-  return shapeFollowupBody(stripClosingFromBody(r), {
-    profile: selectLayoutProfile(ctx),
-    languageTag: ctx.original_language,
-  });
+  //
+  // 2026-08-27: and it now ends with applyJapaneseRegister after that. This
+  // function's whole claim is that it models what production SHIPS, so every
+  // pass production adds has to be added here too or the harness quietly
+  // under-reports. A JA run caught this: the archived bodies still showed 貴社
+  // that production would have normalized to 御社 before sending.
+  return withJapaneseClosing(
+    applyJapaneseRegister(
+      shapeFollowupBody(stripClosingFromBody(r), {
+        profile: selectLayoutProfile(ctx),
+        languageTag: ctx.original_language,
+      }),
+      ctx.original_language,
+    ),
+    ctx.original_language,
+    `${ctx.company}|${ctx.original_subject}|${ctx.stage}`,
+  );
 }
 
 const ALL_LANGS: string[] = [

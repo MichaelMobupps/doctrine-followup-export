@@ -19,7 +19,8 @@
     "llm:bench:pipeline": "node --import tsx src/scripts/bench-llm-pipeline.ts",
     "llm:smoke:summarizer": "node --import tsx src/scripts/smoke-summarizer-cheap.ts",
     "llm:smoke:context": "node --import tsx src/scripts/smoke-context-cheap-chain.ts",
-    "llm:smoke:critic": "node --import tsx src/scripts/smoke-critic.ts"
+    "llm:smoke:critic": "node --import tsx src/scripts/smoke-critic.ts",
+    "llm:smoke:japanese": "node --import tsx src/scripts/smoke-japanese-nativeness.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.65.0",

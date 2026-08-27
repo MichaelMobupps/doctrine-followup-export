@@ -28,6 +28,7 @@ import { stripClosingFromBody } from "./signatureStripper";
 // line and more than one block.
 import { shapeFollowupBody, selectLayoutProfile } from "../lib/layoutShaper";
 import { extractGreetingName, hasUsableProspectName } from "../lib/greetingName";
+import { applyJapaneseRegister, withJapaneseClosing } from "../lib/japaneseRegister";
 import { checkOutputIntegrity, UNTRUSTED_DATA_SYSTEM_CLAUSE } from "../lib/promptInjection";
 import { runCritic } from "./criticProvider";
 // Writer fallback waterfall (lib/modelPolicy.ts: Gemini Flash-Lite -> GPT-5.4-nano
@@ -160,10 +161,26 @@ function humanizeFollowup(
   const humanizedBody = humanizeText(followup.body);
   const result = {
     subject: humanizeText(followup.subject),
-    body: shapeFollowupBody(stripClosingFromBody(humanizedBody), {
-      profile: selectLayoutProfile(ctx),
-      languageTag: ctx.original_language,
-    }),
+    // applyJapaneseRegister is a no-op for every non-JA language. For Japanese
+    // it enforces 弊社/御社 and drops the English salutation comma — register
+    // errors a prompt rule alone did not eliminate (measured 44% 貴社 with the
+    // rule live). See lib/japaneseRegister.ts.
+    // For Japanese, the deterministic layer also OWNS the ending: whatever
+    // closing the writer improvised was stripped above, and withJapaneseClosing
+    // appends one vetted 結びの挨拶 (rotating per thread-and-stage). In Japanese
+    // the closing courtesy is part of the message body, not the signature, and
+    // its absence reads as abrupt — see JAPANESE_CLOSINGS in japaneseRegister.
+    body: withJapaneseClosing(
+      applyJapaneseRegister(
+        shapeFollowupBody(stripClosingFromBody(humanizedBody), {
+          profile: selectLayoutProfile(ctx),
+          languageTag: ctx.original_language,
+        }),
+        ctx.original_language,
+      ),
+      ctx.original_language,
+      `${ctx.company}|${ctx.original_subject}|${ctx.stage}`,
+    ),
   };
   const _egress = checkOutputIntegrity(`${result.subject}\n${result.body}`);
   if (_egress.compromised) {

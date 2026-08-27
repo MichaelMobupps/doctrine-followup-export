@@ -50,6 +50,26 @@ export function normalizeLanguageCode(value: string | null | undefined): string 
  *   ENGLISH-TOLERANT — keep most terms in English (German, Dutch, Nordics)
  *   ENGLISH-HEAVY — keep ALL ad-tech terms in English (SEA, Indian subcontinent, Swahili)
  */
+/**
+ * DEAD CODE — read this before you edit anything below.
+ *
+ * `GUIDES` feeds ONLY `_buildNativenessBlock_v2_LEGACY_REMOVED`, which this file
+ * itself documents as "not called from anywhere". The LIVE writer block is
+ * `buildNativenessBlock` -> `buildNativenessBlockV4` in lib/nativenessV4.ts, and
+ * it carries a completely different (v3 Reading-A++) policy.
+ *
+ * This trap cost real time during the Aug 2026 Japanese-nativeness audit: the
+ * `ja` entry below says "Keep ONLY these pure acronyms in English: <10 items>.
+ * Nothing else stays in Latin script", with no proper-noun exemption — which
+ * reads exactly like the cause of a katakana-transliteration defect a native
+ * reviewer had just reported (エーピーエスフライヤー for AppsFlyer). It was
+ * diagnosed as the root cause, edited, and only then found to be unreachable.
+ * The live v3 policy already permits acronyms AND proper nouns, and a 9-cell
+ * live smoke confirmed 0 transliterations in production output.
+ *
+ * Editing anything in this table changes NOTHING at runtime. Change
+ * lib/nativenessV4.ts instead.
+ */
 const GUIDES: Record<string, string> = {
   // ── HEAVY LOCALIZATION ────────────────────────────────────────────────
   ru:

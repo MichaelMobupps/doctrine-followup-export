@@ -43,6 +43,7 @@
  */
 import { FOLLOWUP_EXEMPLARS, type FollowupExemplar } from "./followupExemplarsData";
 import { shapeFollowupBody, LAYOUT_PROFILES } from "./layoutShaper";
+import { applyJapaneseRegister } from "./japaneseRegister";
 
 export interface ExemplarContext {
   vertical?: string | null;
@@ -216,6 +217,45 @@ export function selectExemplars(ctx: ExemplarContext): SelectedExemplars {
   return { exemplars: picked, structureOnly };
 }
 
+// ---------------------------------------------------------------------------
+// Japanese exemplar normalization (native review, Aug 2026).
+// ---------------------------------------------------------------------------
+
+/**
+ * Repair the Japanese exemplars at render time.
+ *
+ * WHY HERE AND NOT IN THE DATA FILE
+ *
+ * followupExemplarsData.ts states it is generated from
+ * Followupper_exemplars_widened.jsonl and must not be hand-edited — and that
+ * JSONL is not in this repo, so a direct edit would be silently lost the next
+ * time the file is regenerated. This module already fixes a data-level defect
+ * the same way: every stored body is re-shaped through the layout profiles
+ * because 1209 of the 1272 bodies taught the wrong SHAPE. These JA repairs
+ * follow that precedent, so they survive regeneration.
+ *
+ * WHAT IS WRONG WITH THE STORED JA EXEMPLARS
+ *
+ * A native review (Hidenori Terao, MobUpps BD, Aug 2026) identified register and
+ * punctuation errors that the stored exemplars actively teach. Measured across
+ * all 39 JA exemplars:
+ *
+ *   - 39/39 open "NAME様," with an ASCII COMMA. Japanese does not punctuate a
+ *     salutation; this is the English "Hi Alex," shape imported wholesale, and
+ *     39 counter-examples beat any prompt rule asking for the native form.
+ *   - 7/39 use 当社 (neutral) where outbound sales requires 弊社 (humble, 謙譲語).
+ *     Another 8 already use 弊社, so the set is internally inconsistent — the
+ *     writer learns that either is fine.
+ *
+ * The substitutions live in lib/japaneseRegister.ts, shared with the OUTPUT path
+ * so that what the writer is shown and what the writer ships obey one rule.
+ * Only register and punctuation are touched: no claim, figure, structure or
+ * doctrine content of any exemplar changes.
+ */
+export function normalizeJapaneseExemplarBody(body: string): string {
+  return applyJapaneseRegister(body, "ja");
+}
+
 function renderOne(ex: FollowupExemplar, index: number): string {
   const flags =
     ex.illustrative_flags && ex.illustrative_flags.length > 0
@@ -224,7 +264,10 @@ function renderOne(ex: FollowupExemplar, index: number): string {
   // Give each exemplar in the block a different shape, so the few-shot set
   // teaches variation rather than one repeated layout. index is 1-based.
   const profile = LAYOUT_PROFILES[(index - 1) % LAYOUT_PROFILES.length];
-  const body = shapeFollowupBody(ex.body, { profile, languageTag: ex.language });
+  // Japanese register/punctuation repairs run BEFORE the layout shaper, because
+  // the salutation fix targets the name line the shaper then positions.
+  const source = ex.language === "ja" ? normalizeJapaneseExemplarBody(ex.body) : ex.body;
+  const body = shapeFollowupBody(source, { profile, languageTag: ex.language });
   // The body is multi-line now, so it gets its own delimited section instead
   // of sitting inline after a "Body:" label where the line breaks would be
   // ambiguous against the surrounding prompt structure.

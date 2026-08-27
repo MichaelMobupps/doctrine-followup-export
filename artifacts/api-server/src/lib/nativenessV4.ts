@@ -541,17 +541,23 @@ export const NATIVE_STYLE_GUIDES: Record<string, NativeStyleGuide> = {
 
   ja: {
     regional_variant: "Standard Japanese (ja-JP). Use 敬語 (keigo).",
+    // Aug 2026 native review (Hidenori Terao): the apologetic opener is
+    // required, but 突然 ("sudden") is a FIRST-CONTACT word and every email this
+    // system sends is a follow-up. Writing "excuse the sudden contact" in a
+    // second or third touch is wrong on the facts and contradicts the
+    // FOLLOWUP-ACK reference that sits in the same opening. 度々 ("repeated") is
+    // the native follow-up form.
     social_opener:
-      "Open with 'NAME-IN-KATAKANA様' on first line, then '突然のご連絡失礼いたします。' as second-line social opener. Japanese B2B cold outreach REQUIRES the apologetic opener.",
+      "Open with 'NAME-IN-KATAKANA様' on its own first line, NO trailing comma, then the apologetic opener as the second line. Japanese B2B REQUIRES the apologetic opener. Because this is a FOLLOW-UP and not a first contact, use '度々のご連絡失礼いたします。' or '再度のご連絡失礼いたします。' ('excuse the repeated contact'). Do NOT use '突然のご連絡失礼いたします。' — that says 'sudden/unexpected contact' and is only correct for a first touch.",
     connector_phrases: [
       "～と存じます", "～につきまして", "また、", "さらに、",
       "ご検討いただけますと幸いです",
     ],
     softener_phrases: ["～かもしれません", "～と存じます", "もしよろしければ"],
     collaborative_close:
-      "Soft close with 'もしよろしければ、来週お打ち合わせの機会をいただけますでしょうか。' style — explicit time-frame, permission-asking grammar, full keigo.",
+      "Soft close with permission-asking grammar and full keigo, framed as an exchange rather than a pitch: '情報交換を兼ねて一度お打ち合わせのお時間を頂戴できますでしょうか。' or 'もしよろしければ、来週お打ち合わせの機会をいただけますでしょうか。'",
     register_notes:
-      "Japanese B2B uses full keigo. Verbs end in ～ます / ～です. Use 御社 for the recipient's company, 弊社 for own.",
+      "Japanese B2B uses full keigo. Verbs end in ～ます / ～です. Use 御社 for the recipient's company (貴社 is for written documents, not email) and 弊社 for our own (never 当社 — outbound sales is written in 謙譲語). Acronyms and proper nouns stay in Latin script and are NEVER spelled out phonetically in katakana (AppsFlyer, not エーピーエスフライヤー; D30, not ディーサーティ).",
   },
 
   zh: {

@@ -28,6 +28,7 @@
 // re-engagement tiers are subject-only) and the shared draft contract does not.
 // F-3.7b: a spent row budget outranks every fail-open path in this file.
 import { GenerationDeadlineError } from "../lib/generationDeadline";
+import { applyJapaneseRegister, withJapaneseClosing } from "../lib/japaneseRegister";
 import { runCriticWithProvider } from "./criticProvider";
 import { runLlmJson, SUBJECT_BODY_SCHEMA } from "../lib/llmRouter";
 import {
@@ -167,15 +168,27 @@ export async function generateAntiGhostingFollowup(
   const finalize = (draft: GeneratedAntiGhostingFollowup): GeneratedAntiGhostingFollowup => {
     const out = {
       subject: draft.subject,
-      body: shapeFollowupBody(stripClosingFromBody(draft.body), {
-        profile: selectLayoutProfile({
-          company: ctx.company,
-          prospect_name: ctx.prospect_name,
-          original_subject: ctx.seed_subject,
-          stage: ctx.stage,
-        }),
-        languageTag: ctx.original_language,
-      }),
+      // applyJapaneseRegister is a no-op for every non-JA language. For Japanese
+      // it enforces 弊社/御社 and drops the English salutation comma. See
+      // lib/japaneseRegister.ts.
+      // The deterministic layer also owns the Japanese ending — one vetted
+      // 結びの挨拶 appended after the strip. See JAPANESE_CLOSINGS.
+      body: withJapaneseClosing(
+        applyJapaneseRegister(
+          shapeFollowupBody(stripClosingFromBody(draft.body), {
+            profile: selectLayoutProfile({
+              company: ctx.company,
+              prospect_name: ctx.prospect_name,
+              original_subject: ctx.seed_subject,
+              stage: ctx.stage,
+            }),
+            languageTag: ctx.original_language,
+          }),
+          ctx.original_language,
+        ),
+        ctx.original_language,
+        `${ctx.company}|${ctx.seed_subject}|${ctx.stage}`,
+      ),
     };
     const _egress = checkOutputIntegrity(`${out.subject}\n${out.body}`);
     if (_egress.compromised) throw new Error(`Output integrity check failed: ${_egress.reasons.join("; ")}`);
