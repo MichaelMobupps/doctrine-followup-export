@@ -771,10 +771,54 @@ export function findLatinTokenRuns(text: string, lang: string): string[] {
 // they must not be flagged there. "Budget" is standard German and French;
 // "incremental" is standard Spanish and Portuguese. Languages that genuinely
 // translate the term (for example Russian budget>бюджет) are deliberately absent.
+// 2026-08-27 extension, from measured E2E false positives: a French draft was
+// flagged for "durable", "installation" and "segments", and a context-flow
+// draft for "test" — all four are the standard dictionary words in French
+// (Larousse: le test, l'installation, durable, le segment). The singleton list
+// is spelled in English, so any target language whose own word is a HOMOGRAPH
+// of the English one gets flagged for writing natively, then pays a rewrite
+// cycle that cannot succeed (the "fix" would be to stop writing French).
+// Each entry below is exempt ONLY where the target language's standard term is
+// the identical spelling and the doctrine names no distinct native
+// alternative. German keeps its deliberate anti-loanword stance for
+// Performance/Conversion/Retention (Duden-listed alternatives exist and the
+// doctrine mandates them); test/installation/partner have no such rival.
 const SINGLETON_LANG_EXEMPTIONS: Record<string, ReadonlySet<string>> = {
-  de: new Set(["budget", "segment"]),
-  fr: new Set(["budget", "segment"]),
-  es: new Set(["incremental", "real"]),
+  de: new Set([
+    "budget", "segment",
+    "test", "tests",              // der Test, des Tests — the standard word (A/B-Test)
+    "installation",               // die Installation — no rival German term
+    "partner", "partners",        // der Partner / des Partners — plain German
+  ]),
+  fr: new Set([
+    "budget", "segment",
+    "test", "tests",              // le test (Larousse)
+    "installation", "installations", // l'installation
+    "durable",                    // développement durable — core French adjective
+    "segments",                   // plural of the already-exempt segment
+    "conversion", "conversions",  // la conversion — identical native spelling
+    "attribution", "attributions",
+    "validation", "validations",
+    "impression", "impressions",  // une impression
+    "source", "sources",          // la source
+    "audience", "audiences",      // l'audience
+  ]),
+  es: new Set([
+    "incremental", "real",
+    "test", "tests",              // el test / los tests (RAE)
+  ]),
+  it: new Set([
+    "test", "tests",              // il test / i test (Treccani); "validate" is
+                                  // NOT here — Italian has validare, so that
+                                  // one is a genuine error and stays flagged
+  ]),
+  id: new Set([
+    "model",                      // KBBI-native (a measured E2E false positive)
+    "data",                       // KBBI-native, sits on the singleton list
+  ]),
+  ms: new Set([
+    "model", "data",              // same Kamus Dewan homographs as Indonesian
+  ]),
   pt: new Set(["incremental", "real"]),
 };
 

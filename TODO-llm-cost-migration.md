@@ -873,3 +873,55 @@ The real critic-cost levers, still deliberately NOT pulled without a larger batt
   `antiGhostingFollowupPrompts.ts`, `competitorLibrary.ts` (x2), `circuitBreaker.ts`.
 - Context/AG critic prompts confirmed layout-free — the noise problem was doctrine-flow-only.
 - Root helper scripts (`prepublish-check.sh`, `smoke-budget.sh`) confirmed clean of dead LLM env vars.
+
+
+---
+
+## 9. Post-publish fix round (2026-08-27, after deployment verification)
+
+The deployment verification left two recurring E2E ship-fail classes as the only open quality items.
+Both were diagnosed by reproduction, and both turned out to be **the linter punishing correct native
+writing**, not the writer failing.
+
+### 9.1 FOLLOWUP-ACK false positives (ru, hi) — marker-table gaps
+
+Live Russian drafts opened with `Продолжаю нашу переписку по поводу…` ("continuing our
+correspondence about…") — a textbook follow-up acknowledgment — and were flagged anyway: the ru
+marker table had no continuation-verb stems at all. Hindi only knew the masculine agreement `पिछले`
+and missed the feminine `पिछली` (ईमेल/मेल are commonly feminine). Each false positive buys a rewrite
+cycle that cannot succeed, and in the E2E harness (no LLM rescue) counts as a genuine ship risk. The
+LLM confirm (`referencesPriorOutreach`) was verified to answer TRUE on these openings — production
+usually rescued them at the cost of an extra call — but the deterministic table is the honest fix.
+Extended ru (+11 markers incl. feminine forms), uk (+7, same morphology), hi (+13). Markers only
+SUPPRESS the flag, so additions are fail-open safe by construction; cold opens verified still flagged.
+
+### 9.2 FORBIDDEN-ENGLISH-SINGLETON homograph false positives (fr, es, it, id, de)
+
+The singleton list is spelled in English, so any target language whose OWN standard word is the
+identical spelling was flagged for writing natively: a French draft for "durable", "installation",
+"segments" (all Larousse French); a context-flow draft for "test" (le test); an Indonesian draft for
+"model" (KBBI-native). The rewrite the flag demands would be to stop writing French.
+
+Fixed in `SINGLETON_LANG_EXEMPTIONS` (the existing dictionary-homograph mechanism, kept as the single
+home — first draft put it/id in the v4 loanword table and was moved for single-source semantics):
+fr +11 (test, installation(s), durable, segments, conversion(s), attribution(s), validation(s),
+impression(s), source(s), audience(s)), es/it +test(s) (RAE/Treccani), id/ms +model,data (KBBI/Kamus
+Dewan), de +test(s), installation, partner(s) — while **German's deliberate anti-loanword doctrine is
+preserved and test-locked**: Performance/Conversion/Retention still flag, because Duden alternatives
+exist and the doctrine mandates them. Italian "validate" likewise stays flagged (validare exists).
+
+### 9.3 Measured result
+
+E2E heal run over exactly the previously-failing set (ru, hi, fr, it, id, es, de × 2 verticals):
+
+| | before (across earlier runs) | after |
+|---|---|---|
+| FOLLOWUP-ACK ship-fails (ru/hi) | recurring, every run | **0** |
+| singleton ship-fails (fr/it/id) | recurring | **0** |
+| SHIP CLEAN | — | **13/14** |
+
+The one residual is a NEW, lower-severity class (es `NON-REFLEXIVE-ROMANCE-VERB` on "encaja" — a rule
+whose own docstring warns of false positives for transitive/intransitive readings; RAE lists
+intransitive *encajar*). Logged as the next candidate, deliberately not chased in this round.
+
++11 tests (`test-ack-and-homograph-fixes.ts`), suite **1,396 / 0**.

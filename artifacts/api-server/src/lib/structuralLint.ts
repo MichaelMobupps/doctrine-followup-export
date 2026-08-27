@@ -82,14 +82,25 @@ const ACK_MARKERS: Record<string, string[]> = {
   fr: ["pour faire suite", "je reviens vers vous", "mon precedent", "mon dernier e-mail", "mon dernier email", "mon message precedent", "je vous ai ecrit", "suite a mon", "faisant suite"],
   de: ["ich komme zuruck auf", "meine vorherige", "meine letzte e-mail", "meine letzte email", "ich hatte geschrieben", "anknupfend an", "bezugnehmend auf", "meine nachricht", "in bezug auf meine", "melde mich noch einmal", "melde mich erneut", "melde mich nochmals", "zu meiner e-mail", "zu meiner email", "auf meine e-mail", "auf meine email", "meine e-mail uber", "meine email uber", "wie bereits geschrieben", "ich wollte noch einmal"],
   it: ["a seguito della", "tornando alla", "la mia precedente", "il mio messaggio precedente", "ti avevo scritto", "ricollegandomi", "facendo seguito"],
-  ru: ["возвращаясь к", "в продолжение", "мое предыдущее письмо", "моего предыдущего письма", "писал вам", "ранее писал", "в дополнение к моему", "напоминаю о"],
-  uk: ["повертаючись до", "на продовження", "мій попередній лист", "писав вам", "раніше писав"],
+  // ru extended 2026-08-27: live drafts opened with natural continuation
+  // framings the original eight markers never matched — "Продолжаю нашу
+  // переписку по поводу…" / "Продолжаю свою мысль относительно…" are textbook
+  // Russian follow-up acknowledgments, yet every one produced a FOLLOWUP-ACK
+  // false positive, a needless rewrite cycle, and a STILL-FAILING E2E cell.
+  // Markers only SUPPRESS the flag, so additions are fail-open safe.
+  ru: ["возвращаясь к", "в продолжение", "мое предыдущее письмо", "моего предыдущего письма", "писал вам", "ранее писал", "в дополнение к моему", "напоминаю о", "продолжаю", "продолжая", "снова пишу", "пишу вам снова", "хочу вернуться к", "вернуться к моему", "предыдущем письме", "прошлом письме", "прошлое письмо", "писала вам", "ранее писала", "напомнить о", "напомню о"],
+  // uk mirrors the ru extension (same continuation-verb gap, same morphology).
+  uk: ["повертаючись до", "на продовження", "мій попередній лист", "писав вам", "раніше писав", "продовжую", "продовжуючи", "знову пишу", "попередньому листі", "попереднього листа", "писала вам", "раніше писала"],
   ja: ["先日", "以前", "前回", "再度", "先ほど", "先般", "改めてご連絡", "お送りした"],
   zh: ["跟进", "上次", "之前", "再次联系", "我之前", "上一封", "跟進", "之前发的", "之前發的", "续上次", "给您发过", "给你发过", "发过一封", "发送过", "上封", "给您写过", "给你写过", "此前发"],
   ko: ["지난번", "이전에", "앞서", "다시 연락", "보내드린", "지난 이메일", "지난 메일"],
   ar: ["متابعة", "في إشارة إلى", "رسالتي السابقة", "بريدي السابق", "تواصلت معك", "سبق أن راسلتك", "أتابع بخصوص"],
   he: ["בהמשך", "חוזר אליך", "המייל הקודם", "המייל הקודם שלי", "הודעתי הקודמת", "כתבתי לך", "פניתי אליך", "במענה ל", "חזרתי על", "חזרתי אל", "חוזר למייל", "חוזר להודעה", "חוזר על", "חוזר אל", "חוזרת על"],
-  hi: ["फॉलो अप", "पिछले ईमेल", "पिछले संदेश", "मैंने आपको लिखा", "आगे बढ़ते हुए", "पिछली बार"],
+  // hi extended 2026-08-27: the table only knew masculine agreement (पिछले)
+  // and missed the feminine पिछली (ईमेल/मेल are commonly feminine in Hindi),
+  // plus the "returning to my message" (…पर लौट रहा हूँ) and "contacting again"
+  // framings live drafts actually use. Same fail-open safety as ru.
+  hi: ["फॉलो अप", "पिछले ईमेल", "पिछले संदेश", "मैंने आपको लिखा", "आगे बढ़ते हुए", "पिछली बार", "पिछली ईमेल", "पिछली मेल", "पिछले मेल", "मेरे पिछले", "मेरी पिछली", "लौट रहा", "लौट रही", "दोबारा संपर्क", "फिर से संपर्क", "दोबारा लिख", "फिर से लिख", "याद दिला", "स्मरण करा"],
   vi: ["theo dõi", "tiếp nối", "email trước", "tin nhắn trước", "tôi đã liên hệ", "nhắc lại", "thư trước"],
   th: ["ติดตาม", "อีเมลก่อนหน้า", "ข้อความก่อนหน้า", "ติดต่อไป", "ตามที่ได้"],
   tr: ["takip", "onceki e-posta", "onceki mesaj", "size yazmistim", "geri donus", "daha once"],
