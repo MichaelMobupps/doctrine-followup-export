@@ -1,27 +1,31 @@
 /**
  * Google AI Studio (Gemini API) transport.
  *
- * Pure HTTP transport for the Generative Language REST API. Used by the
- * critic provider to run the critic stage on a configurable Gemini model
- * (default Gemini 3 Flash Preview) at lower token cost than the Opus critic. This module knows nothing about the follow-up
- * domain. It sends a system instruction plus one user turn and returns the
- * raw text and usage metadata. Prompt construction, JSON parsing, and usage
- * recording live in the caller (services/criticProvider.ts).
+ * Pure HTTP transport for the Generative Language REST API — the Gemini half
+ * of every role's fallback waterfall (lib/llmRouter.ts walks the chains from
+ * lib/modelPolicy.ts and calls this for the Gemini tiers). This module knows
+ * nothing about the follow-up domain: it sends a system instruction plus one
+ * user turn and returns the raw text and usage metadata. Prompt construction,
+ * JSON parsing, and usage recording live in the router and its callers.
  *
  * Auth: a Google AI Studio API key in the GEMINI_API_KEY env var, sent as the
  * x-goog-api-key header. Add it as a Replit Secret on BOTH the workspace and
- * the deployment, the same as ANTHROPIC_API_KEY. Get a key at
- * https://aistudio.google.com/apikey
+ * the deployment. Get a key at https://aistudio.google.com/apikey
  *
  * Resilience: Gemini models can return transient 503 UNAVAILABLE
  * under load, and Google asks callers to retry. This transport retries 429 and
  * 5xx responses and aborts and network errors with exponential backoff, up to
  * GEMINI_MAX_ATTEMPTS (default 3). After attempts are exhausted it throws, and
- * the caller falls back to the Sonnet critic, so a sustained outage still
- * degrades safely.
+ * the router advances to the next tier in the role's waterfall, so a sustained
+ * outage degrades rather than fails.
  *
  * Tunables, all optional:
- *   GEMINI_CRITIC_THINKING  LOW | MEDIUM | HIGH   (default MEDIUM)
+ *   GEMINI_CRITIC_THINKING  MINIMAL | LOW | MEDIUM | HIGH  (default MEDIUM) —
+ *                           the level used when a call arrives with NO explicit
+ *                           thinkingLevel. The router always passes the tier's
+ *                           level from the chain, so this only reaches requests
+ *                           from an env-override chain entry written without
+ *                           an @level suffix, and direct transport callers.
  *   GEMINI_MAX_ATTEMPTS     1..6                  (default 3)
  *   GEMINI_TIMEOUT_MS       5000..300000          (default 60000, per attempt)
  *
@@ -37,6 +41,86 @@ import { assertGenerationBudget, clampToGenerationBudget } from "./generationDea
 export const GEMINI_CRITIC_MODEL = process.env.GEMINI_CRITIC_MODEL || "gemini-3-flash-preview";
 
 export type ThinkingLevel = "MINIMAL" | "LOW" | "MEDIUM" | "HIGH";
+
+const LEVEL_ORDER: ThinkingLevel[] = ["MINIMAL", "LOW", "MEDIUM", "HIGH"];
+
+/**
+ * Per-model thinking constraints. Not every Gemini model accepts every
+ * thinkingLevel, and the ones that do not answer with a hard 400 — which the
+ * retry loop correctly refuses to retry, so an un-clamped level burns a whole
+ * waterfall tier on a request that could never have succeeded.
+ *
+ * Probed live, 27 Aug 2026:
+ *   gemini-3.7-flash      "Thinking level MINIMAL is not supported for this
+ *                         model. Please retry with other thinking level."  → floor LOW
+ *   gemini-2.5-flash-lite "Thinking level is not supported for this model." → omit entirely
+ *
+ * `null` means the model rejects thinkingConfig altogether; a level means that
+ * is the lowest it will accept. Anything not listed takes any level.
+ */
+const THINKING_FLOOR: Record<string, ThinkingLevel | null> = {
+  "gemini-3.7-flash": "LOW",
+  "gemini-3.6-flash": "LOW",
+  "gemini-3.1-pro-preview": "LOW",
+  "gemini-2.5-flash": null,
+  "gemini-2.5-flash-lite": null,
+  "gemini-2.5-pro": null,
+};
+
+/**
+ * Headroom, in tokens, that a thinking level needs INSIDE maxOutputTokens.
+ *
+ * The trap this exists for: Gemini bills thinking tokens as output AND counts
+ * them against `maxOutputTokens`. A caller that says "this answer is 40 tokens,
+ * cap it at 200" is silently also capping the model's reasoning — and when
+ * thinking eats the budget, the response is not an error. It is a TRUNCATED
+ * string, which arrives as unparseable JSON.
+ *
+ * Measured on gemini-3-flash-preview classifying a one-line email reply
+ * (27 Aug 2026): LOW thinking spent 138-181 tokens against a 200-token cap that
+ * also had to hold a ~35-token answer. It succeeded about as often as it failed,
+ * which is the worst way for something to be wrong.
+ *
+ * These figures are deliberately generous. Unused headroom costs nothing — only
+ * tokens actually generated are billed — while too little costs a whole tier.
+ */
+const THINKING_HEADROOM: Record<ThinkingLevel, number> = {
+  MINIMAL: 0,
+  LOW: 1024,
+  MEDIUM: 2048,
+  HIGH: 4096,
+};
+
+/**
+ * Raise a caller's output cap so the thinking budget does not eat the answer.
+ *
+ * Never lowers the cap, so a caller that already asked for plenty is untouched.
+ * Exported for the tests, which assert the specific failure this prevents.
+ */
+export function budgetForThinking(
+  maxOutputTokens: number,
+  thinkingLevel: ThinkingLevel | null,
+): number {
+  if (!thinkingLevel) return maxOutputTokens;
+  return maxOutputTokens + THINKING_HEADROOM[thinkingLevel];
+}
+
+/**
+ * Clamp a requested level to what the model will actually accept.
+ *
+ * Returns null when the model takes no thinkingConfig at all, in which case the
+ * caller omits the block. Raising a level is always safe (it costs a few more
+ * thinking tokens); sending an unsupported one is a 400.
+ */
+export function resolveThinkingForModel(
+  model: string,
+  requested: ThinkingLevel,
+): ThinkingLevel | null {
+  if (!(model in THINKING_FLOOR)) return requested;
+  const floor = THINKING_FLOOR[model];
+  if (floor === null) return null;
+  return LEVEL_ORDER.indexOf(requested) < LEVEL_ORDER.indexOf(floor) ? floor : requested;
+}
 
 function resolveThinkingLevel(): ThinkingLevel {
   const v = (process.env.GEMINI_CRITIC_THINKING || "MEDIUM").toUpperCase();
@@ -182,7 +266,13 @@ export async function geminiGenerateJson(args: {
   const url =
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
-  const thinkingLevel = args.thinkingLevel ?? resolveThinkingLevel();
+  // Clamp to what THIS model accepts. An unsupported level is a 400, which is
+  // non-retryable, so without this a single bad env override would burn a whole
+  // waterfall tier on every call.
+  const thinkingLevel = resolveThinkingForModel(
+    model,
+    args.thinkingLevel ?? resolveThinkingLevel(),
+  );
 
   const payload = JSON.stringify({
     systemInstruction: {
@@ -192,8 +282,11 @@ export async function geminiGenerateJson(args: {
     generationConfig: {
       responseMimeType: "application/json",
       ...(args.responseSchema ? { responseSchema: args.responseSchema } : {}),
-      thinkingConfig: { thinkingLevel },
-      maxOutputTokens: args.maxOutputTokens ?? 8192,
+      ...(thinkingLevel ? { thinkingConfig: { thinkingLevel } } : {}),
+      // Thinking tokens count against this cap. Add headroom for them so a
+      // caller sizing the cap to its ANSWER does not silently truncate the
+      // model mid-reasoning. See budgetForThinking.
+      maxOutputTokens: budgetForThinking(args.maxOutputTokens ?? 8192, thinkingLevel),
     },
   });
 

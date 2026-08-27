@@ -1,28 +1,32 @@
 /**
- * smoke-context-cheap-chain.ts — end-to-end validation of the sibling-flow cost
- * change. Drives the REAL generateContextFollowup (full heal loop, finalize) for
- * a sample of languages under TWO configs and compares the shipped-email clean
- * rate:
+ * smoke-context-cheap-chain.ts — end-to-end ship-clean smoke for the CONTEXT
+ * flow, the exemplar-less pipeline that historically regressed first on cheap
+ * writers.
  *
- *   cheap : default routing — Gemini Flash writer -> Sonnet fallback, Gemini
- *           critic -> Sonnet fallback (the new money-saving path).
- *   sonnet: WRITER_PROVIDER=anthropic + CRITIC_PROVIDER=anthropic — the old
- *           all-Sonnet path, as a quality baseline.
+ * Drives the REAL generateContextFollowup (draft -> critic -> rewrite ->
+ * finalize) across a language sample and lints what would actually ship. This
+ * flow has no exemplar library, which is exactly why it runs its own, stronger
+ * chain (EXEMPLARLESS_WRITER_CHAIN in lib/modelPolicy.ts) — and why it needs
+ * its own end-to-end smoke: the doctrine-flow E2E cannot vouch for it.
  *
- * The context flow is non-sales, so NO doctrine exemplars are injected on either
- * path (that is the whole point — the writer chain still applies, just without
- * the study block). If the cheap clean rate tracks the Sonnet baseline, the
- * change holds quality.
+ * Aug 2026: this used to be a cheap-vs-Sonnet A/B driven by WRITER_PROVIDER /
+ * CRITIC_PROVIDER. Those switches no longer exist (Anthropic is disabled and
+ * routing lives in lib/modelPolicy.ts), and for a while after the migration the
+ * "sonnet" arm silently ran the identical config as the "cheap" arm, making the
+ * comparison pass vacuously. A smoke that cannot fail is worse than none, so
+ * the dead arm is gone: this is now a single-config gate on the live chain with
+ * an ABSOLUTE clean-rate floor instead of a delta against a baseline that can
+ * no longer be produced.
  *
- * SAFE: bounded by --max-langs; each cell is up to 3 calls (draft, critic,
- * rewrite). Nothing is written to the production usage ledger (no usage context).
+ * SAFE: each cell is up to 3 calls (draft, critic, rewrite). Nothing is written
+ * to the production usage ledger (no usage context).
  *
  * RUN (from artifacts/api-server):
  *   node --import tsx src/scripts/smoke-context-cheap-chain.ts
  *   node --import tsx src/scripts/smoke-context-cheap-chain.ts --langs en,de,ja,ar
  *
- * Exit codes: 0 cheap held quality (clean rate within 15 pts of Sonnet) and no
- * errors; 1 a hard error or a material quality regression.
+ * Exit codes: 0 clean rate >= the floor and no errors; 1 a hard error or a
+ * clean rate below the floor.
  */
 import { generateContextFollowup } from "../services/contextFollowupGenerator";
 import type { FollowupContext } from "../services/followupPrompts";
@@ -31,7 +35,11 @@ import { isGeminiConfigured } from "../lib/gemini";
 import { logger } from "../lib/logger";
 
 const DEFAULT_LANGS = ["en", "de", "fr", "es", "ja", "ar", "hi", "ru", "tr", "pt-BR"];
-const DELTA_TOLERANCE_PCT = 15;
+// Absolute gate. The pre-migration cheap-vs-Sonnet runs recorded the exemplar-
+// less flow at 50% clean on the cheap writer vs 80% on Sonnet; the stronger
+// chain exists to close that gap, so the floor sits at the old Sonnet-era
+// neighbourhood minus one cell of noise on a 10-language sample.
+const MIN_CLEAN_PCT = 70;
 
 function buildCtx(lang: string): FollowupContext {
   return {
@@ -74,14 +82,7 @@ function parseArgs() {
 type Verdict = "PASS" | "FAIL" | "ERROR";
 interface Cell { lang: string; verdict: Verdict; issues: string[] }
 
-async function runConfig(config: "cheap" | "sonnet", langs: string[]): Promise<Cell[]> {
-  if (config === "sonnet") {
-    process.env.WRITER_PROVIDER = "anthropic";
-    process.env.CRITIC_PROVIDER = "anthropic";
-  } else {
-    delete process.env.WRITER_PROVIDER; // default -> gemini
-    process.env.CRITIC_PROVIDER = "gemini"; // default cheap critic
-  }
+async function runAll(langs: string[]): Promise<Cell[]> {
   const out: Cell[] = [];
   for (const lang of langs) {
     const ctx = buildCtx(lang);
@@ -89,10 +90,10 @@ async function runConfig(config: "cheap" | "sonnet", langs: string[]): Promise<C
       const res = await generateContextFollowup(ctx);
       const lint = lintBody(res.body, ctx);
       out.push({ lang, verdict: lint.pass ? "PASS" : "FAIL", issues: lint.issues });
-      console.log(`  ${config.padEnd(6)} ${lang.padEnd(6)} ${lint.pass ? "PASS" : "FAIL"}${lint.issues.length ? `  ${lint.issues.join(" | ")}` : ""}`);
+      console.log(`  ${lang.padEnd(6)} ${lint.pass ? "PASS" : "FAIL"}${lint.issues.length ? `  ${lint.issues.join(" | ")}` : ""}`);
     } catch (err) {
       out.push({ lang, verdict: "ERROR", issues: [err instanceof Error ? err.message : String(err)] });
-      console.log(`  ${config.padEnd(6)} ${lang.padEnd(6)} ERROR  ${err instanceof Error ? err.message : String(err)}`);
+      console.log(`  ${lang.padEnd(6)} ERROR  ${err instanceof Error ? err.message : String(err)}`);
     }
   }
   return out;
@@ -112,31 +113,24 @@ async function main() {
     console.error("GEMINI_API_KEY is not set — cannot exercise the cheap chain. Aborting.");
     process.exit(1);
   }
-  console.log(`\nContext-flow cheap-chain smoke — ${langs.length} languages, real generateContextFollowup end-to-end\n`);
+  console.log(`\nContext-flow ship-clean smoke — ${langs.length} languages, real generateContextFollowup end-to-end\n`);
 
-  console.log("CHEAP (Gemini Flash writer + Gemini critic, Sonnet fallbacks):");
-  const cheap = await runConfig("cheap", langs);
-  console.log("\nSONNET baseline (WRITER_PROVIDER=anthropic + CRITIC_PROVIDER=anthropic):");
-  const sonnet = await runConfig("sonnet", langs);
+  const cells = await runAll(langs);
 
-  const c = cleanRate(cheap);
-  const s = cleanRate(sonnet);
-  const delta = s.pct - c.pct; // positive => Sonnet cleaner => cheap costs quality
-  const errs = [...cheap, ...sonnet].filter((x) => x.verdict === "ERROR");
+  const c = cleanRate(cells);
+  const errs = cells.filter((x) => x.verdict === "ERROR");
 
   console.log(`\n${"-".repeat(60)}`);
-  console.log(`CHEAP  clean: ${c.clean}/${c.graded}  (${c.pct.toFixed(1)}%)`);
-  console.log(`SONNET clean: ${s.clean}/${s.graded}  (${s.pct.toFixed(1)}%)`);
-  console.log(`delta (Sonnet - cheap): ${delta.toFixed(1)} pts   tolerance: ${DELTA_TOLERANCE_PCT} pts`);
+  console.log(`clean: ${c.clean}/${c.graded}  (${c.pct.toFixed(1)}%)   floor: ${MIN_CLEAN_PCT}%`);
   if (errs.length) console.log(`errors: ${errs.map((e) => e.lang).join(", ")}`);
 
   const hardError = errs.length > 0;
-  const qualityRisk = delta > DELTA_TOLERANCE_PCT;
+  const qualityRisk = c.pct < MIN_CLEAN_PCT;
   const verdict = hardError
     ? "SMOKE FAIL (errors)"
     : qualityRisk
-    ? `SMOKE FAIL — cheap ${delta.toFixed(1)} pts worse than Sonnet`
-    : `SMOKE PASS — cheap chain holds context-flow quality (within ${DELTA_TOLERANCE_PCT} pts)`;
+    ? `SMOKE FAIL — clean rate ${c.pct.toFixed(1)}% is below the ${MIN_CLEAN_PCT}% floor`
+    : `SMOKE PASS — context flow ships clean (${c.clean}/${c.graded})`;
   console.log(`\n${verdict}\n`);
   process.exit(hardError || qualityRisk ? 1 : 0);
 }

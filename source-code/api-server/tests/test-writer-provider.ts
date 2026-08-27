@@ -1,9 +1,13 @@
 /**
  * test-writer-provider.ts
  *
- * Hermetic tests for the writer fallback chain and its two inputs. No DB, no
- * network, no billing: the Gemini transport, usage recorder, and breakers are
- * injected as fakes, and the grey-area / exemplar logic is pure.
+ * Hermetic tests for the writer stage's two pure inputs — grey-area routing and
+ * the exemplar library — and for the role mapping that turns them into a chain
+ * choice. No DB, no network, no billing.
+ *
+ * The fallback WATERFALL itself is tested in test-llm-router.ts, which is where
+ * it now lives: writerProvider is a ~130-line adapter over lib/llmRouter.ts, and
+ * testing the chain walk here would be testing the router twice.
  *
  * Run: pnpm --filter @workspace/api-server exec tsx --test src/tests/test-writer-provider.ts
  */
@@ -16,14 +20,8 @@ import {
   buildWriterExemplarBlock,
   exemplarsEnabled,
 } from "../lib/exemplarLibrary";
-import {
-  planWriterChain,
-  runWriter,
-  type WriterDeps,
-  type WriterResult,
-  type AnthropicWriterFn,
-} from "../services/writerProvider";
-import { createCircuitBreaker } from "../lib/circuitBreaker";
+import { writerRole, getPrimaryWriterModel } from "../services/writerProvider";
+import { getChain, describeChain, isAnthropicModel } from "../lib/modelPolicy";
 
 // ----------------------------- grey-area --------------------------------
 
@@ -132,230 +130,76 @@ test.describe("exemplarLibrary", () => {
   });
 });
 
-// --------------------------- chain planning -----------------------------
+// --------------------------- role selection -----------------------------
 
-test.describe("planWriterChain", () => {
-  test.it("returns Flash then Sonnet for an ordinary gemini-mode draft by default", () => {
-    assert.deepEqual(
-      planWriterChain({ provider: "gemini", greyArea: false, geminiConfigured: true }),
-      ["gemini_primary", "anthropic"],
-    );
+test.describe("writerRole", () => {
+  test.it("maps stage x grey-area onto the four writer roles", () => {
+    assert.equal(writerRole("draft", false), "draft");
+    assert.equal(writerRole("rewriter", false), "rewriter");
+    assert.equal(writerRole("draft", true), "grey_draft");
+    assert.equal(writerRole("rewriter", true), "grey_rewriter");
   });
-  test.it("inserts Gemini Pro when the secondary tier is enabled", () => {
-    assert.deepEqual(
-      planWriterChain({ provider: "gemini", greyArea: false, geminiConfigured: true, secondaryEnabled: true }),
-      ["gemini_primary", "gemini_secondary", "anthropic"],
-    );
+
+  test.it("gives grey-area verticals a genuinely different chain", () => {
+    // The whole reason grey-area is a separate ROLE rather than a boolean
+    // inside the chain walk. If these two ever resolve to the same chain, the
+    // regulated-vertical policy has silently evaporated.
+    const ordinary = describeChain(getChain("draft"));
+    const grey = describeChain(getChain("grey_draft"));
+    assert.notEqual(ordinary, grey);
   });
-  test.it("collapses to Sonnet for grey-area", () => {
-    assert.deepEqual(
-      planWriterChain({ provider: "gemini", greyArea: true, geminiConfigured: true }),
-      ["anthropic"],
-    );
+
+  test.it("starts grey-area on a stronger tier than the ordinary chain", () => {
+    // Regulated verticals used to be pinned to Sonnet. The replacement policy is
+    // "start at the strongest tier, not the cheapest", so tier 1 of the grey
+    // chain must not be the cheap primary the ordinary chain opens with.
+    assert.notEqual(getChain("grey_draft")[0].model, getChain("draft")[0].model);
   });
-  test.it("collapses to Sonnet for the anthropic escape hatch", () => {
-    assert.deepEqual(
-      planWriterChain({ provider: "anthropic", greyArea: false, geminiConfigured: true }),
-      ["anthropic"],
-    );
-  });
-  test.it("collapses to Sonnet when Gemini is not configured", () => {
-    assert.deepEqual(
-      planWriterChain({ provider: "gemini", greyArea: false, geminiConfigured: false }),
-      ["anthropic"],
-    );
+
+  test.it("reports the live primary writer model rather than a frozen copy", () => {
+    assert.equal(getPrimaryWriterModel(), getChain("draft")[0].model);
   });
 });
 
-// --------------------------- runWriter chain ----------------------------
+// --------------------------- chain invariants ---------------------------
 
-const silentLogger = { info: () => {}, warn: () => {} };
+test.describe("writer chains", () => {
+  const WRITER_ROLES = [
+    "draft",
+    "rewriter",
+    "grey_draft",
+    "grey_rewriter",
+    "context_draft",
+    "context_rewriter",
+    "ag_draft",
+    "ag_rewriter",
+  ] as const;
 
-// Gemini Pro is opt-in. These helpers enable it for the tests that exercise the
-// Pro tier mechanics, and restore the prior value even if an assertion throws.
-async function withSecondaryOn(fn: () => Promise<void>): Promise<void> {
-  const prev = process.env.WRITER_GEMINI_SECONDARY;
-  process.env.WRITER_GEMINI_SECONDARY = "on";
-  try {
-    await fn();
-  } finally {
-    if (prev === undefined) delete process.env.WRITER_GEMINI_SECONDARY;
-    else process.env.WRITER_GEMINI_SECONDARY = prev;
+  for (const role of WRITER_ROLES) {
+    test.it(`${role}: has a real fallback and never depends on one model`, () => {
+      const chain = getChain(role);
+      assert.ok(chain.length >= 2, `${role} has only ${chain.length} tier(s): ${describeChain(chain)}`);
+    });
+
+    test.it(`${role}: spans both vendors`, () => {
+      // A chain built only from one vendor's models shares one quota pool and
+      // one control plane, so a vendor-side incident empties it all at once.
+      const vendors = new Set(getChain(role).map((t) => t.provider));
+      assert.ok(vendors.size >= 2, `${role} uses only ${[...vendors].join(",")}`);
+    });
+
+    test.it(`${role}: names no Anthropic model`, () => {
+      assert.ok(!getChain(role).some((t) => isAnthropicModel(t.model)));
+    });
   }
-}
 
-function freshDeps(over: Partial<WriterDeps>): Partial<WriterDeps> {
-  return {
-    isGeminiConfigured: () => true,
-    recordGeminiUsage: async () => {},
-    primaryBreaker: createCircuitBreaker({ failureThreshold: 3, cooldownMs: 60_000 }),
-    secondaryBreaker: createCircuitBreaker({ failureThreshold: 3, cooldownMs: 60_000 }),
-    logger: silentLogger,
-    ...over,
-  };
-}
-
-const baseArgs = {
-  label: "draft" as const,
-  greyArea: false,
-  systemParts: ["clause", "role"],
-  userPrompt: "write it",
-  maxOutputTokens: 1000,
-  prospectName: "Test",
-};
-
-function sonnet(): AnthropicWriterFn {
-  return async (): Promise<WriterResult> => ({
-    subject: "Re: x",
-    body: "sonnet body",
-    modelUsed: "claude-sonnet-4-6",
-    tier: "anthropic",
-  });
-}
-
-test.describe("runWriter fallback chain", () => {
-  test.it("uses Gemini primary when it succeeds and records usage once", async () => {
-    let recorded = 0;
-    const deps = freshDeps({
-      geminiGenerateJson: async () => ({
-        text: JSON.stringify({ subject: "Re: a", body: "flash body" }),
-        usage: { totalTokenCount: 10 },
-        model: "gemini-3.1-flash-lite",
-      }),
-      recordGeminiUsage: async () => { recorded++; },
-    });
-    const res = await runWriter(baseArgs, sonnet(), deps);
-    assert.equal(res.tier, "gemini_primary");
-    assert.equal(res.body, "flash body");
-    assert.equal(recorded, 1);
-  });
-
-  test.it("skips Gemini Pro by default and falls to Sonnet when primary fails", async () => {
-    let calls = 0;
-    const deps = freshDeps({
-      geminiGenerateJson: async () => {
-        calls++;
-        throw new Error("Gemini HTTP 429: RESOURCE_EXHAUSTED");
-      },
-    });
-    const res = await runWriter(baseArgs, sonnet(), deps);
-    assert.equal(res.tier, "anthropic");
-    assert.equal(res.body, "sonnet body");
-    assert.equal(calls, 1); // only Flash is tried, then Sonnet
-  });
-
-  test.it("advances to Gemini Pro when primary is at capacity", async () => {
-    await withSecondaryOn(async () => {
-      let calls = 0;
-      const deps = freshDeps({
-        geminiGenerateJson: async (a: { model?: string }) => {
-          calls++;
-          if (a.model === "gemini-3.1-flash-lite") {
-            throw new Error("Gemini HTTP 429: RESOURCE_EXHAUSTED");
-          }
-          return { text: JSON.stringify({ subject: "Re: b", body: "pro body" }), usage: {}, model: a.model || "?" };
-        },
-      });
-      const res = await runWriter(baseArgs, sonnet(), deps);
-      assert.equal(res.tier, "gemini_secondary");
-      assert.equal(res.body, "pro body");
-      assert.equal(calls, 2);
-    });
-  });
-
-  test.it("falls through to Sonnet when both Gemini tiers fail", async () => {
-    await withSecondaryOn(async () => {
-      const deps = freshDeps({
-        geminiGenerateJson: async () => { throw new Error("Gemini HTTP 503: UNAVAILABLE"); },
-      });
-      const res = await runWriter(baseArgs, sonnet(), deps);
-      assert.equal(res.tier, "anthropic");
-      assert.equal(res.body, "sonnet body");
-    });
-  });
-
-  test.it("never calls Gemini for grey-area drafts", async () => {
-    let geminiCalled = false;
-    const deps = freshDeps({
-      geminiGenerateJson: async () => { geminiCalled = true; throw new Error("should not be called"); },
-    });
-    const res = await runWriter({ ...baseArgs, greyArea: true }, sonnet(), deps);
-    assert.equal(res.tier, "anthropic");
-    assert.equal(geminiCalled, false);
-  });
-
-  test.it("skips a tier whose breaker is open", async () => {
-    await withSecondaryOn(async () => {
-      const openBreaker = {
-        shouldAttempt: () => false,
-        onSuccess: () => {},
-        onFailure: () => {},
-        state: () => ({ open: true, consecutiveFailures: 9, openUntil: Date.now() + 1000 }),
-      };
-      let model = "";
-      const deps = freshDeps({
-        primaryBreaker: openBreaker,
-        geminiGenerateJson: async (a: { model?: string }) => {
-          model = a.model || "";
-          return { text: JSON.stringify({ subject: "Re: c", body: "pro body" }), usage: {}, model: a.model || "?" };
-        },
-      });
-      const res = await runWriter(baseArgs, sonnet(), deps);
-      assert.equal(res.tier, "gemini_secondary");
-      assert.equal(model, "gemini-3.1-pro-preview");
-    });
-  });
-
-  test.it("advances on a malformed Gemini JSON response", async () => {
-    await withSecondaryOn(async () => {
-      const deps = freshDeps({
-        geminiGenerateJson: async (a: { model?: string }) => {
-          if (a.model === "gemini-3.1-flash-lite") return { text: "not json at all", usage: {}, model: a.model };
-          return { text: JSON.stringify({ subject: "Re: d", body: "pro body" }), usage: {}, model: a.model || "?" };
-        },
-      });
-      const res = await runWriter(baseArgs, sonnet(), deps);
-      assert.equal(res.tier, "gemini_secondary");
-    });
-  });
-
-  test.it("uses the first JSON object when Gemini appends trailing content", async () => {
-    // Observed Gemini Pro behavior: a valid object followed by a second object
-    // or trailing notes. The parser must take the first complete object and
-    // succeed on that tier rather than discarding the draft.
-    const deps = freshDeps({
-      geminiGenerateJson: async (a: { model?: string }) => ({
-        text:
-          JSON.stringify({ subject: "Re: e", body: "first body with a } brace inside" }) +
-          "\n" +
-          JSON.stringify({ subject: "second", body: "trailing object" }),
-        usage: {},
-        model: a.model || "gemini-3.1-flash-lite",
-      }),
-    });
-    const res = await runWriter(baseArgs, sonnet(), deps);
-    assert.equal(res.tier, "gemini_primary");
-    assert.equal(res.subject, "Re: e");
-    assert.equal(res.body, "first body with a } brace inside");
-  });
-
-  test.it("passes a response schema and MINIMAL thinking to Gemini primary", async () => {
-    let seen: { responseSchema?: unknown; thinkingLevel?: unknown } = {};
-    const savedPrimary = process.env.GEMINI_WRITER_PRIMARY_THINKING;
-    const savedShared = process.env.GEMINI_WRITER_THINKING;
-    delete process.env.GEMINI_WRITER_PRIMARY_THINKING;
-    delete process.env.GEMINI_WRITER_THINKING;
-    const deps = freshDeps({
-      geminiGenerateJson: async (a: { responseSchema?: unknown; thinkingLevel?: unknown; model?: string }) => {
-        seen = { responseSchema: a.responseSchema, thinkingLevel: a.thinkingLevel };
-        return { text: JSON.stringify({ subject: "Re: s", body: "schema body" }), usage: {}, model: a.model || "gemini-3.1-flash-lite" };
-      },
-    });
-    const res = await runWriter(baseArgs, sonnet(), deps);
-    assert.equal(res.tier, "gemini_primary");
-    assert.ok(seen.responseSchema, "writer must pass a response schema to Gemini");
-    assert.equal(seen.thinkingLevel, "MINIMAL");
-    if (savedPrimary !== undefined) process.env.GEMINI_WRITER_PRIMARY_THINKING = savedPrimary;
-    if (savedShared !== undefined) process.env.GEMINI_WRITER_THINKING = savedShared;
+  test.it("the two exemplar-less flows share one chain, and it is not the doctrine chain", () => {
+    // Context and anti-ghosting both lack an exemplar library, which is the
+    // measured reason they start a tier up. If either drifts back onto the
+    // doctrine chain, the nativeness regression that motivated the split comes
+    // back with it.
+    const ctxChain = describeChain(getChain("context_draft"));
+    assert.equal(ctxChain, describeChain(getChain("ag_draft")));
+    assert.notEqual(ctxChain, describeChain(getChain("draft")));
   });
 });

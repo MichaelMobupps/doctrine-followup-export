@@ -1,5 +1,13 @@
 /**
- * Retry helper for Anthropic API calls.
+ * RETIRED — retry helper for Anthropic API calls.
+ *
+ * Aug 2026: no production path calls Anthropic any more (see
+ * lib/modelPolicy.ts); retries for the live vendors are built into
+ * lib/gemini.ts and lib/openai.ts, and the waterfall in lib/llmRouter.ts sits
+ * above them. This module is kept solely for the archived Anthropic-era
+ * harnesses (src/scripts/archive-anthropic-era/), which still import it, and
+ * tests/test-no-anthropic-on-production-paths.ts asserts it stays unreachable
+ * from index.ts.
  *
  * Design goals:
  * - Treat transient failures (5xx, 429, timeouts, connection resets) as

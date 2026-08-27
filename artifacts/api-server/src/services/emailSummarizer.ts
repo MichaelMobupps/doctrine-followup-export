@@ -7,13 +7,9 @@
  * without being tempted to reproduce the original pitch verbatim.
  */
 
-import { anthropic, MODEL_SUMMARIZER } from "../lib/anthropic";
-import { withAnthropicRetry } from "./anthropicRetry";
 import { logger } from "../lib/logger";
-import { recordAuxUsageBestEffort, recordGeminiAuxUsageBestEffort } from "../lib/usageTracker";
 import { wrapUntrusted, UNTRUSTED_DATA_SYSTEM_CLAUSE } from "../lib/promptInjection";
-import { geminiGenerateJson, isGeminiConfigured } from "../lib/gemini";
-import { createCircuitBreaker } from "../lib/circuitBreaker";
+import { runLlmJson, type LlmJsonSchema } from "../lib/llmRouter";
 
 const SUMMARIZE_SYSTEM = `You are a topic extractor. Given a cold outreach email body, extract the SHORT TOPIC the email was about, suitable for a follow-up reference like "following up on my email about [TOPIC]".
 
@@ -35,31 +31,15 @@ export interface SummarizeResult {
   language: string;
 }
 
-// Provider switch for the summarizer, mirroring the writer/critic switches.
-// Gemini (flash-lite) is the default: summarization is an easy extract-topic
-// task and the heavy sanitizeSummary pass repairs the rest, so the cheapest tier
-// holds quality at a fraction of Sonnet's cost. SUMMARIZER_PROVIDER=anthropic
-// forces the in-house Sonnet summarizer; a missing GEMINI_API_KEY also uses it.
-function getSummarizerProvider(): "anthropic" | "gemini" {
-  return (process.env.SUMMARIZER_PROVIDER || "gemini").toLowerCase() === "anthropic" ? "anthropic" : "gemini";
-}
-function getSummarizerGeminiModel(): string {
-  return process.env.GEMINI_SUMMARIZER_MODEL || "gemini-3.1-flash-lite";
-}
-
-// {summary, language} response schema so the Gemini summarizer cannot emit
-// malformed JSON.
-const SUMMARIZER_SCHEMA: Record<string, unknown> = {
-  type: "OBJECT",
-  properties: { summary: { type: "STRING" }, language: { type: "STRING" } },
+// {summary, language} output contract. Both vendors are constrained to it —
+// Gemini through responseSchema, OpenAI through strict json_schema — so a tier
+// cannot emit malformed JSON, and the router falls to the next tier if one
+// somehow does.
+const SUMMARIZER_SCHEMA: LlmJsonSchema = {
+  name: "email_summary",
+  properties: { summary: "string", language: "string" },
   required: ["summary", "language"],
-  propertyOrdering: ["summary", "language"],
 };
-
-// Per-process circuit breaker for the Gemini summarizer, same thresholds as the
-// writer/critic breakers: after a short run of failures it opens and every call
-// routes straight to Sonnet for a cooldown.
-const summarizerBreaker = createCircuitBreaker({ failureThreshold: 3, cooldownMs: 60_000 });
 
 function detectLanguageFallback(text: string): string {
   const sample = text.slice(0, 500);
@@ -217,24 +197,36 @@ export function resanitizeStoredSummary(summary: string): string {
   return sanitizeSummary(summary);
 }
 
-// Parse a summarizer model's raw output into a sanitized SummarizeResult, or
-// null when the output is unusable (too short / no summary field). Shared by the
-// Gemini and Sonnet paths so both apply the identical parse + sanitize rules.
-function parseSummarizerOutput(text: string, body: string): SummarizeResult | null {
-  if (!text || text.trim().length <= 10) return null;
-  const raw = text.replace(/```json\s*|```/g, "").trim();
-  try {
-    const parsed = JSON.parse(raw);
-    if (parsed.summary && parsed.language) {
-      return { summary: sanitizeSummary(parsed.summary), language: String(parsed.language).trim().toLowerCase() };
-    }
-    if (typeof parsed === "string" || parsed.summary) {
-      return { summary: sanitizeSummary(parsed.summary || text), language: detectLanguageFallback(body) };
-    }
-    return null;
-  } catch {
-    return { summary: sanitizeSummary(text), language: detectLanguageFallback(body) };
+/**
+ * Turn a summarizer model's parsed answer into a sanitized SummarizeResult, or
+ * null when it is unusable.
+ *
+ * The router has already parsed the JSON (and already fell to the next tier if
+ * it could not), so this handles the shapes that ARE valid JSON but are not the
+ * agreed object: a summary with no language, or a bare string. Both are salvaged
+ * with the deterministic language detector rather than thrown away, because a
+ * usable summary in the wrong-labelled language is far better for the writer
+ * than no summary at all.
+ *
+ * Every tier goes through it, so the sanitize rules are identical whichever
+ * vendor answered — which is the point. sanitizeSummary is what keeps the
+ * cheapest tier's output at the same bar as an expensive one's.
+ */
+function coerceSummarizerOutput(parsed: unknown, body: string): SummarizeResult | null {
+  if (typeof parsed === "string") {
+    const summary = sanitizeSummary(parsed);
+    return summary.trim() ? { summary, language: detectLanguageFallback(body) } : null;
   }
+  if (!parsed || typeof parsed !== "object") return null;
+  const p = parsed as { summary?: unknown; language?: unknown };
+  if (typeof p.summary !== "string" || !p.summary.trim()) return null;
+  const summary = sanitizeSummary(p.summary);
+  if (!summary.trim()) return null;
+  const language =
+    typeof p.language === "string" && p.language.trim()
+      ? p.language.trim().toLowerCase()
+      : detectLanguageFallback(body);
+  return { summary, language };
 }
 
 export async function summarizeOriginalEmail(body: string): Promise<SummarizeResult> {
@@ -244,62 +236,39 @@ export async function summarizeOriginalEmail(body: string): Promise<SummarizeRes
 
   const userBlock = wrapUntrusted("EMAIL_BODY", body.slice(0, 1000)).block;
 
-  // Cheap path: Gemini flash-lite with a Sonnet fallback. Guarded by a breaker so
-  // a Gemini outage routes straight to Sonnet for the cooldown instead of paying
-  // Gemini's retry latency on every ingest.
-  if (getSummarizerProvider() === "gemini" && isGeminiConfigured() && summarizerBreaker.shouldAttempt()) {
-    try {
-      const res = await geminiGenerateJson({
-        systemParts: [UNTRUSTED_DATA_SYSTEM_CLAUSE, SUMMARIZE_SYSTEM],
-        user: userBlock,
-        maxOutputTokens: 300,
-        model: getSummarizerGeminiModel(),
-        thinkingLevel: "MINIMAL",
-        responseSchema: SUMMARIZER_SCHEMA,
-      });
-      // Best-effort aux cost record (ingest has no usage context).
-      void recordGeminiAuxUsageBestEffort(res.usage, res.model, "email_summary", "email_summary");
-      const parsed = parseSummarizerOutput(res.text, body);
-      if (parsed) {
-        summarizerBreaker.onSuccess();
-        return parsed;
-      }
-      // Unusable Gemini output — treat as a soft failure and fall to Sonnet.
-      throw new Error("Gemini summarizer output unusable");
-    } catch (err) {
-      summarizerBreaker.onFailure();
-      logger.warn(
-        { err: String(err), model: getSummarizerGeminiModel(), breaker: summarizerBreaker.state() },
-        "Gemini summarizer failed — falling back to Sonnet",
-      );
-      // fall through to the Sonnet path
-    }
-  }
-
+  // Summarization is an easy extract-the-topic task with a heavy deterministic
+  // sanitizer (sanitizeSummary) behind it, so the summarizer chain is the
+  // cheapest in the product. The router walks it, retries inside a tier, and
+  // moves on to the next tier on a 429/503/timeout or an unusable answer.
   try {
-    const response = await withAnthropicRetry(
-      () => anthropic.messages.create({
-        model: MODEL_SUMMARIZER,
-        max_tokens: 300,
-        system: `${UNTRUSTED_DATA_SYSTEM_CLAUSE}\n\n${SUMMARIZE_SYSTEM}`,
-        messages: [{ role: "user", content: userBlock }],
-      }),
-      { label: "summarizer" },
-    );
-
-    // Count this auxiliary LLM call toward tool-wide spend (best-effort,
-    // fire-and-forget). Never gates reply handling.
-    void recordAuxUsageBestEffort(response, "email_summary", "email_summary");
-
-    const textBlock = response.content.find((b) => b.type === "text");
-    if (textBlock && textBlock.type === "text") {
-      const parsed = parseSummarizerOutput(textBlock.text, body);
-      if (parsed) return parsed;
-    }
+    const { value } = await runLlmJson<SummarizeResult>({
+      role: "summarizer",
+      systemParts: [UNTRUSTED_DATA_SYSTEM_CLAUSE, SUMMARIZE_SYSTEM],
+      user: userBlock,
+      maxOutputTokens: 300,
+      schema: SUMMARIZER_SCHEMA,
+      // Ingest runs outside a generation, so there is no usage context to
+      // attribute to. The aux sink still lands the cost on the shared ledger,
+      // which is what the daily budget cap reads.
+      usage: { kind: "aux", app: "email_summary", label: "email_summary" },
+      validate: (parsed) => {
+        // coerceSummarizerOutput owns the messy-but-valid shapes (a bare string,
+        // a summary with no language) and the meta-language sanitize pass. It
+        // returns null when the answer is unusable, which we turn into a throw
+        // so the router treats it as a tier failure rather than a result.
+        const result = coerceSummarizerOutput(parsed, body);
+        if (!result) throw new Error("summarizer output unusable");
+        return result;
+      },
+    });
+    return value;
   } catch (err) {
-    logger.warn({ err }, "Email summarization failed, using truncated body");
+    logger.warn({ err: String(err) }, "Email summarization failed on every tier, using truncated body");
   }
 
+  // Last resort, unchanged: a truncated body is a poor topic line but it is
+  // real text in the right language, and the follow-up writer degrades far
+  // better with a weak summary than with none.
   const summary = body.slice(0, 200).trim() + (body.length > 200 ? "..." : "");
   return { summary: sanitizeSummary(summary), language: detectLanguageFallback(body) };
 }

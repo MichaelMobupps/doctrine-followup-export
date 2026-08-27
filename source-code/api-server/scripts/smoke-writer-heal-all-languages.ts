@@ -1,22 +1,29 @@
 /**
  * smoke-writer-heal-all-languages.ts — does the production HEAL LOOP ship clean?
  *
- * The draft-only smoke (smoke-writer-all-languages.ts) measures the writer's
- * FIRST-DRAFT quality. Production does not ship the first draft: it runs a
- * 2-iteration healing loop (generateFollowup in services/followupGenerator.ts)
- * that, on any deterministic doctrine/nativeness violation, feeds the findings
- * to the rewriter and tries again. This smoke replicates that exact loop so you
- * can see what actually ships:
+ * The draft-only bench (scripts/bench-llm-quality.ts) measures FIRST-DRAFT
+ * quality. Production does not ship the first draft: it runs a 2-iteration
+ * healing loop (generateFollowupEmail in services/followupGenerator.ts) that, on
+ * any deterministic doctrine/nativeness violation, feeds the findings to the
+ * rewriter and tries again. This smoke replicates that exact loop so you can see
+ * what actually ships:
  *
- *   draft (Sonnet)
+ *   draft   (the `draft` role's waterfall — lib/modelPolicy.ts)
  *     -> lint  (detectAllDeterministicViolations + detectStructuralViolations)
  *     -> if clean: done
- *     -> else: rewrite (Sonnet) with the findings as feedback, re-lint
+ *     -> else: rewrite (the `rewriter` role's waterfall) with the findings as
+ *              feedback, re-lint
  *   up to maxHealingIterations = 2, matching production.
  *
- * It uses Sonnet for both draft and rewrite — production's final writer tier —
- * and the IDENTICAL lint gate the draft smoke used, so the "first draft" column
- * here lines up with that run, and the "final" column shows the heal result.
+ * THIS IS THE NUMBER THAT MATTERS for a model-chain decision. First-draft clean
+ * rate is a leading indicator; SHIPS-CLEAN rate is the outcome, and TOTAL cost
+ * per shipped email is the price — a cheaper draft that heals twice is not
+ * cheaper. Run it before and after any change to a writer chain.
+ *
+ * Aug 2026: ported off the Sonnet writer onto the production waterfalls, so the
+ * models it exercises are exactly the models production uses. Cost is computed
+ * from lib/pricing.ts against whichever tier actually served, rather than from a
+ * hardcoded Sonnet rate card.
  *
  * Note: production's heal gate is slightly broader (it also runs competitor-
  * script, meta-language and ungrounded-number checks). Using the narrower gate
@@ -29,13 +36,19 @@
  * RUN (from artifacts/api-server):
  *   node --import tsx src/scripts/smoke-writer-heal-all-languages.ts
  *   node --import tsx src/scripts/smoke-writer-heal-all-languages.ts --langs de,fr,it,tr,sv --max-usd 4
+ *   node --import tsx src/scripts/smoke-writer-heal-all-languages.ts --baseline-model claude-sonnet-4-6
+ *
+ * --baseline-model (default claude-sonnet-4-6) re-prices the run's OWN observed
+ * token counts under that model's rate card, so the summary answers "what did
+ * the migration save?" on identical prompts and identical call counts.
  *
  * Exit codes: 0 every cell ships clean after healing; 1 at least one cell STILL
  * violates after 2 rewrites (a genuine ship risk); 2 incomplete (cost cap).
  */
 import { writeFileSync } from "node:fs";
-import { anthropic, MODEL_DRAFT_GENERATOR, MODEL_REWRITER, cachedSystem } from "../lib/anthropic";
-import { withAnthropicRetry } from "../services/anthropicRetry";
+import { runLlmDraft } from "../lib/llmRouter";
+import { computeCostUsd } from "../lib/pricing";
+import { describeChain, getChain } from "../lib/modelPolicy";
 import {
   getFollowupSystemPrompt,
   getFollowupUserPrompt,
@@ -121,25 +134,50 @@ function studyBlockFor(ctx: FollowupContext): string {
   return [comp, ex].filter((b) => b.length > 0).join("\n\n");
 }
 
-function parseSubjectBody(raw: string): { subject: string; body: string } {
-  const cleaned = raw.replace(/```json\s*|```/g, "").trim();
-  const parsed = JSON.parse(cleaned);
-  if (!parsed.subject || !parsed.body) throw new Error("missing subject or body");
-  return { subject: String(parsed.subject), body: String(parsed.body) };
-}
-
-async function sonnet(model: string, system: ReturnType<typeof cachedSystem>, user: string, label: string) {
-  const resp = await withAnthropicRetry(
-    () => anthropic.messages.create({ model, max_tokens: 8192, system, messages: [{ role: "user", content: user }] }),
-    { label },
-  );
-  const usage: any = (resp as any).usage ?? {};
-  const tb = resp.content.find((b) => b.type === "text");
-  if (!tb || tb.type !== "text") throw new Error("no text block");
-  return { draft: parseSubjectBody(tb.text), usage };
-}
-function estCostUsd(u: any): number {
-  return (u?.input_tokens ?? 0) / 1e6 * 3 + (u?.output_tokens ?? 0) / 1e6 * 15 + (u?.cache_read_input_tokens ?? 0) / 1e6 * 0.3 + (u?.cache_creation_input_tokens ?? 0) / 1e6 * 6;
+/**
+ * One writer call through the production waterfall.
+ *
+ * `usage: {kind:"none"}` keeps this out of the followup_usage ledger — the smoke
+ * must not pollute production spend reporting or the daily budget cap — so cost
+ * is computed here from the same pricing table the ledger would have used.
+ */
+async function write(
+  role: "draft" | "rewriter",
+  systemParts: string[],
+  user: string,
+  baselineModel: string,
+): Promise<{
+  draft: { subject: string; body: string };
+  costUsd: number;
+  baselineUsd: number;
+  model: string;
+  tier: number;
+}> {
+  const { value, result } = await runLlmDraft({
+    role,
+    systemParts,
+    user,
+    maxOutputTokens: 8192,
+    usage: { kind: "none" },
+  });
+  const tokens = {
+    inputTokens: result.usage.inputTokens,
+    outputTokens: result.usage.outputTokens,
+    cacheCreationTokens: 0,
+    cacheReadTokens: result.usage.cachedInputTokens,
+  };
+  return {
+    draft: value,
+    costUsd: computeCostUsd(result.model, tokens),
+    // The SAME observed token counts, priced under another model's rate card.
+    // This is the honest apples-to-apples baseline: identical prompts, identical
+    // number of calls, only the price list differs. What it deliberately does
+    // NOT model is whether the baseline model would have needed fewer heal
+    // iterations — see the note printed with the summary.
+    baselineUsd: computeCostUsd(baselineModel, tokens),
+    model: result.model,
+    tier: result.tierIndex,
+  };
 }
 
 interface Result {
@@ -147,19 +185,28 @@ interface Result {
   firstClean: boolean; finalClean: boolean; iterations: number;
   status: "CLEAN-FIRST" | "HEALED" | "HUMANIZED" | "STILL-FAILING" | "ERROR" | "CAPPED";
   residual: string[]; subject: string; body: string; costUsd: number;
+  /** The same tokens priced under --baseline-model's rate card. */
+  baselineUsd: number;
+  /** Which concrete model served each call, with a (tN) marker when a fallback tier did. */
+  models: string[];
 }
 
-async function runCellHeal(lang: string, vertical: string, stage: number): Promise<Result> {
+async function runCellHeal(lang: string, vertical: string, stage: number, baselineModel: string): Promise<Result> {
   const ctx = buildCtx(lang, vertical, stage);
   const study = studyBlockFor(ctx);
-  const draftSystem = cachedSystem(UNTRUSTED_DATA_SYSTEM_CLAUSE, getFollowupSystemPrompt());
-  const rewriteSystem = cachedSystem(UNTRUSTED_DATA_SYSTEM_CLAUSE, getRewriterSystemPrompt());
+  const draftSystem = [UNTRUSTED_DATA_SYSTEM_CLAUSE, getFollowupSystemPrompt()];
+  const rewriteSystem = [UNTRUSTED_DATA_SYSTEM_CLAUSE, getRewriterSystemPrompt()];
   let cost = 0;
+  let baselineCost = 0;
+  const models: string[] = [];
   try {
     const base = getFollowupUserPrompt(ctx);
     const draftUser = study ? `${study}\n\n${base}` : base;
-    let { draft, usage } = await sonnet(MODEL_DRAFT_GENERATOR, draftSystem, draftUser, `heal:${lang}:${vertical}:draft`);
-    cost += estCostUsd(usage);
+    const first = await write("draft", draftSystem, draftUser, baselineModel);
+    let draft = first.draft;
+    cost += first.costUsd;
+    baselineCost += first.baselineUsd;
+    models.push(`draft=${first.model}${first.tier > 1 ? `(t${first.tier})` : ""}`);
 
     let report = lintFull(draft.body, ctx);
     const firstClean = !report.found;
@@ -169,8 +216,10 @@ async function runCellHeal(lang: string, vertical: string, stage: number): Promi
       iterations++;
       const rewriteBase = getRewriterUserPrompt(ctx, draft, { issues: report.issues, suggestions: report.suggestions });
       const rewriteUser = study ? `${study}\n\n${rewriteBase}` : rewriteBase;
-      const rw = await sonnet(MODEL_REWRITER, rewriteSystem, rewriteUser, `heal:${lang}:${vertical}:rw${iterations}`);
-      cost += estCostUsd(rw.usage);
+      const rw = await write("rewriter", rewriteSystem, rewriteUser, baselineModel);
+      cost += rw.costUsd;
+      baselineCost += rw.baselineUsd;
+      models.push(`rw${iterations}=${rw.model}${rw.tier > 1 ? `(t${rw.tier})` : ""}`);
       draft = rw.draft;
       report = lintFull(draft.body, ctx);
       if (!report.found) break;
@@ -191,9 +240,9 @@ async function runCellHeal(lang: string, vertical: string, stage: number): Promi
     else if (shipClean) status = "HUMANIZED"; // loop left a residual, humanizer cleared it
     else status = "STILL-FAILING";
 
-    return { lang, vertical, firstClean, finalClean: shipClean, iterations, status, residual: shipReport.issues.slice(0, 3), subject: draft.subject, body: shipBody, costUsd: cost };
+    return { lang, vertical, firstClean, finalClean: shipClean, iterations, status, residual: shipReport.issues.slice(0, 3), subject: draft.subject, body: shipBody, costUsd: cost, baselineUsd: baselineCost, models };
   } catch (err) {
-    return { lang, vertical, firstClean: false, finalClean: false, iterations: 0, status: "ERROR", residual: [err instanceof Error ? err.message : String(err)], subject: "", body: "", costUsd: cost };
+    return { lang, vertical, firstClean: false, finalClean: false, iterations: 0, status: "ERROR", residual: [err instanceof Error ? err.message : String(err)], subject: "", body: "", costUsd: cost, baselineUsd: baselineCost, models };
   }
 }
 
@@ -205,6 +254,10 @@ function parseArgs() {
     verticals: get("--verticals", "gaming_ua,cps").split(",").map((s) => s.trim()),
     stage: Number(get("--stage", "2")),
     maxUsd: Number(get("--max-usd", "8")),
+    // The rate card to compare against. Defaults to the Sonnet writer this
+    // pipeline ran on until Aug 2026, so the summary answers "what did the
+    // migration actually save?" without anyone doing arithmetic by hand.
+    baselineModel: get("--baseline-model", "claude-sonnet-4-6"),
     concurrency: Math.max(1, Number(get("--concurrency", "4"))),
   };
 }
@@ -224,8 +277,8 @@ async function main() {
     while (true) {
       const my = idx++;
       if (my >= cells.length) return;
-      if (spent >= opts.maxUsd) { results.push({ ...cells[my], firstClean: false, finalClean: false, iterations: 0, status: "CAPPED", residual: [], subject: "", body: "", costUsd: 0 }); capped = true; continue; }
-      const r = await runCellHeal(cells[my].lang, cells[my].vertical, opts.stage);
+      if (spent >= opts.maxUsd) { results.push({ ...cells[my], firstClean: false, finalClean: false, iterations: 0, status: "CAPPED", residual: [], subject: "", body: "", costUsd: 0, baselineUsd: 0, models: [] }); capped = true; continue; }
+      const r = await runCellHeal(cells[my].lang, cells[my].vertical, opts.stage, opts.baselineModel);
       spent += r.costUsd;
       results.push(r);
       const flag = NON_LATIN.has(r.lang) ? "*" : " ";
@@ -259,8 +312,39 @@ async function main() {
   console.log(`  SHIP CLEAN (all of the above): ${shipClean} / ${results.length}`);
   console.log(`  still failing after ${MAX_HEAL} rewrites + humanizer: ${stillFailing.length}   (genuine ship risks)`);
   if (errors) console.log(`  errors: ${errors}`);
-  console.log(`spend: $${spent.toFixed(4)} of $${opts.maxUsd} cap`);
-  console.log(`emails archived to emails-healed-${ts}.md (and emails-healed.md)`);
+  // ---- cost, and what the same work would have cost on the old rate card ----
+  const baselineSpent = results.reduce((sum, r) => sum + r.baselineUsd, 0);
+  const perShipped = shipClean ? spent / shipClean : 0;
+  const baselinePerShipped = shipClean ? baselineSpent / shipClean : 0;
+  const savedPct = baselineSpent > 0 ? (1 - spent / baselineSpent) * 100 : 0;
+
+  console.log(`\nspend:                 $${spent.toFixed(4)} of $${opts.maxUsd} cap`);
+  console.log(`  per SHIPPED email:   $${perShipped.toFixed(6)}`);
+  console.log(`  same tokens on ${opts.baselineModel}: $${baselineSpent.toFixed(4)}  ($${baselinePerShipped.toFixed(6)} per shipped email)`);
+  console.log(`  => ${savedPct.toFixed(1)}% cheaper than the ${opts.baselineModel} rate card`);
+  console.log(
+    `  (identical prompts and identical call counts, only the price list differs.\n` +
+    `   It does NOT model whether ${opts.baselineModel} would have needed fewer\n` +
+    `   heal iterations — compare the SHIP CLEAN line against that model's own run.)`,
+  );
+
+  // Which tiers actually served, so a run that quietly fell onto a dearer tier
+  // is visible in the cost line rather than only in the logs.
+  const tierCounts = new Map<string, number>();
+  for (const r of results) {
+    for (const m of r.models) {
+      const model = m.split("=")[1] ?? m;
+      tierCounts.set(model, (tierCounts.get(model) ?? 0) + 1);
+    }
+  }
+  if (tierCounts.size) {
+    console.log(`\nmodels that served:`);
+    for (const [model, n] of [...tierCounts.entries()].sort((a, b) => b[1] - a[1])) {
+      console.log(`  ${String(n).padStart(4)}  ${model}`);
+    }
+  }
+
+  console.log(`\nemails archived to emails-healed-${ts}.md (and emails-healed.md)`);
   if (stillFailing.length) {
     console.log(`\nstill failing (read these in emails-healed.md):`);
     for (const r of stillFailing) console.log(`  ${r.lang}/${r.vertical}: ${r.residual.join(" | ")}`);

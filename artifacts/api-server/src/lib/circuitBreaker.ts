@@ -1,10 +1,10 @@
 // circuitBreaker.ts — a tiny, pure circuit breaker.
 //
-// Used to stop hammering an upstream (the Gemini critic) while it is at full
-// capacity or unavailable. After `failureThreshold` consecutive failures the
-// breaker OPENS for `cooldownMs`; while open, callers route straight to the
-// fallback (Sonnet) instead of paying the upstream's retry latency on every
-// call. After the cooldown, one probe is allowed (half-open): a success closes
+// Used to stop hammering an upstream model while it is at full capacity or
+// unavailable. After `failureThreshold` consecutive failures the breaker OPENS
+// for `cooldownMs`; while open, callers route straight to the next tier in the
+// role's waterfall (lib/llmRouter.ts keeps one breaker per model) instead of
+// paying the upstream's retry latency on every call. After the cooldown, one probe is allowed (half-open): a success closes
 // the breaker, a failure re-opens it for another cooldown.
 //
 // Pure and clock-injectable (every method takes an optional `now`) so it is

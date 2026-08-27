@@ -684,8 +684,9 @@ export async function processDueFollowups(options?: {
         // Phase 7b: route generation by product. Doctrine flow uses the
         // doctrine prompts + 3-call pipeline. Context flow uses its own
         // prompts (no doctrine, faithful-to-context).
-        // B7r: wrap generator dispatch with the usage context so
-        // recordUsageBestEffort() inside the generator knows what to attribute.
+        // B7r: wrap generator dispatch with the usage context so the LLM
+        // router's recorder (recordLlmUsageBestEffort, whichever vendor
+        // served) knows what to attribute.
         // F-3.7b: the row's wall-clock budget. Everything inside — every
         // writer tier, every critic pass, every retry ladder — shares 180s.
         // On expiry this throws GenerationDeadlineError, the catch below

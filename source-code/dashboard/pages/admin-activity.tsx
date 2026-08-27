@@ -167,10 +167,30 @@ function userLabel(name: string | null, email: string | null): string {
   return "—";
 }
 
+// Shorten a model id for the table. Keeps the tier, drops the vendor prefix and
+// the version noise, so a column of mixed-vendor rows stays scannable.
+//
+// The Anthropic branches are retained for HISTORICAL rows only — nothing calls
+// Anthropic since Aug 2026 (see api-server/src/lib/modelPolicy.ts) — but the
+// ledger still holds rows that name those models, and re-labelling them would
+// make the past unreadable.
 function modelShort(model: string): string {
   if (model.startsWith("claude-opus-")) return "Opus";
   if (model.startsWith("claude-sonnet-")) return "Sonnet";
   if (model.startsWith("claude-haiku-")) return "Haiku";
+  // Gemini: "gemini-3.1-flash-lite" -> "3.1 Flash-Lite", "gemini-3-flash-preview" -> "3 Flash"
+  const gem = model.match(/^gemini-([\d.]+)-(.+)$/);
+  if (gem) {
+    const tier = gem[2]
+      .replace(/-preview$/, "")
+      .replace(/flash-lite/, "Flash-Lite")
+      .replace(/^flash$/, "Flash")
+      .replace(/^pro$/, "Pro");
+    return `${gem[1]} ${tier}`;
+  }
+  // OpenAI: "gpt-5.4-nano" -> "5.4 nano", "gpt-4.1-mini" -> "4.1 mini", "gpt-5.5" -> "5.5"
+  const gpt = model.match(/^gpt-([\d.]+)(?:-(.+))?$/);
+  if (gpt) return gpt[2] ? `${gpt[1]} ${gpt[2]}` : gpt[1];
   return model;
 }
 

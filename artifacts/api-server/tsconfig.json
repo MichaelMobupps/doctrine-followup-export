@@ -7,6 +7,11 @@
     "noEmit": true
   },
   "include": ["src"],
+  // The archived Anthropic-era comparison harnesses call a vendor we no longer
+  // use and cannot typecheck against the current writer/critic modules. They
+  // are kept as the record of how the Gemini tiers were validated; see
+  // src/scripts/archive-anthropic-era/README.md.
+  "exclude": ["src/scripts/archive-anthropic-era"],
   "references": [
     {
       "path": "../../lib/db"

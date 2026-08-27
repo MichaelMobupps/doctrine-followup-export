@@ -1,9 +1,9 @@
 /**
  * B9c.2: AntiGhosting follow-up generator.
  *
- * Mirrors contextFollowupGenerator.ts in shape — Sonnet writer -> Opus
- * critic -> Sonnet rewriter, JSON-only output, three-call pipeline with
- * graceful fallbacks on critic or rewriter failure.
+ * Mirrors contextFollowupGenerator.ts in shape — writer -> critic -> rewriter,
+ * JSON-only output, three-call pipeline with graceful fallbacks on critic or
+ * rewriter failure.
  *
  * The AntiGhosting prompts (writer/critic/rewriter) enforce the
  * ACKNOWLEDGE -> BRIDGE -> ASK structure, the forbidden-phrase list,
@@ -17,22 +17,19 @@
  * the context flow.
  */
 
-import {
-  anthropic,
-  MODEL_ANTI_GHOSTING_GENERATOR,
-  MODEL_ANTI_GHOSTING_CRITIC,
-  MODEL_ANTI_GHOSTING_REWRITER,
-  withOpusReasoning,
-  assertCriticModelAllowed,
-} from "../lib/anthropic";
-import { withAnthropicRetry } from "./anthropicRetry";
-import { recordUsageBestEffort } from "../lib/usageTracker";
-import { cachedSystem } from "../lib/anthropic";
-// Cost-saving change: the CRITIC runs on the shared Gemini critic (Sonnet
-// fallback + shared breaker). The WRITER stays on Sonnet — this exemplar-less,
-// non-sales flow regressed nativeness on the cheap Flash writer in a cross-
-// language smoke, so only the critic (a judge, ~90% cheaper) moves to Gemini.
+// MODEL ROUTING (Aug 2026): every stage runs through the LLM router. This flow
+// shares the Context flow's chain, which starts a tier above the doctrine
+// flow's — both are exemplar-less, and a cross-language smoke measured the cheap
+// writer regressing nativeness where there is no exemplar block to carry it.
+// See EXEMPLARLESS_WRITER_CHAIN in lib/modelPolicy.ts.
+//
+// The writer stages call the router directly rather than through
+// services/writerProvider, because this flow tolerates an EMPTY body (some
+// re-engagement tiers are subject-only) and the shared draft contract does not.
+// F-3.7b: a spent row budget outranks every fail-open path in this file.
+import { GenerationDeadlineError } from "../lib/generationDeadline";
 import { runCriticWithProvider } from "./criticProvider";
+import { runLlmJson, SUBJECT_BODY_SCHEMA } from "../lib/llmRouter";
 import {
   ANTI_GHOSTING_GENERATOR_SYSTEM,
   ANTI_GHOSTING_CRITIC_SYSTEM,
@@ -69,30 +66,6 @@ interface AntiGhostingCriticResult {
   needs_rewrite: boolean;
 }
 
-function parseJsonResponse(raw: string): unknown {
-  const cleaned = raw.replace(/```json\s*|```/g, "").trim();
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    // Models sometimes wrap JSON in commentary. Pull the first {...} block.
-    const match = cleaned.match(/\{[\s\S]*\}/);
-    if (match) {
-      try {
-        return JSON.parse(match[0]);
-      } catch {
-        // fall through
-      }
-    }
-    throw new SyntaxError(
-      `Failed to parse AntiGhosting follow-up JSON: ${cleaned.slice(0, 200)}...`,
-    );
-  }
-}
-
-// CB-4 (AG port): a number in an anti-ghosting follow-up is grounded only
-// if it already appeared in the seed email or earlier in the real thread.
-// A percentage not present there is treated as invented and is removed or
-// grounded by the rewrite below. Local copies of the Doctrine-flow helpers.
 function normalizeForGrounding(s: string): string {
   return (s || "").toLowerCase().replace(/\s+/g, "");
 }
@@ -114,133 +87,78 @@ function findUngroundedPercentages(body: string, source: string): string[] {
   return out;
 }
 
-// AG draft writer (Sonnet). Unchanged by the cost work — the cheap Flash writer
-// regressed nativeness on this exemplar-less flow, so only the critic moved to
-// Gemini. Keeps the AG-specific empty-body tolerance (body === undefined).
+// AG draft writer. Walks the exemplar-less writer chain.
+//
+// Note the AG-specific output contract: an EMPTY body is legitimate here (some
+// re-engagement tiers are subject-only), so this flow cannot use the shared
+// runLlmDraft contract check, which requires a non-empty body. It asks the
+// router for the raw {subject, body} object and applies its own validation —
+// subject required, body merely present.
 async function generateAntiGhostingDraft(
   ctx: AntiGhostingFollowupContext,
-  attempt = 1,
 ): Promise<GeneratedAntiGhostingFollowup> {
-  const maxAttempts = 2;
-  const response = await withAnthropicRetry(
-    () => anthropic.messages.create({
-      model: MODEL_ANTI_GHOSTING_GENERATOR,
-      max_tokens: 4096,
-      system: cachedSystem(UNTRUSTED_DATA_SYSTEM_CLAUSE, ANTI_GHOSTING_GENERATOR_SYSTEM),
-      messages: [{ role: "user", content: getAntiGhostingGeneratorUserPrompt(ctx) }],
-    }),
-    { label: "anti-ghosting-draft" },
-  );
-  void recordUsageBestEffort(response, "anti_ghosting_generator");
-
-  const textBlock = response.content.find((b) => b.type === "text");
-  if (!textBlock || textBlock.type !== "text") {
-    throw new Error("No text in anti-ghosting-draft response");
-  }
-
-  try {
-    const parsed = parseJsonResponse(textBlock.text) as { subject?: unknown; body?: unknown };
-    if (!parsed.subject || parsed.body === undefined) {
-      throw new Error("AntiGhosting draft missing subject or body");
-    }
-    return { subject: String(parsed.subject), body: String(parsed.body) };
-  } catch (err) {
-    logger.warn(
-      { attempt, rawPreview: textBlock.text.slice(0, 300) },
-      "AntiGhosting-draft JSON parse failed",
-    );
-    if (attempt < maxAttempts) {
-      logger.info("Retrying anti-ghosting-draft generation...");
-      return generateAntiGhostingDraft(ctx, attempt + 1);
-    }
-    throw err;
-  }
+  const { value } = await runLlmJson<GeneratedAntiGhostingFollowup>({
+    role: "ag_draft",
+    systemParts: [UNTRUSTED_DATA_SYSTEM_CLAUSE, ANTI_GHOSTING_GENERATOR_SYSTEM],
+    user: getAntiGhostingGeneratorUserPrompt(ctx),
+    maxOutputTokens: 4096,
+    schema: SUBJECT_BODY_SCHEMA,
+    usage: { kind: "pipeline", label: "anti_ghosting_generator" },
+    prospectName: ctx.prospect_name,
+    validate: (parsed) => {
+      const p = parsed as { subject?: unknown; body?: unknown };
+      if (!p.subject || p.body === undefined) {
+        throw new Error("AntiGhosting draft missing subject or body");
+      }
+      return { subject: String(p.subject), body: String(p.body) };
+    },
+  });
+  return value;
 }
 
-async function critiqueAntiGhostingDraft(
-  ctx: AntiGhostingFollowupContext,
-  draft: GeneratedAntiGhostingFollowup,
-): Promise<AntiGhostingCriticResult> {
-  // Critic runs on Sonnet. assertCriticModelAllowed refuses any Opus model.
-  assertCriticModelAllowed(MODEL_ANTI_GHOSTING_CRITIC);
-  const response = await withAnthropicRetry(
-    // Sonnet critic. withOpusReasoning is a passthrough for a non-Opus model.
-    // max_tokens stays at 12000 so the JSON verdict never truncates.
-    () => anthropic.messages.create(withOpusReasoning({
-      model: MODEL_ANTI_GHOSTING_CRITIC,
-      max_tokens: 12000,
-      system: cachedSystem(UNTRUSTED_DATA_SYSTEM_CLAUSE, ANTI_GHOSTING_CRITIC_SYSTEM),
-      messages: [{ role: "user", content: getAntiGhostingCriticUserPrompt(ctx, draft) }],
-    })),
-    { label: "anti-ghosting-critic" },
-  );
-  void recordUsageBestEffort(response, "anti_ghosting_critic");
-
-  const textBlock = response.content.find((b) => b.type === "text");
-  if (!textBlock || textBlock.type !== "text") {
-    throw new Error("No text in anti-ghosting-critic response");
-  }
-
-  const parsed = parseJsonResponse(textBlock.text) as {
-    scores?: Record<string, number>;
-    overall?: unknown;
-    issues?: unknown;
-    suggestions?: unknown;
-    needs_rewrite?: unknown;
-  };
-  return {
-    scores: parsed.scores || {},
-    overall: typeof parsed.overall === "number" ? parsed.overall : 5,
-    issues: Array.isArray(parsed.issues) ? parsed.issues.map(String) : [],
-    suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions.map(String) : [],
-    needs_rewrite: parsed.needs_rewrite === true,
-  };
-}
-
-// AG rewriter (Sonnet). Unchanged by the cost work.
+// AG rewriter. Same chain as the draft, same empty-body tolerance.
+//
+// Keeps the caller's old failure semantics: if the chain is exhausted, or none
+// of it returns a usable revision, return the ORIGINAL draft rather than
+// nothing. A follow-up that skipped one round of polish beats one that never
+// sends.
 async function rewriteAntiGhostingDraft(
   ctx: AntiGhostingFollowupContext,
   draft: GeneratedAntiGhostingFollowup,
   critique: AntiGhostingCriticResult,
 ): Promise<GeneratedAntiGhostingFollowup> {
-  const response = await withAnthropicRetry(
-    () => anthropic.messages.create({
-      model: MODEL_ANTI_GHOSTING_REWRITER,
-      max_tokens: 4096,
-      system: cachedSystem(UNTRUSTED_DATA_SYSTEM_CLAUSE, ANTI_GHOSTING_REWRITER_SYSTEM),
-      messages: [{
-        role: "user",
-        content: getAntiGhostingRewriterUserPrompt(ctx, draft, {
-          issues: critique.issues,
-          suggestions: critique.suggestions,
-        }),
-      }],
-    }),
-    { label: "anti-ghosting-rewriter" },
-  );
-  void recordUsageBestEffort(response, "anti_ghosting_rewriter");
-
-  const textBlock = response.content.find((b) => b.type === "text");
-  if (!textBlock || textBlock.type !== "text") {
-    throw new Error("No text in anti-ghosting-rewriter response");
-  }
-
-  const parsed = parseJsonResponse(textBlock.text) as { subject?: unknown; body?: unknown };
-  if (!parsed.subject || parsed.body === undefined) {
+  try {
+    const { value } = await runLlmJson<GeneratedAntiGhostingFollowup>({
+      role: "ag_rewriter",
+      systemParts: [UNTRUSTED_DATA_SYSTEM_CLAUSE, ANTI_GHOSTING_REWRITER_SYSTEM],
+      user: getAntiGhostingRewriterUserPrompt(ctx, draft, {
+        issues: critique.issues,
+        suggestions: critique.suggestions,
+      }),
+      maxOutputTokens: 4096,
+      schema: SUBJECT_BODY_SCHEMA,
+      usage: { kind: "pipeline", label: "anti_ghosting_rewriter" },
+      prospectName: ctx.prospect_name,
+      validate: (parsed) => {
+        const p = parsed as { subject?: unknown; body?: unknown };
+        if (!p.subject || p.body === undefined) {
+          throw new Error("AntiGhosting rewrite missing subject or body");
+        }
+        return { subject: String(p.subject), body: String(p.body) };
+      },
+    });
+    return value;
+  } catch (err) {
+    // Same rule as the critic above: a spent budget is terminal for the row.
+    if (err instanceof GenerationDeadlineError) throw err;
     logger.warn(
-      { rawPreview: textBlock.text.slice(0, 300) },
-      "AntiGhosting-rewriter produced invalid output — falling back to original draft",
+      { err: String(err), stage: ctx.stage, cycle: ctx.cycle },
+      "AntiGhosting-rewriter chain exhausted — falling back to the original draft",
     );
     return draft;
   }
-  return { subject: String(parsed.subject), body: String(parsed.body) };
 }
 
-/**
- * Top-level entry point for the dispatcher. Same shape as
- * generateContextFollowup / generateFollowupEmail so the scheduler
- * can branch between them without restructuring the dispatch site.
- */
 export async function generateAntiGhostingFollowup(
   ctx: AntiGhostingFollowupContext,
 ): Promise<GeneratedAntiGhostingFollowup> {
@@ -300,8 +218,8 @@ export async function generateAntiGhostingFollowup(
   const ungroundedStats = findUngroundedPercentages(draft.body, groundingSource);
 
   // CB-1 cost gate: when the deterministic layer flags the draft we already
-  // know it needs a rewrite, so we skip the Opus critic call and rewrite
-  // directly from the deterministic findings. The Opus critic runs only on a
+  // know it needs a rewrite, so we skip the LLM critic call and rewrite
+  // directly from the deterministic findings. The LLM critic runs only on a
   // draft that is already deterministically clean. The forbidden-phrase rule
   // is still enforced server-side at send time via deterministic
   // post-checks; the critic is one line of defence and not the only one.
@@ -329,21 +247,25 @@ export async function generateAntiGhostingFollowup(
     };
     logger.info(
       { stage: ctx.stage, cycle: ctx.cycle, matches: deterministicCheck.matches.slice(0, 5) },
-      "AntiGhosting deterministic violations detected — rewriting without an Opus critic call",
+      "AntiGhosting deterministic violations detected — rewriting without an LLM critic call",
     );
   } else {
     try {
-      // Critic runs on Gemini (flash-lite) with the in-house Sonnet critic as
-      // the fallback — same provider switch and shared breaker as the doctrine
-      // critic, using the AG flow's own critic prompts.
+      // Critic runs the shared critic waterfall with the AG flow's own prompts.
       critique = await runCriticWithProvider({
-        anthropicCritic: () => critiqueAntiGhostingDraft(ctx, draft),
-        geminiSystemParts: [UNTRUSTED_DATA_SYSTEM_CLAUSE, ANTI_GHOSTING_CRITIC_SYSTEM],
-        geminiUser: getAntiGhostingCriticUserPrompt(ctx, draft),
+        systemParts: [UNTRUSTED_DATA_SYSTEM_CLAUSE, ANTI_GHOSTING_CRITIC_SYSTEM],
+        user: getAntiGhostingCriticUserPrompt(ctx, draft),
         label: "anti_ghosting_critic",
         prospectName: ctx.prospect_name,
       });
     } catch (err) {
+      // F-3.7b: a spent row budget is NOT a critic outage. The catch below is
+      // deliberately fail-open — a transient critic problem should ship the
+      // draft rather than fail the row — but "ship the original draft" on the
+      // strength of a DEADLINE would put an un-critiqued email in a client's
+      // inbox. The doctrine flow has always rethrown here; these two never did.
+      // Closing that gap so all three flows obey the same rule.
+      if (err instanceof GenerationDeadlineError) throw err;
       // Critic failure is non-fatal: ship the original draft. The critic is
       // the primary line of defence and not the only one.
       logger.warn({ err }, "AntiGhosting-critic call failed — shipping original draft");
@@ -373,6 +295,9 @@ export async function generateAntiGhostingFollowup(
     logger.info({ stage: ctx.stage, cycle: ctx.cycle }, "AntiGhosting follow-up rewritten after critic feedback");
     return finalize(rewritten);
   } catch (err) {
+    // F-3.7b: rewriteAntiGhostingDraft rethrows a spent budget precisely so it
+    // can travel — swallowing it here would defeat that guard one frame up.
+    if (err instanceof GenerationDeadlineError) throw err;
     logger.warn(
       { err, stage: ctx.stage, cycle: ctx.cycle },
       "AntiGhosting-rewriter failed — shipping original draft",

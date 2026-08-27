@@ -324,7 +324,7 @@ test.describe("a spent budget is not a vendor outage", () => {
     const { runWriter } = await import("../services/writerProvider");
 
     let breakerFailures = 0;
-    let anthropicTierUsed = 0;
+    let tiersAttempted = 0;
     const breaker = {
       shouldAttempt: () => true,
       onSuccess: () => {},
@@ -334,29 +334,39 @@ test.describe("a spent budget is not a vendor outage", () => {
       state: () => "closed",
     };
 
-    // What the real Gemini loop does when the row's budget is spent: its
+    // What the real transports do when the row's budget is spent: their
     // assertGenerationBudget throws GenerationDeadlineError out of the tier
     // call. The budget itself is still live here, so the outer race is NOT
     // what ends this — the thrown error has to travel on its own.
+    //
+    // Both transports are wired to the same throw, so if the router DID advance
+    // the chain we would see tiersAttempted climb past 1 and the assertion below
+    // would catch it. That is the real subject of this test: the chain must stop,
+    // not merely fail.
+    const spentBudget = (() => {
+      tiersAttempted++;
+      throw new GenerationDeadlineError(180_000, 180_500);
+    }) as never;
+
     await assert.rejects(
       () =>
         withGenerationDeadline(
           () =>
             runWriter(
-              { label: "draft", greyArea: false, systemParts: ["s"], userPrompt: "u" },
-              async () => {
-                anthropicTierUsed++;
-                return { subject: "s", body: "b", modelUsed: "sonnet", tier: "anthropic" as const };
+              {
+                role: "draft",
+                systemParts: ["s"],
+                userPrompt: "u",
               },
               {
                 isGeminiConfigured: () => true,
-                geminiGenerateJson: (() => {
-                  throw new GenerationDeadlineError(180_000, 180_500);
-                }) as never,
-                recordGeminiUsage: (() => {}) as never,
-                primaryBreaker: breaker as never,
-                secondaryBreaker: breaker as never,
-                logger: { info: () => {}, warn: () => {} } as never,
+                isOpenAiConfigured: () => true,
+                geminiGenerateJson: spentBudget,
+                openaiGenerateJson: spentBudget,
+                recordUsage: (() => {}) as never,
+                recordAuxUsage: (() => {}) as never,
+                breakerFor: () => breaker as never,
+                logger: { info: () => {}, warn: () => {}, error: () => {} } as never,
               },
             ),
           30_000,
@@ -367,13 +377,13 @@ test.describe("a spent budget is not a vendor outage", () => {
     assert.equal(
       breakerFailures,
       0,
-      "a spent row budget must not be scored against Gemini — that opens the breaker and " +
-        "pushes later rows onto the dearer tier for a fault Gemini never had",
+      "a spent row budget must not be scored against the tier — that opens the breaker and " +
+        "pushes later rows onto a dearer tier for a fault the vendor never had",
     );
     assert.equal(
-      anthropicTierUsed,
-      0,
-      "and it must not advance the chain: the pass has already abandoned this row",
+      tiersAttempted,
+      1,
+      "and it must not advance the waterfall: the pass has already abandoned this row",
     );
   });
 
@@ -387,6 +397,53 @@ test.describe("a spent budget is not a vendor outage", () => {
     assert.ok(idx > 0, "the fail-open critic path must still exist");
     const before = gen.slice(Math.max(0, idx - 700), idx);
     assert.match(before, /if \(err instanceof GenerationDeadlineError\) throw err;/);
+  });
+
+  test.it("EVERY fail-open catch in all three generators carries the guard", () => {
+    // Aug 2026 audit finding: the context and anti-ghosting flows never had the
+    // guard at all, and after it was added to their inner helpers the OUTER
+    // rewriter catches still swallowed the rethrow — a guard defeated one frame
+    // up is no guard. This sweep reads every fail-open log marker in the three
+    // generators and asserts the rethrow sits in the ~800 chars before it, so a
+    // new fail-open path added without the guard fails here by name.
+    const FAIL_OPEN_MARKERS: Array<[string, string[]]> = [
+      [
+        "services/followupGenerator.ts",
+        [
+          '"Critic unavailable after retries — returning best draft seen"',
+          '"Rewriter unavailable after retries — returning best draft seen"',
+        ],
+      ],
+      [
+        "services/contextFollowupGenerator.ts",
+        [
+          '"Context-critic call failed — shipping original draft"',
+          '"Context-rewriter chain exhausted — falling back to the original draft"',
+          '"Context-rewriter failed — shipping original draft"',
+        ],
+      ],
+      [
+        "services/antiGhostingFollowupGenerator.ts",
+        [
+          '"AntiGhosting-critic call failed — shipping original draft"',
+          '"AntiGhosting-rewriter chain exhausted — falling back to the original draft"',
+          '"AntiGhosting-rewriter failed — shipping original draft"',
+        ],
+      ],
+    ];
+    for (const [file, markers] of FAIL_OPEN_MARKERS) {
+      const src = readSrc(file);
+      for (const marker of markers) {
+        const idx = src.indexOf(marker);
+        assert.ok(idx > 0, `${file}: fail-open marker ${marker} must still exist`);
+        const before = src.slice(Math.max(0, idx - 800), idx);
+        assert.match(
+          before,
+          /if \(err instanceof GenerationDeadlineError\) throw err;/,
+          `${file}: the catch logging ${marker} must rethrow GenerationDeadlineError first`,
+        );
+      }
+    }
   });
 });
 

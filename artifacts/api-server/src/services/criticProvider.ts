@@ -1,92 +1,97 @@
 /**
- * Critic-stage provider switch.
+ * criticProvider.ts — the critic stage's view of the LLM router.
  *
- * The Doctrine follow-up pipeline runs writer (Sonnet) -> critic -> rewriter
- * (Sonnet). This module governs ONLY the doctrine critic stage. The provider is
- * selected by the CRITIC_PROVIDER env var:
+ * All three flows (doctrine, context, anti-ghosting) run the same shape:
+ * writer -> critic -> rewriter. This module governs ONLY the critic stages.
+ * The writer stages are governed by services/writerProvider.ts; both sit on
+ * lib/llmRouter.ts and lib/modelPolicy.ts.
  *
- *   gemini     (default, or unset) Run the critic on the configured Gemini
- *              model (GEMINI_CRITIC_MODEL, default gemini-3-flash-preview).
- *              Gemini is cheapest and is the normal path. If Gemini is at full
- *              capacity or unavailable, the call falls back to the in-house
- *              Sonnet critic for that draft — never in parallel. A circuit
- *              breaker guards this: after a short run of Gemini failures the
- *              breaker opens and every call routes straight to Sonnet for a
- *              cooldown, so a Gemini outage costs one probe per cooldown instead
- *              of a Gemini-retry stall on every single draft. A missing
- *              GEMINI_API_KEY also uses Sonnet.
- *   anthropic  Force the in-house Sonnet critic and never call Gemini. An
- *              escape hatch for debugging or if Gemini billing must be cut off.
+ * THE CHAIN
  *
- * There is no parallel/shadow mode: the critic runs on exactly one model per
- * draft.
+ *   gemini-3-flash-preview -> gpt-5.4-mini -> gemini-3.7-flash -> gpt-4.1-mini
  *
- * Cost note: Gemini 3 Flash Preview bills 0.50 / 3.00 USD per 1M
- * input/output tokens; the Sonnet fallback bills 3.00 / 15.00. Opus
- * (5.00 / 25.00) is never used as a critic on any path.
+ * Deliberately NOT the cheapest models available, and the one place in the
+ * product where cost is not the tie-breaker. By the time a draft reaches the
+ * LLM critic the deterministic linter has already rewritten anything that trips
+ * a mechanical rule (see GEMINI_CRITIC_FOCUS below), so what is left is exactly
+ * the judgment a regex cannot make. A critic that waves through a bad draft
+ * costs a whole extra send; the token delta against a cheaper tier is a rounding
+ * error next to that.
+ *
+ * Until Aug 2026 the fallback behind Gemini was an in-house Sonnet critic. With
+ * the Anthropic account unfunded that tier is gone and the chain is Gemini and
+ * OpenAI end to end, alternating vendors so a Google-side incident does not take
+ * every tier down at once.
+ *
+ * The critic is the one role that passes NO response schema. Its verdict
+ * contains `scores`, an open map of dimension -> number whose keys differ per
+ * flow, and OpenAI's strict json_schema mode cannot express an open map
+ * (additionalProperties must be false, and every property must be listed).
+ * Rather than flatten the verdict to fit the tooling, the critic keeps its
+ * prompt contract and relies on tolerant parsing — and, critically, the router
+ * treats an unparseable verdict as a TIER failure, so a model that loses the
+ * contract is fallen past instead of silently degrading the critique.
+ *
+ * The old CRITIC_PROVIDER env var selected between Gemini and Anthropic;
+ * nothing reads it any more. Set LLM_CHAIN_CRITIC to change the chain.
  */
 import type { FollowupContext } from "./followupPrompts";
 import { getCriticSystemPrompt, getCriticUserPrompt } from "./followupPrompts";
 import type { CriticResult } from "./followupGenerator";
 import { UNTRUSTED_DATA_SYSTEM_CLAUSE } from "../lib/promptInjection";
 import { logger } from "../lib/logger";
-import {
-  geminiGenerateJson,
-  isGeminiConfigured,
-  GEMINI_CRITIC_MODEL,
-} from "../lib/gemini";
-import { anthropic, cachedSystem, MODEL_CRITIC_FALLBACK } from "../lib/anthropic";
-import { withAnthropicRetry } from "./anthropicRetry";
-import { recordGeminiUsageBestEffort, recordUsageBestEffort } from "../lib/usageTracker";
-import { createCircuitBreaker } from "../lib/circuitBreaker";
+import { runLlmJson, AllTiersFailedError, type RouterDeps } from "../lib/llmRouter";
+import { getChain, describeChain, type LlmRole } from "../lib/modelPolicy";
 
-// Guards the Gemini critic. After 3 consecutive Gemini failures the breaker
-// opens for 60s and every critic routes straight to Sonnet, so a Gemini outage
-// or capacity wall does not stall each draft on Gemini's own retry budget. One
-// probe is allowed after the cooldown; a success closes it. Module-level so the
-// state is shared across the long-running api-server process.
-const geminiBreaker = createCircuitBreaker({ failureThreshold: 3, cooldownMs: 60_000 });
+/** The three critic flows. Each records usage under its own ledger label so per-product cost stays attributable. */
+export type CriticLabel = "critic" | "context_critic" | "anti_ghosting_critic";
 
-export type CriticProviderName = "anthropic" | "gemini";
+const ROLE_FOR_LABEL: Record<CriticLabel, LlmRole> = {
+  critic: "critic",
+  context_critic: "context_critic",
+  anti_ghosting_critic: "ag_critic",
+};
 
-export function getCriticProvider(): CriticProviderName {
-  // Gemini is the default. Only an explicit "anthropic" forces the Sonnet-only
-  // critic; any other value (including unset) resolves to gemini.
-  const v = (process.env.CRITIC_PROVIDER || "gemini").toLowerCase();
-  return v === "anthropic" ? "anthropic" : "gemini";
-}
-
-type AnthropicCriticFn = () => Promise<CriticResult>;
 type DraftLike = { subject: string; body: string };
 
-// Same tolerant extraction the Anthropic path uses: strip any code fences and
-// slice to the outermost JSON object before parsing. responseMimeType
-// application/json normally yields a bare object, so the fence and slice
-// handling is belt-and-suspenders. A parse failure throws and the caller
-// falls back to the Sonnet critic.
-function parseCriticJson(text: string): CriticResult {
-  let raw = text.replace(/```json\s*|```/g, "").trim();
-  const first = raw.indexOf("{");
-  const last = raw.lastIndexOf("}");
-  if (first !== -1 && last > first) {
-    raw = raw.slice(first, last + 1);
+/**
+ * Coerce a parsed verdict into a CriticResult, rejecting anything that is not
+ * recognisably a critique.
+ *
+ * The shape check is deliberately minimal but non-empty: a verdict with none of
+ * the four expected keys is not a lenient critique, it is a model that answered
+ * a different question, and defaulting it to `{overall: 5, needs_rewrite:
+ * false}` would ship an un-reviewed draft on the strength of a malformed
+ * response. Throwing hands it to the router, which advances the waterfall.
+ */
+export function coerceCriticResult(parsed: unknown): CriticResult {
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("critic verdict is not an object");
   }
-  const parsed = JSON.parse(raw) as Partial<CriticResult>;
+  const p = parsed as Partial<CriticResult>;
+  const hasAnySignal =
+    p.scores !== undefined ||
+    p.overall !== undefined ||
+    p.issues !== undefined ||
+    p.needs_rewrite !== undefined;
+  if (!hasAnySignal) {
+    throw new Error("critic verdict has none of scores/overall/issues/needs_rewrite");
+  }
   return {
-    scores: parsed.scores ?? {},
-    overall: parsed.overall ?? 5,
-    issues: parsed.issues ?? [],
-    suggestions: parsed.suggestions ?? [],
-    needs_rewrite: parsed.needs_rewrite ?? false,
+    scores: p.scores ?? {},
+    overall: typeof p.overall === "number" ? p.overall : 5,
+    issues: Array.isArray(p.issues) ? p.issues : [],
+    suggestions: Array.isArray(p.suggestions) ? p.suggestions : [],
+    needs_rewrite: p.needs_rewrite ?? false,
   };
 }
 
 // Gemini critic focus directive. In production the deterministic linter runs
 // upstream of the critic and rewrites any draft that trips a mechanical rule,
 // so by the time the LLM critic sees a draft those rules are already clean.
-// This tells the cheaper Gemini model to trust that and spend its scrutiny on
-// the judgment a regex cannot make. It is appended only to the Gemini system
-// prompt; the Anthropic critic prompt is unchanged.
+// This tells the cheaper model to trust that and spend its scrutiny on the
+// judgment a regex cannot make. Named GEMINI_* historically; it is appended to
+// every critic chain's system prompt now, whichever vendor serves.
 export const GEMINI_CRITIC_FOCUS = [
   "ENFORCEMENT CONTEXT: A deterministic linter runs before you and rewrites any",
   "draft that violates a mechanical rule, so the draft you are grading is already",
@@ -102,153 +107,106 @@ export const GEMINI_CRITIC_FOCUS = [
   "language is natural beyond the mechanical checks. Still return every score in",
   "the required JSON, but weight your overall score and your needs_rewrite",
   "decision toward those judgment dimensions.",
+  // Aug 2026 audit: layout is out of the critic's hands entirely.
+  //
+  // The writer prompt carries a randomized per-thread layout directive (block
+  // pattern, soft breaks) for human-formatting variation, and critics kept
+  // re-judging drafts against it — unreliably. Measured directly: a control
+  // draft verified STRUCTURALLY to match its seeded directive (pattern [1,3],
+  // soft break after sentence 1) was still flagged with a miscounted layout
+  // complaint. Every such false flag buys a full rewrite + re-critique cycle,
+  // and the critic stage is two thirds of the LLM bill (bench-llm-pipeline).
+  //
+  // The division of labour is: the writer ATTEMPTS the directive, the
+  // deterministic linter + layout shaper OWN the floor that must hold at ship
+  // time, and the critic judges CONTENT — including opener repetition (rule
+  // 5b), which is carved back in below because no regex can judge it. Restore
+  // the old re-policing with CRITIC_JUDGES_LAYOUT=1 (read at module load for
+  // this clause; followupPrompts reads it per call — set it before boot).
+  ...(process.env.CRITIC_JUDGES_LAYOUT === "1"
+    ? []
+    : [
+        "LAYOUT (VISUAL SHAPE) IS OUT OF SCOPE FOR YOU: how many paragraph",
+        "blocks the email has, which sentences share a line, where blank lines",
+        "or mid-thought line breaks fall — all of that is owned by the",
+        "deterministic layout stage. Do not list any visual-shape complaint in",
+        "issues and never set needs_rewrite for visual shape. One carve-out",
+        "stays fully yours: OPENER REPETITION across the thread's previous",
+        "follow-ups (rule 5b of your instructions) is content judgment, not",
+        "visual shape — keep scoring and flagging it exactly as instructed.",
+      ]),
 ].join(" ");
 
-// The three critic flows that can run on Gemini. Each records usage under its
-// own ledger label so per-product cost stays attributable.
-type CriticLabel = "critic" | "context_critic" | "anti_ghosting_critic";
-
-// Generalized Gemini critic: grade a draft on the Gemini critic model using the
-// caller's own system + user prompts, and record usage under the flow's label.
-// The doctrine critic is one caller (getCriticSystemPrompt + GEMINI_CRITIC_FOCUS);
-// the context and anti-ghosting flows pass their own critic prompts. The prompt-
-// injection hardening clause is expected to be the first systemPart in every
-// caller, mirroring the Anthropic critic's system construction.
-async function geminiCritiqueWithPrompts(
-  systemParts: string[],
-  user: string,
-  label: CriticLabel,
-): Promise<CriticResult> {
-  const result = await geminiGenerateJson({
-    systemParts,
-    user,
-    maxOutputTokens: 8192,
-  });
-  // Record token usage on the same ledger as the Anthropic stages, under the
-  // flow's own critic label. Best-effort: never throws.
-  void recordGeminiUsageBestEffort(result.usage, result.model, label);
-  return parseCriticJson(result.text);
-}
-
-// Sonnet fallback critic. In gemini mode this runs whenever the Gemini path
-// is unavailable: a Gemini call that fails after retries (a 503 under load),
-// or a missing GEMINI_API_KEY. The draft reaching this point is already
-// deterministically clean, and Sonnet is the standard critic tier, so gemini
-// mode degrades to the same cost as the default in-house critic. No path —
-// anthropic, gemini, or shadow — ever uses an Opus critic.
-async function sonnetCritique(
-  ctx: FollowupContext,
-  draft: DraftLike,
-): Promise<CriticResult> {
-  const response = await withAnthropicRetry(
-    () =>
-      anthropic.messages.create({
-        model: MODEL_CRITIC_FALLBACK,
-        max_tokens: 4096,
-        system: cachedSystem(UNTRUSTED_DATA_SYSTEM_CLAUSE, getCriticSystemPrompt()),
-        messages: [{ role: "user", content: getCriticUserPrompt(ctx, draft) }],
-      }),
-    { label: "critic" },
-  );
-  void recordUsageBestEffort(response, "critic");
-  const textBlock = response.content.find((b) => b.type === "text");
-  if (!textBlock || textBlock.type !== "text") {
-    throw new Error("No text in Sonnet fallback critic response");
-  }
-  return parseCriticJson(textBlock.text);
-}
-
 export interface CriticProviderArgs {
-  /**
-   * Sonnet critic used for the explicit escape hatch (CRITIC_PROVIDER=anthropic).
-   * For the doctrine flow this is the full critic; for the sibling flows it is
-   * that flow's only Sonnet critic.
-   */
-  anthropicCritic: AnthropicCriticFn;
-  /**
-   * Sonnet critic used when Gemini is the intended provider but is unavailable
-   * (no key, breaker open, or a failed call). Defaults to anthropicCritic. The
-   * doctrine flow passes a cheaper fallback critic here so a degraded path does
-   * not pay for the full critic.
-   */
-  geminiFallbackCritic?: AnthropicCriticFn;
-  /** Gemini critic system-instruction parts (untrusted clause first, then the critic prompt). */
-  geminiSystemParts: string[];
-  /** The Gemini critic user turn (the draft to grade). */
-  geminiUser: string;
-  /** Usage-ledger label for this flow's critic. */
+  /** Critic system-instruction parts (untrusted clause first, then the critic prompt). */
+  systemParts: string[];
+  /** The critic user turn (the draft to grade). */
+  user: string;
+  /** Usage-ledger label for this flow's critic; also selects the router role. */
   label: CriticLabel;
   /** For logs only. */
   prospectName?: string;
 }
 
 /**
- * Provider-switched critic for ANY flow. Gemini-first with a Sonnet fallback —
- * never both, never in parallel — the exact policy the doctrine critic uses,
- * generalized so the context and anti-ghosting critics get the same cost saving.
- * The circuit breaker is shared across all critic flows, so a Gemini outage
- * opens it once and every flow routes to Sonnet for the cooldown.
+ * Provider-switched critic for ANY flow.
+ *
+ * Walks the flow's critic chain and returns the first well-formed verdict.
+ * Throws AllTiersFailedError when the whole chain is unavailable — every caller
+ * already degrades gracefully on a critic throw (it ships the best draft seen),
+ * so a total critic outage costs review depth, never a dropped follow-up.
  */
-export async function runCriticWithProvider(args: CriticProviderArgs): Promise<CriticResult> {
-  const provider = getCriticProvider();
-  const fallback = args.geminiFallbackCritic ?? args.anthropicCritic;
-
-  // Escape hatch: force the in-house Sonnet critic, never call Gemini.
-  if (provider === "anthropic") {
-    return args.anthropicCritic();
-  }
-
-  // Default: Gemini-first with a Sonnet fallback. Never both, never in parallel.
-  if (!isGeminiConfigured()) {
-    logger.warn({ prospect: args.prospectName }, "GEMINI_API_KEY is not set. Using Sonnet critic");
-    return fallback();
-  }
-
-  // Breaker open: a recent run of Gemini failures means it is at capacity or
-  // down, so skip it entirely for this draft and use Sonnet — no per-call
-  // Gemini stall during an outage.
-  if (!geminiBreaker.shouldAttempt()) {
-    logger.info(
-      { prospect: args.prospectName, breaker: geminiBreaker.state() },
-      "Gemini critic circuit breaker open. Using Sonnet critic",
-    );
-    return fallback();
-  }
-
+export async function runCriticWithProvider(
+  args: CriticProviderArgs,
+  depsOverride?: Partial<RouterDeps>,
+): Promise<CriticResult> {
+  const role = ROLE_FOR_LABEL[args.label];
   try {
-    const result = await geminiCritiqueWithPrompts(args.geminiSystemParts, args.geminiUser, args.label);
-    geminiBreaker.onSuccess();
-    return result;
-  } catch (err) {
-    geminiBreaker.onFailure();
-    logger.warn(
-      { err: String(err), prospect: args.prospectName, model: GEMINI_CRITIC_MODEL, breaker: geminiBreaker.state() },
-      "Gemini critic failed (capacity or unavailable). Falling back to Sonnet critic",
+    const { value, result } = await runLlmJson<CriticResult>(
+      {
+        role,
+        systemParts: args.systemParts,
+        user: args.user,
+        maxOutputTokens: 8192,
+        usage: { kind: "pipeline", label: args.label },
+        prospectName: args.prospectName,
+        validate: coerceCriticResult,
+      },
+      depsOverride,
     );
-    return fallback();
+    if (result.tierIndex > 1) {
+      logger.info(
+        { prospect: args.prospectName, label: args.label, model: result.model, tier: result.tierIndex },
+        "Critic served by a fallback tier",
+      );
+    }
+    return value;
+  } catch (err) {
+    if (err instanceof AllTiersFailedError) {
+      logger.warn(
+        { prospect: args.prospectName, label: args.label, chain: describeChain(getChain(role)), err: String(err) },
+        "Every critic tier was unavailable",
+      );
+    }
+    throw err;
   }
 }
 
 /**
- * Doctrine-flow critic. Thin wrapper over runCriticWithProvider that supplies
- * the doctrine critic prompts, the GEMINI_CRITIC_FOCUS directive, and the cheaper
- * MODEL_CRITIC_FALLBACK Sonnet critic for the degraded path. Behavior is
- * identical to the previous implementation.
+ * Doctrine-flow critic. Thin wrapper that supplies the doctrine critic prompts
+ * and the GEMINI_CRITIC_FOCUS directive.
  */
 export async function runCritic(
   ctx: FollowupContext,
   draft: DraftLike,
-  anthropicCritic: AnthropicCriticFn,
 ): Promise<CriticResult> {
   return runCriticWithProvider({
-    anthropicCritic,
-    // Cheaper Sonnet critic for the Gemini-unavailable path, as before.
-    geminiFallbackCritic: () => sonnetCritique(ctx, draft),
-    // Mirror the Anthropic critic's system construction: the prompt-injection
-    // hardening clause precedes the critic instructions.
-    geminiSystemParts: [UNTRUSTED_DATA_SYSTEM_CLAUSE, getCriticSystemPrompt(), GEMINI_CRITIC_FOCUS],
-    geminiUser: getCriticUserPrompt(ctx, draft),
+    // The prompt-injection hardening clause precedes the critic instructions,
+    // as it does on every other prompt in the product.
+    systemParts: [UNTRUSTED_DATA_SYSTEM_CLAUSE, getCriticSystemPrompt(), GEMINI_CRITIC_FOCUS],
+    user: getCriticUserPrompt(ctx, draft),
     label: "critic",
     prospectName: ctx.prospect_name,
   });
 }
+

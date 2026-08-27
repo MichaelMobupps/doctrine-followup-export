@@ -7,9 +7,17 @@
  * Order of decision (cheap → expensive, fail-safe at every step):
  *   1. Deterministic unsubscribe scan on the body  → "unsubscribe"
  *   2. Deterministic OOO scan on subject+body+headers → "ooo"
- *   3. LLM positive/negative judgement (Sonnet) with a confidence score.
- *      The LLM may also return "ooo" to catch auto-replies the regex missed.
- *   4. Any failure (network, parse, empty) → "unknown" (NO cascade).
+ *   3. LLM positive/negative judgement with a confidence score, via the
+ *      reply_sentiment chain (lib/modelPolicy.ts). The LLM may also return
+ *      "ooo" to catch auto-replies the regex missed.
+ *   4. Any failure (every tier down, or no tier answering in the agreed
+ *      vocabulary) → "unknown" (NO cascade).
+ *
+ * Aug 2026 note on one behaviour change: an unparseable verdict used to be
+ * returned as "negative". It now advances the router's waterfall instead, and
+ * only a fully exhausted chain returns "unknown". Both values are equally safe
+ * downstream — gmailSync cascades only on "positive" above the confidence floor
+ * — so this strictly buys another model's opinion where the old code gave up.
  *
  * Only the body of the LATEST inbound message is read — the caller passes
  * its Gmail message id (resolved in classifyThreadInbound). The original
@@ -23,8 +31,6 @@
  */
 
 import { gmail_v1 } from "googleapis";
-import { anthropic, MODEL_REPLY_CLASSIFIER } from "../lib/anthropic";
-import { withAnthropicRetry } from "./anthropicRetry";
 import {
   getHeaderValueHelper,
   extractPlainTextFromPayloadHelper,
@@ -36,7 +42,7 @@ import {
   type AutoReplyHeaders,
 } from "../lib/replyClassification";
 import { logger } from "../lib/logger";
-import { recordAuxUsageBestEffort } from "../lib/usageTracker";
+import { runLlmJson, type LlmJsonSchema } from "../lib/llmRouter";
 import { wrapUntrusted, scanForInjection, UNTRUSTED_DATA_SYSTEM_CLAUSE } from "../lib/promptInjection";
 
 export interface ReplySentimentResult {
@@ -61,6 +67,16 @@ RULES:
 - A bare referral with no interest ("not me, no idea who handles this") is negative.
 - If you are genuinely unsure between positive and negative, choose "negative" with a low confidence. Never guess "positive".
 - "confidence" is your certainty in the class you chose, 0 to 1.`;
+
+// The {class, confidence, reason} contract, enforced at both vendors so the
+// classifier cannot answer with prose. `class` is a plain string rather than an
+// enum because the shared schema shape is scalars-only; the value check below
+// is the real gate, and it is the one that must be conservative.
+const SENTIMENT_SCHEMA: LlmJsonSchema = {
+  name: "reply_sentiment",
+  properties: { class: "string", confidence: "number", reason: "string" },
+  required: ["class", "confidence", "reason"],
+};
 
 /**
  * Read the latest inbound message body and classify it.
@@ -135,41 +151,44 @@ export async function classifyReplySentiment(params: {
     : `Prospect's reply:\n${_replyBlock.block}`;
 
   try {
-    const response = await withAnthropicRetry(
-      () => anthropic.messages.create({
-        model: MODEL_REPLY_CLASSIFIER,
-        max_tokens: 200,
-        system: `${UNTRUSTED_DATA_SYSTEM_CLAUSE}\n\n${SENTIMENT_SYSTEM}`,
-        messages: [{ role: "user", content: userContent }],
-      }),
-      { label: "reply_sentiment" },
-    );
-
-    // Count this auxiliary LLM call toward tool-wide spend (best-effort,
-    // fire-and-forget). Never gates reply handling.
-    void recordAuxUsageBestEffort(response, "reply_sentiment", "reply_sentiment");
-
-    const textBlock = response.content.find((b) => b.type === "text");
-    if (textBlock && textBlock.type === "text") {
-      const raw = textBlock.text.replace(/```json\s*|```/g, "").trim();
-      const parsed = JSON.parse(raw);
-      const cls = String(parsed.class || "").toLowerCase();
-      const conf = Number(parsed.confidence);
-      const reason = String(parsed.reason || "").slice(0, 120);
-      if (cls === "positive" || cls === "negative" || cls === "ooo") {
+    const { value } = await runLlmJson<ReplySentimentResult>({
+      role: "reply_sentiment",
+      systemParts: [UNTRUSTED_DATA_SYSTEM_CLAUSE, SENTIMENT_SYSTEM],
+      user: userContent,
+      maxOutputTokens: 200,
+      schema: SENTIMENT_SCHEMA,
+      // No usage context here — reply handling runs outside a generation — so
+      // the cost lands on the shared ledger under its own app label, where the
+      // daily budget cap still sums it.
+      usage: { kind: "aux", app: "reply_sentiment", label: "reply_sentiment" },
+      validate: (parsed) => {
+        const p = parsed as { class?: unknown; confidence?: unknown; reason?: unknown };
+        const cls = String(p.class ?? "").toLowerCase();
+        if (cls !== "positive" && cls !== "negative" && cls !== "ooo") {
+          // Not one of the three permitted verdicts. Throwing hands it to the
+          // router, which tries the next tier — a model that answered a
+          // different question should not get to decide a campaign's fate.
+          throw new Error(`reply classifier returned an unknown class: ${cls.slice(0, 40)}`);
+        }
+        const conf = Number(p.confidence);
         return {
           replyClass: cls as ReplyClass,
           confidence: Number.isFinite(conf) ? Math.max(0, Math.min(1, conf)) : 0.5,
-          reason: reason || cls,
-          source: "llm",
+          reason: String(p.reason ?? "").slice(0, 120) || cls,
+          source: "llm" as const,
         };
-      }
-    }
-    logger.warn({ latestInboundMessageId }, "replySentiment: unparseable LLM verdict — treating as negative");
-    // Unparseable but the LLM responded: fail to the SAFE side (no cascade).
-    return { replyClass: "negative", confidence: 0, reason: "unparseable verdict", source: "fallback" };
+      },
+    });
+    return value;
   } catch (err) {
-    logger.warn({ err, latestInboundMessageId }, "replySentiment: LLM classify failed — treating as unknown");
+    // Every tier failed, or none produced a verdict in the agreed vocabulary.
+    // Fail to "unknown", which means NO cascade — the conservative direction.
+    // A false "positive" pauses a live campaign; a false "negative" costs one
+    // extra follow-up. That asymmetry is why this catch does not guess.
+    logger.warn(
+      { err: String(err), latestInboundMessageId },
+      "replySentiment: LLM classify failed on every tier — treating as unknown",
+    );
     return { replyClass: "unknown", confidence: 0, reason: "classifier error", source: "fallback" };
   }
 }

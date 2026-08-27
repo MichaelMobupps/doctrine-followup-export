@@ -251,6 +251,30 @@ ${layoutBlock}
 Write the follow-up now. Pull one concrete detail from the original email and make it the spine of your follow-up.`;
 }
 
+/**
+ * CRITIC_JUDGES_LAYOUT=1 restores the pre-Aug-2026 rule 5a: the critic
+ * re-polices visual shape (greeting run-on, single block, the per-thread
+ * block-pattern directive) on top of the deterministic layer.
+ *
+ * Off by default on measurement, not taste: the critic's visual-shape verdicts
+ * were demonstrably NOISY — a control draft verified structurally to match its
+ * seeded directive was still flagged with a miscounted layout complaint — and
+ * each false flag buys a rewrite + re-critique cycle in the stage that is two
+ * thirds of the LLM bill (bench-llm-pipeline.ts). The deterministic linter
+ * (pre-critic) and layout shaper (post-critic) own the shapes that must hold
+ * at ship time; opener repetition (5b) stays with the critic because no regex
+ * can judge it. criticProvider.ts gates its focus clause on the same flag.
+ */
+function criticJudgesLayout(): string {
+  if (process.env.CRITIC_JUDGES_LAYOUT !== "1") return "";
+  return (
+    " OVERRIDE (CRITIC_JUDGES_LAYOUT=1): visual shape IS in scope for this run. " +
+    "If the greeting shares a line with the first sentence, or the body is one " +
+    "unbroken paragraph, or the draft ignores the LAYOUT block supplied with it, " +
+    "score 'layout' 1 and set needs_rewrite = true."
+  );
+}
+
 export function getCriticSystemPrompt(): string {
   return `You are a senior email copywriting critic. Your job is to evaluate a follow-up sales email and provide specific, actionable feedback.
 
@@ -274,7 +298,7 @@ EVALUATION CRITERIA (score each 1-5):
 
 5. CONCISENESS: Is it 4-6 sentences maximum? No padding, no filler, no unnecessary repetition?
 
-5a. LAYOUT (severity: block, 2026-08-26 Robotic.jpeg incident): score the SHAPE of the text, independently of its content. Two failures are blocking. (a) GREETING RUN-ON: the greeting shares a line with the first sentence ("Hi there, following up on my previous note..."). A human puts the greeting on its own line and leaves a blank line under it. (b) SINGLE BLOCK: the whole body is one unbroken paragraph. A follow-up of 4+ sentences with no blank line anywhere is the single most recognisable machine-written shape there is, and it is judged before a word is read. The email must carry at least two blocks separated by a blank line, and it must match the LAYOUT block supplied with the draft below when one is present. If either failure is present, score 'layout' 1 and set needs_rewrite = true. Do NOT ask for bullet points or numbered lines to fix this — the deliverability ban on lists is unchanged; blocks are prose separated by blank lines.
+5a. LAYOUT (visual shape — OUT OF YOUR SCOPE by default): the two blocking shapes from the 2026-08-26 Robotic.jpeg incident (a greeting sharing a line with the first sentence; the whole body as one unbroken paragraph) are caught by a deterministic linter BEFORE you and repaired by a deterministic layout shaper AFTER you, and the finer per-thread block pattern is the writer's directive, not a ship requirement. Do NOT flag visual shape — block counts, sentences-per-line, blank lines, soft line breaks — in issues, and do NOT lower the 'layout' score or set needs_rewrite for visual shape. Keep the 'layout' key in your JSON; it is scored by 5b. (Never suggest bullet points or numbered lines in any feedback — the deliverability ban on lists is unchanged; blocks are prose separated by blank lines.)${criticJudgesLayout()}
 
 5b. OPENER REPETITION (severity: block, applies only when PREVIOUS FOLLOW-UPS are shown below): does this draft open with the same clause as an earlier stage in the thread? Three messages that all begin "Following up on my previous note regarding [same topic]" are a template running, and the recipient sees it immediately. Compare the opening clause against every previous follow-up. If the verb phrase AND the thing referenced are both substantially the same as an earlier stage, score 'layout' 1-2 and set needs_rewrite = true, quoting both openers in "issues".
 

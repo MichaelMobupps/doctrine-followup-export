@@ -1,6 +1,6 @@
 /**
- * smoke-summarizer-cheap.ts — validate the cheap (Gemini flash-lite) summarizer
- * against Sonnet across languages.
+ * smoke-summarizer-cheap.ts — validate the summarizer chain's PRIMARY and its
+ * FALLBACK tier across languages.
  *
  * summarizeOriginalEmail feeds two things into every downstream follow-up:
  *   - language: sets prospects.original_language, which drives exemplar
@@ -10,19 +10,33 @@
  *   - summary: a short topic noun phrase used as context. Heavily sanitized
  *     downstream, so the bar is: non-empty and not meta-language.
  *
- * Runs the REAL summarizeOriginalEmail for a set of real cold-outreach bodies in
- * 14 languages under both providers and compares:
- *   cheap  = default (Gemini flash-lite -> Sonnet fallback)
- *   sonnet = SUMMARIZER_PROVIDER=anthropic (Sonnet only)
+ * Aug 2026: this used to compare the cheap Gemini summarizer against a
+ * SUMMARIZER_PROVIDER=anthropic Sonnet baseline. That switch no longer exists —
+ * the summarizer runs a Gemini/OpenAI waterfall (lib/modelPolicy.ts) and
+ * Anthropic is disabled — and for a while after the migration this smoke kept
+ * setting the dead env var, which made both arms run the identical config and
+ * the "comparison" pass vacuously. A smoke that cannot fail is worse than none.
+ *
+ * It now compares what actually exists and actually carries risk:
+ *   primary  = the live summarizer chain as production runs it (tier 1 serving)
+ *   fallback = LLM_CHAIN_SUMMARIZER forced to the chain's cross-vendor tier,
+ *              i.e. what production silently degrades to when Gemini is at
+ *              capacity. If THAT tier misdetects languages, a Gemini outage
+ *              quietly produces wrong-language follow-ups — exactly the failure
+ *              this smoke exists to catch before it ships.
  *
  * RUN (from artifacts/api-server):
  *   node --import tsx src/scripts/smoke-summarizer-cheap.ts
  *
- * Exit codes: 0 cheap matches Sonnet on language accuracy (within 1 miss) and no
- * errors; 1 cheap materially worse or a hard error.
+ * Exit codes: 0 the fallback tier holds language accuracy (within 1 miss of the
+ * primary) and no errors; 1 the fallback is materially worse or a hard error.
  */
 import { summarizeOriginalEmail, summaryLooksMeta } from "../services/emailSummarizer";
+import { __setLedgerSuppressedForOfflineRuns } from "../lib/usageTracker";
 import { isGeminiConfigured } from "../lib/gemini";
+import { isOpenAiConfigured } from "../lib/openai";
+import { getChain, describeChain } from "../lib/modelPolicy";
+import { __resetBreakersForTests } from "../lib/llmRouter";
 import { logger } from "../lib/logger";
 
 interface Sample { lang: string; body: string }
@@ -46,9 +60,12 @@ const SAMPLES: Sample[] = [
 type Verdict = "OK" | "LANG" | "META" | "EMPTY" | "ERROR";
 interface Row { lang: string; provider: string; got: string; summary: string; verdict: Verdict }
 
-async function runConfig(provider: "cheap" | "sonnet"): Promise<Row[]> {
-  if (provider === "sonnet") process.env.SUMMARIZER_PROVIDER = "anthropic";
-  else delete process.env.SUMMARIZER_PROVIDER; // default -> gemini
+async function runConfig(provider: "primary" | "fallback", chainSpec: string | null): Promise<Row[]> {
+  if (chainSpec) process.env.LLM_CHAIN_SUMMARIZER = chainSpec;
+  else delete process.env.LLM_CHAIN_SUMMARIZER;
+  // Fresh breakers per arm so a failure streak in one arm cannot open a
+  // breaker that silently reroutes the other arm's calls.
+  __resetBreakersForTests();
   const rows: Row[] = [];
   for (const s of SAMPLES) {
     try {
@@ -77,33 +94,57 @@ function score(rows: Row[]) {
 
 async function main() {
   (logger as unknown as { level: string }).level = "warn";
+  // Keep this smoke's 28 summarizer calls off the production usage ledger —
+  // the aux recorder writes without a usage context by design, so a dev run
+  // would otherwise skew the email_summary cost line and the daily budget cap.
+  __setLedgerSuppressedForOfflineRuns(true);
   if (!isGeminiConfigured()) {
     console.error("GEMINI_API_KEY not set — cannot test the cheap summarizer. Aborting.");
     process.exit(1);
   }
-  console.log(`\nSummarizer cheap-vs-Sonnet smoke — ${SAMPLES.length} languages, real summarizeOriginalEmail\n`);
-  console.log("CHEAP (Gemini flash-lite -> Sonnet fallback):");
-  const cheap = await runConfig("cheap");
-  console.log("\nSONNET (SUMMARIZER_PROVIDER=anthropic):");
-  const sonnet = await runConfig("sonnet");
+  if (!isOpenAiConfigured()) {
+    console.error("OPENAI_API_KEY not set — cannot test the fallback tier. Aborting.");
+    process.exit(1);
+  }
+
+  // The chain's first cross-vendor tier is the one a Gemini outage lands on.
+  const chain = getChain("summarizer");
+  const fallbackTier = chain.find((t) => t.provider !== chain[0].provider);
+  if (!fallbackTier) {
+    console.error(`summarizer chain has no cross-vendor tier: ${describeChain(chain)}`);
+    process.exit(1);
+  }
+  const fallbackSpec = `${fallbackTier.provider}:${fallbackTier.model}${fallbackTier.effort ? `@${fallbackTier.effort}` : fallbackTier.thinking ? `@${fallbackTier.thinking}` : ""}`;
+
+  const savedChain = process.env.LLM_CHAIN_SUMMARIZER;
+  console.log(`\nSummarizer primary-vs-fallback smoke — ${SAMPLES.length} languages, real summarizeOriginalEmail`);
+  console.log(`chain: ${describeChain(chain)}\n`);
+  console.log("PRIMARY (live chain, tier 1 serving):");
+  const cheap = await runConfig("primary", null);
+  console.log(`\nFALLBACK (forced ${fallbackSpec} — what a Gemini outage degrades to):`);
+  const sonnet = await runConfig("fallback", fallbackSpec);
+  if (savedChain === undefined) delete process.env.LLM_CHAIN_SUMMARIZER;
+  else process.env.LLM_CHAIN_SUMMARIZER = savedChain;
 
   const c = score(cheap);
   const s = score(sonnet);
   console.log(`\n${"-".repeat(64)}`);
-  console.log(`language correct   cheap ${c.langOk}/${c.n}   sonnet ${s.langOk}/${s.n}`);
-  console.log(`fully OK (lang+summary)  cheap ${c.fullOk}/${c.n}   sonnet ${s.fullOk}/${s.n}`);
-  const cheapLangMisses = cheap.filter((r) => r.verdict === "LANG").map((r) => `${r.lang}->${r.got}`);
-  if (cheapLangMisses.length) console.log(`cheap language misses: ${cheapLangMisses.join(", ")}`);
+  console.log(`language correct   primary ${c.langOk}/${c.n}   fallback ${s.langOk}/${s.n}`);
+  console.log(`fully OK (lang+summary)  primary ${c.fullOk}/${c.n}   fallback ${s.fullOk}/${s.n}`);
+  const fallbackLangMisses = sonnet.filter((r) => r.verdict === "LANG").map((r) => `${r.lang}->${r.got}`);
+  if (fallbackLangMisses.length) console.log(`fallback language misses: ${fallbackLangMisses.join(", ")}`);
   const errs = [...cheap, ...sonnet].filter((r) => r.verdict === "ERROR");
 
-  // Language accuracy is the gate. Allow cheap to be at most 1 behind Sonnet.
-  const langRegression = s.langOk - c.langOk > 1;
+  // Language accuracy is the gate, and the FALLBACK is the arm under test: it
+  // is what a Gemini capacity wall silently degrades production to. Allow it to
+  // be at most 1 behind the primary.
+  const langRegression = c.langOk - s.langOk > 1;
   const hardError = errs.length > 0;
   const verdict = hardError
     ? "SMOKE FAIL (errors)"
     : langRegression
-    ? `SMOKE FAIL — cheap language accuracy ${c.langOk} vs Sonnet ${s.langOk}`
-    : `SMOKE PASS — cheap summarizer holds language accuracy (${c.langOk}/${c.n} vs Sonnet ${s.langOk}/${s.n})`;
+    ? `SMOKE FAIL — fallback language accuracy ${s.langOk} vs primary ${c.langOk}`
+    : `SMOKE PASS — the fallback tier holds language accuracy (${s.langOk}/${s.n} vs primary ${c.langOk}/${c.n})`;
   console.log(`\n${verdict}\n`);
   process.exit(hardError || langRegression ? 1 : 0);
 }

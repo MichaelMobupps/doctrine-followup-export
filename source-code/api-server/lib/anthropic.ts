@@ -1,41 +1,68 @@
 /**
- * Direct Anthropic SDK client.
+ * RETIRED — the Anthropic client. Nothing on a production path imports this.
  *
- * Replaces the prior `@workspace/integrations-anthropic-ai` wrapper, which
- * routed requests through Replit's AI Integrations proxy. The proxy dependency
- * caused production-silent outages: when Replit's integration was not
- * configured on the deployment, every call returned 404 "Replit AI Integrations
- * is not configured", and the pipeline silently degraded to a broken
- * hard-coded fallback.
+ * Aug 2026: the Anthropic account's card was declined, so every LLM role moved
+ * to Gemini and OpenAI. See lib/modelPolicy.ts for what runs where and
+ * lib/llmRouter.ts for how a role's fallback waterfall is walked.
  *
- * This module talks to api.anthropic.com directly with ANTHROPIC_API_KEY.
- * Single source of credentials, single import site, clearer error messages.
+ * The module is kept rather than deleted for two reasons, both about not losing
+ * information:
  *
- * The exported `anthropic` object is API-compatible with the previous wrapper
- * (both use the official @anthropic-ai/sdk underneath) so callers only change
- * the import line.
+ *   1. Archived comparison scripts (src/scripts/archive-anthropic-era/) still
+ *      reference these model constants. They are the record of how the Gemini
+ *      tiers were validated against Sonnet in the first place, and they should
+ *      still typecheck.
+ *   2. The MODEL_* constants document what each stage used to run on, which is
+ *      the baseline every cost claim in TODO-llm-cost-migration.md is measured
+ *      against.
+ *
+ * WHAT CHANGED HERE
+ *
+ * The module used to `throw` at import time when ANTHROPIC_API_KEY was unset —
+ * a deliberate fail-loud-at-boot when Anthropic was load-bearing. It is no
+ * longer load-bearing, and a server that refuses to start without a key it will
+ * never use is a worse failure than the one that guard was written to prevent.
+ * The client is now built lazily and throws only if something actually tries to
+ * call it, which is exactly the signal we want: a loud, specific error naming
+ * the ban, at the call site that violated it.
+ *
+ * To bring Anthropic back: restore a chain entry in lib/modelPolicy.ts and
+ * delete assertNoAnthropic. That is deliberately a visible code edit rather
+ * than an env flag, because re-enabling it is a billing decision.
  */
 import Anthropic from "@anthropic-ai/sdk";
 
-const apiKey = process.env.ANTHROPIC_API_KEY;
+let client: Anthropic | null = null;
 
-if (!apiKey) {
-  // Fail loudly at boot rather than on first request — a missing API key is
-  // a config problem, not a runtime problem, and should be visible immediately
-  // in the deploy logs.
-  throw new Error(
-    "ANTHROPIC_API_KEY is not set. Add it as a Replit Secret for both the " +
-      "workspace and the deployment. Get a key at https://console.anthropic.com/",
-  );
-}
-
-export const anthropic = new Anthropic({
-  apiKey,
-  // Reasonable network timeouts. The SDK default is 10min, way too long for
-  // a user-facing follow-up pipeline. If a request is still pending after 60s,
-  // it's better to fail and let our retry layer try again.
-  timeout: 60 * 1000,
-  maxRetries: 0, // We implement our own retry logic with visibility and logging.
+/**
+ * The Anthropic client, built on first use.
+ *
+ * Every property access goes through this proxy, so merely importing the module
+ * — which the archived scripts and a couple of type-only imports still do — is
+ * free, and only an actual API call trips the guard.
+ */
+export const anthropic: Anthropic = new Proxy({} as Anthropic, {
+  get(_target, prop, receiver) {
+    if (!client) {
+      const apiKey = process.env.ANTHROPIC_API_KEY;
+      if (!apiKey) {
+        throw new Error(
+          "ANTHROPIC_API_KEY is not set, and Anthropic is disabled anyway " +
+            "(the account is unfunded as of Aug 2026). Every LLM role runs on " +
+            "Gemini or OpenAI — see lib/modelPolicy.ts. If you reached this " +
+            "from production code, that code should be using lib/llmRouter.ts.",
+        );
+      }
+      client = new Anthropic({
+        // Reasonable network timeouts. The SDK default is 10min, way too long
+        // for a user-facing follow-up pipeline.
+        apiKey,
+        timeout: 60 * 1000,
+        maxRetries: 0,
+      });
+    }
+    return Reflect.get(client as object, prop, receiver);
+  },
 });
 
 /**

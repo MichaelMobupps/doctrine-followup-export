@@ -1,14 +1,14 @@
 // B7r: per-request usage attribution propagated via AsyncLocalStorage.
 //
-// We attach this context once at the scheduler level, then read it
-// from inside the generator's anthropic call sites. This avoids
-// threading 4 extra parameters through every generator function
-// signature.
+// We attach this context once at the scheduler level, then read it from
+// inside the LLM router's usage recorder, whichever vendor served the
+// call. This avoids threading 4 extra parameters through every generator
+// function signature.
 //
 // Pattern: scheduler.ts wraps the generator call in
 //   runWithUsageContext({...}, () => generateFollowupEmail(ctx))
-// and recordUsage() inside usageTracker.ts calls getUsageContext()
-// to know which followup the call belongs to.
+// and recordLlmUsageBestEffort() inside usageTracker.ts calls
+// getUsageContext() to know which followup the call belongs to.
 
 import { AsyncLocalStorage } from "node:async_hooks";
 

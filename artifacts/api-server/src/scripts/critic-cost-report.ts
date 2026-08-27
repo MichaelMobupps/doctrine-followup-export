@@ -17,6 +17,7 @@
  */
 import { db, followupUsageTable } from "@workspace/db";
 import { and, gte, eq } from "drizzle-orm";
+import { MODEL_PRICES } from "../lib/pricing";
 
 interface Rate {
   name: string;
@@ -24,14 +25,23 @@ interface Rate {
   output: number; // USD per 1M output tokens
 }
 
-// Candidate critic models to reprice against. Output rate covers visible
-// answer tokens plus thinking tokens, which is where critic cost concentrates.
-const CANDIDATES: Rate[] = [
-  { name: "gemini-3.5-flash", input: 1.5, output: 9 },
-  { name: "gemini-3.1-pro-preview", input: 2, output: 12 },
-  { name: "gemini-3-flash-preview", input: 0.5, output: 3 },
-  { name: "gemini-3.1-flash-lite", input: 0.25, output: 1.5 },
-];
+// Candidate critic models to reprice against. Rates come from the shared
+// pricing table so this report can never drift from what the ledger bills —
+// the hardcoded copy it used to carry went stale the first time a price moved.
+// Output rate covers visible answer tokens plus thinking tokens, which is
+// where critic cost concentrates.
+const CANDIDATE_NAMES = [
+  "gemini-3-flash-preview",
+  "gpt-5.4-mini",
+  "gemini-3.7-flash",
+  "gemini-3.1-flash-lite",
+] as const;
+
+const CANDIDATES: Rate[] = CANDIDATE_NAMES.map((name) => {
+  const price = MODEL_PRICES[name];
+  if (!price) throw new Error(`candidate ${name} is missing from MODEL_PRICES`);
+  return { name, input: price.input, output: price.output };
+});
 
 function usd(n: number): string {
   return "$" + n.toFixed(6);

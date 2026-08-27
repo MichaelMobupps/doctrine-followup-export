@@ -54,14 +54,14 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { anthropic, MODEL_DRAFT_GENERATOR, cachedSystem } from "../lib/anthropic";
-import { withAnthropicRetry } from "../services/anthropicRetry";
+import { anthropic, MODEL_DRAFT_GENERATOR, cachedSystem } from "../../lib/anthropic";
+import { withAnthropicRetry } from "../../services/anthropicRetry";
 import {
   getFollowupSystemPrompt,
   getFollowupUserPrompt,
   type FollowupContext,
-} from "../services/followupPrompts";
-import { UNTRUSTED_DATA_SYSTEM_CLAUSE } from "../lib/promptInjection";
+} from "../../services/followupPrompts";
+import { UNTRUSTED_DATA_SYSTEM_CLAUSE } from "../../lib/promptInjection";
 import {
   planWriterChain,
   getWriterProvider,
@@ -71,19 +71,19 @@ import {
   runWriter,
   type WriterTier,
   type AnthropicWriterFn,
-} from "../services/writerProvider";
-import { isGreyArea, detectGreyArea } from "../lib/greyArea";
-import { buildWriterExemplarBlock } from "../lib/exemplarLibrary";
-import { buildWriterCompetitorBlock } from "../lib/competitorLibrary";
+} from "../../services/writerProvider";
+import { isGreyArea, detectGreyArea } from "../../lib/greyArea";
+import { buildWriterExemplarBlock } from "../../lib/exemplarLibrary";
+import { buildWriterCompetitorBlock } from "../../lib/competitorLibrary";
 import {
   geminiGenerateJson,
   isGeminiConfigured,
   type GeminiUsageMetadata,
   type ThinkingLevel,
-} from "../lib/gemini";
-import { computeCostUsd, MODEL_PRICES } from "../lib/pricing";
-import { detectAllDeterministicViolations } from "../lib/doctrineLint";
-import { detectStructuralViolations, mergeViolationReports } from "../lib/structuralLint";
+} from "../../lib/gemini";
+import { computeCostUsd, MODEL_PRICES } from "../../lib/pricing";
+import { detectAllDeterministicViolations } from "../../lib/doctrineLint";
+import { detectStructuralViolations, mergeViolationReports } from "../../lib/structuralLint";
 
 // ===========================================================================
 // CLI

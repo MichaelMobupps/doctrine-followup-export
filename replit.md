@@ -15,7 +15,7 @@ pnpm workspace monorepo using TypeScript. Each package manages its own dependenc
 - **Validation**: Zod (`zod/v4`), `drizzle-zod`
 - **API codegen**: Orval (from OpenAPI spec)
 - **Build**: esbuild (CJS bundle)
-- **AI**: Anthropic Claude via Replit AI Integrations
+- **AI**: Gemini (Google AI Studio) + OpenAI, behind a per-role fallback waterfall (`api-server/src/lib/modelPolicy.ts`, `llmRouter.ts`)
 - **Gmail API**: googleapis (OAuth2)
 - **Scheduling**: node-cron
 - **Design System**: Dovah (see `attached_assets/DOVAH_DESIGN_SYSTEM_*.md`)
@@ -66,7 +66,7 @@ The system has three components:
    - Syncing Doctrine-labeled emails from Gmail (cron every 15 min, per connected user)
    - Detecting replies and auto-cancelling queued follow-ups
    - Storing prospect state in PostgreSQL (via Drizzle ORM)
-   - Generating follow-up emails via Claude Sonnet (Replit AI integration)
+   - Generating follow-up emails via the LLM router (Gemini/OpenAI waterfall per role)
    - Sending follow-ups as threaded Gmail replies on randomized schedules
    - Per-user customizable follow-up timing and settings
    - Exposing REST API for the Gmail add-on and dashboard
@@ -131,7 +131,7 @@ All under `/api/` prefix. Require `x-api-key` header matching `ADDON_API_KEY`.
 ### Cron Jobs
 
 - `*/15 * * * *` — Gmail sync (iterates connected users, fetch new emails, detect replies)
-- `5,20,35,50 * * * *` — Process due follow-ups (generate via Claude, send via user's Gmail)
+- `5,20,35,50 * * * *` — Process due follow-ups (generate via the LLM router, send via user's Gmail)
 - `*/3 * * * *` — Test-mode tick: processes due follow-ups + auto-queues next stages (3 min apart) for test-mode users
 
 ### Auto-Queue System
@@ -144,11 +144,23 @@ After each processing cycle, `autoQueueNextStages()` checks test-mode users' pro
 
 ### AI Follow-up Generation
 
-- Draft: Claude Sonnet generates initial follow-up as JSON `{subject, body}`
-- Critic: Claude Opus scores the draft (1-10 on multiple axes); `followup_ack < 4` forces rewrite
-- Rewrite: Claude Sonnet rewrites if critic demands it
-- Humanizer: Removes AI artifacts (em dashes, curly quotes, AI phrases)
-- JSON parser: Extracts JSON from AI responses with fallback regex extraction and retry logic
+Aug 2026: every stage runs on Gemini/OpenAI. Anthropic is disabled (unfunded account) and
+`assertNoAnthropic()` in `lib/modelPolicy.ts` refuses any chain naming a Claude model.
+
+- Draft: the `draft` role's waterfall produces `{subject, body}` (Gemini Flash-Lite primary,
+  GPT-5.4-nano tier 2, then a stronger Gemini and a second OpenAI tier)
+- Deterministic gate: doctrine + structural + spam-risk linters. A flagged draft skips the LLM
+  critic entirely and goes straight to rewrite — the critic only judges already-clean drafts
+- Critic: the `critic` role's waterfall scores the draft; `needs_rewrite` drives the loop
+- Rewrite: the `rewriter` role's waterfall, up to 2 healing iterations
+- Humanizer + layout shaper: removes AI artifacts (em dashes, curly quotes, AI phrases) and
+  guarantees the greeting/blocks floor on every return path
+- Every tier: a 429/503/timeout/safety-block/off-contract answer advances the waterfall; a spent
+  row budget (`GenerationDeadlineError`) does not, and is never scored against the tier's breaker
+
+Grey-area verticals (casino/betting/crypto/forex) and the two exemplar-less flows (context,
+anti-ghosting) run their own, stronger chains. See `TODO-llm-cost-migration.md` for the
+measurements behind each choice.
 
 ### Vertical Classifier
 
@@ -158,7 +170,7 @@ After each processing cycle, `autoQueueNextStages()` checks test-mode users' pro
 
 ### Email Summarizer
 
-Uses Claude to generate follow-up-safe context summaries of original emails, stored in `original_body_summary` field on prospects
+Uses the `summarizer` role's waterfall (cheapest chain in the product) to generate follow-up-safe context summaries of original emails, stored in the `original_body_summary` field on prospects. The heavy deterministic `sanitizeSummary` pass runs on every tier's output, which is what holds the cheap tier to the same bar.
 
 ### Required Environment Variables
 
@@ -168,8 +180,15 @@ Uses Claude to generate follow-up-safe context summaries of original emails, sto
 - `SENDER_NAME` — Legacy fallback display name (optional if users connected via OAuth)
 - `DOCTRINE_LABELS` — Legacy fallback Gmail labels (optional, per-user label in DB)
 - `ADDON_API_KEY` — API key for authenticating all requests
-- `AI_INTEGRATIONS_ANTHROPIC_BASE_URL` — Auto-set by Replit AI integration
-- `AI_INTEGRATIONS_ANTHROPIC_API_KEY` — Auto-set by Replit AI integration
+- `GEMINI_API_KEY` — Google AI Studio key. Serves tier 1 of nearly every role
+- `OPENAI_API_KEY` — Serves the cross-vendor tiers. Without it every waterfall runs at half depth
+  and the server warns loudly at boot; with NEITHER key it refuses to start
+
+Optional LLM tuning (all have working defaults): `WRITER_THINKING`, `CRITIC_THINKING`,
+`LLM_CHAIN_<ROLE>`, `GEMINI_MAX_ATTEMPTS`, `GEMINI_TIMEOUT_MS`, `OPENAI_MAX_ATTEMPTS`,
+`OPENAI_TIMEOUT_MS`. See §5 of `TODO-llm-cost-migration.md`.
+
+`ANTHROPIC_API_KEY` is no longer read by any production path.
 
 ### Follow-up Stages (defaults, customizable per user)
 

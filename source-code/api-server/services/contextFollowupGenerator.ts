@@ -1,28 +1,31 @@
 /**
  * Context-based follow-up generator — Phase 7b.
  *
- * Mirrors followupGenerator.ts in shape (Sonnet generator → Opus critic
- * → Sonnet rewriter, all adaptive thinking) but uses context-only prompts
- * with no doctrine principles.
+ * Mirrors followupGenerator.ts in shape (generator -> critic -> rewriter) but
+ * uses context-only prompts with no doctrine principles.
  *
  * Goal: write follow-ups that nudge for a response on a previous email
  * thread, faithfully referencing the prior content with no invention,
  * marketing language, or sales pitch. The critic's job is to catch any
  * drift from those constraints; the rewriter applies the fixes.
+ *
+ * MODEL ROUTING (Aug 2026)
+ *
+ * Every stage runs through the LLM router on this flow's OWN chain, which
+ * starts a tier above the doctrine flow's. That is not caution, it is a
+ * measurement: this flow has no exemplar library, and when the writer was first
+ * moved to a cheap tier a cross-language smoke found it regressed nativeness
+ * here specifically — untranslated English singletons in Latin-script languages,
+ * "test" surviving into fr/es/pt copy — at 50% clean against the then-Sonnet
+ * writer's 80%. The doctrine flow did not regress, because its exemplar block
+ * carries the cheap tier. Without exemplars there is nothing to carry it, so
+ * the chain compensates. See EXEMPLARLESS_WRITER_CHAIN in lib/modelPolicy.ts.
  */
 
-import { anthropic, MODEL_CONTEXT_GENERATOR, MODEL_CONTEXT_CRITIC, MODEL_CONTEXT_REWRITER, withOpusReasoning, cachedSystem, assertCriticModelAllowed } from "../lib/anthropic";
-import { withAnthropicRetry } from "./anthropicRetry";
-// Cost-saving change: the CRITIC runs on the shared Gemini critic (with the same
-// Sonnet fallback + breaker as the doctrine flow). The WRITER stays on Sonnet:
-// this non-sales flow has no exemplars, and a cross-language smoke showed the
-// cheap Flash writer regressed nativeness here (untranslated English singletons
-// in Latin-script languages, e.g. "test" in fr/es/pt), 50% vs Sonnet's 80% clean.
-// The critic is a judge, not a writer, so it keeps quality while cutting the
-// critic-stage cost ~90%.
+import { runWriter } from "./writerProvider";
+// F-3.7b: a spent row budget outranks every fail-open path in this file.
+import { GenerationDeadlineError } from "../lib/generationDeadline";
 import { runCriticWithProvider } from "./criticProvider";
-// B7r: usage tracker import. Safe outside a runWithUsageContext scope.
-import { recordUsageBestEffort } from "../lib/usageTracker";
 import type { FollowupContext } from "./followupPrompts";
 import {
   CONTEXT_GENERATOR_SYSTEM,
@@ -63,152 +66,60 @@ interface ContextCriticResult {
   needs_rewrite: boolean;
 }
 
-function parseJsonResponse(raw: string): any {
-  const cleaned = raw.replace(/```json\s*|```/g, "").trim();
-  try {
-    return JSON.parse(cleaned);
-  } catch (firstErr) {
-    // Sometimes models emit a JSON object embedded in commentary. Pull
-    // the first {...} block and try that.
-    const match = cleaned.match(/\{[\s\S]*\}/);
-    if (match) {
-      try {
-        return JSON.parse(match[0]);
-      } catch {
-        // fall through
-      }
-    }
-    throw new SyntaxError(`Failed to parse Context follow-up JSON: ${cleaned.slice(0, 200)}...`);
-  }
-}
-
-// Context draft writer (Sonnet). Unchanged by the cost work — a cross-language
-// smoke showed the cheap Flash writer regressed nativeness on this exemplar-less
-// flow, so only the critic moved to Gemini.
+// Context draft writer. Walks the exemplar-less writer chain. The router
+// retries inside a tier, falls to the next tier on a 429/503/timeout/safety
+// block, and treats an off-contract answer as a tier failure — so the
+// two-attempt JSON-parse retry this function used to carry is now handled for
+// every tier at once, one level down.
 async function generateContextDraft(
   ctx: FollowupContext,
-  attempt = 1,
 ): Promise<GeneratedContextFollowup> {
-  const maxAttempts = 2;
-  const response = await withAnthropicRetry(
-    () => anthropic.messages.create({
-      model: MODEL_CONTEXT_GENERATOR,
-      max_tokens: 4096,
-      system: cachedSystem(UNTRUSTED_DATA_SYSTEM_CLAUSE, CONTEXT_GENERATOR_SYSTEM),
-      messages: [{ role: "user", content: getContextGeneratorUserPrompt(ctx) }],
-    }),
-    { label: "context-draft" },
-  );
-  // B7r: capture token usage for the activity log.
-  void recordUsageBestEffort(response, "context_generator");
-
-  const textBlock = response.content.find((b) => b.type === "text");
-  if (!textBlock || textBlock.type !== "text") {
-    throw new Error("No text in context-draft response");
-  }
-
-  try {
-    const parsed = parseJsonResponse(textBlock.text);
-    if (!parsed.subject || !parsed.body) {
-      throw new Error("Context draft missing subject or body");
-    }
-    return { subject: String(parsed.subject), body: String(parsed.body) };
-  } catch (err) {
-    logger.warn(
-      { attempt, rawPreview: textBlock.text.slice(0, 300) },
-      "Context-draft JSON parse failed",
-    );
-    if (attempt < maxAttempts) {
-      logger.info("Retrying context-draft generation...");
-      return generateContextDraft(ctx, attempt + 1);
-    }
-    throw err;
-  }
+  const result = await runWriter({
+    role: "context_draft",
+    systemParts: [UNTRUSTED_DATA_SYSTEM_CLAUSE, CONTEXT_GENERATOR_SYSTEM],
+    userPrompt: getContextGeneratorUserPrompt(ctx),
+    maxOutputTokens: 4096,
+    usageLabel: "context_generator",
+    prospectName: ctx.prospect_name,
+  });
+  return { subject: result.subject, body: result.body };
 }
 
-async function critiqueContextDraft(
-  ctx: FollowupContext,
-  draft: GeneratedContextFollowup,
-): Promise<ContextCriticResult> {
-  // Critic runs on Sonnet. assertCriticModelAllowed refuses any Opus model.
-  assertCriticModelAllowed(MODEL_CONTEXT_CRITIC);
-  const response = await withAnthropicRetry(
-    // Sonnet critic. withOpusReasoning is a passthrough for a non-Opus model.
-    // max_tokens stays at 12000 so the JSON verdict never truncates.
-    () => anthropic.messages.create(withOpusReasoning({
-      model: MODEL_CONTEXT_CRITIC,
-      max_tokens: 12000,
-      system: cachedSystem(UNTRUSTED_DATA_SYSTEM_CLAUSE, CONTEXT_CRITIC_SYSTEM),
-      messages: [{ role: "user", content: getContextCriticUserPrompt(ctx, draft) }],
-    })),
-    { label: "context-critic" },
-  );
-  // B7r: capture token usage for the activity log.
-  void recordUsageBestEffort(response, "context_critic");
-
-  const textBlock = response.content.find((b) => b.type === "text");
-  if (!textBlock || textBlock.type !== "text") {
-    throw new Error("No text in context-critic response");
-  }
-
-  const parsed = parseJsonResponse(textBlock.text);
-  return {
-    scores: parsed.scores || {},
-    overall: typeof parsed.overall === "number" ? parsed.overall : 5,
-    issues: Array.isArray(parsed.issues) ? parsed.issues.map(String) : [],
-    suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions.map(String) : [],
-    needs_rewrite: parsed.needs_rewrite === true,
-  };
-}
-
-// Context rewriter (Sonnet). Unchanged by the cost work.
+// Context rewriter. Same chain as the draft.
+//
+// Keeps the caller's old failure semantics deliberately: if the whole chain is
+// unavailable, or none of it returns a usable revision, we return the ORIGINAL
+// draft rather than nothing. A follow-up that skipped one round of polish beats
+// a follow-up that never sends.
 async function rewriteContextDraft(
   ctx: FollowupContext,
   draft: GeneratedContextFollowup,
   critique: ContextCriticResult,
 ): Promise<GeneratedContextFollowup> {
-  const response = await withAnthropicRetry(
-    () => anthropic.messages.create({
-      model: MODEL_CONTEXT_REWRITER,
-      max_tokens: 4096,
-      system: cachedSystem(UNTRUSTED_DATA_SYSTEM_CLAUSE, CONTEXT_REWRITER_SYSTEM),
-      messages: [{
-        role: "user",
-        content: getContextRewriterUserPrompt(ctx, draft, {
-          issues: critique.issues,
-          suggestions: critique.suggestions,
-        }),
-      }],
-    }),
-    { label: "context-rewriter" },
-  );
-  // B7r: capture token usage for the activity log.
-  void recordUsageBestEffort(response, "context_rewriter");
-
-  const textBlock = response.content.find((b) => b.type === "text");
-  if (!textBlock || textBlock.type !== "text") {
-    throw new Error("No text in context-rewriter response");
-  }
-
-  const parsed = parseJsonResponse(textBlock.text);
-  if (!parsed.subject || !parsed.body) {
-    // Rewriter failed to produce a valid revision — fall back to the
-    // original draft rather than returning nothing.
+  try {
+    const result = await runWriter({
+      role: "context_rewriter",
+      systemParts: [UNTRUSTED_DATA_SYSTEM_CLAUSE, CONTEXT_REWRITER_SYSTEM],
+      userPrompt: getContextRewriterUserPrompt(ctx, draft, {
+        issues: critique.issues,
+        suggestions: critique.suggestions,
+      }),
+      maxOutputTokens: 4096,
+      usageLabel: "context_rewriter",
+      prospectName: ctx.prospect_name,
+    });
+    return { subject: result.subject, body: result.body };
+  } catch (err) {
+    // Same rule as the critic above: a spent budget is terminal for the row.
+    if (err instanceof GenerationDeadlineError) throw err;
     logger.warn(
-      { rawPreview: textBlock.text.slice(0, 300) },
-      "Context-rewriter produced invalid output — falling back to original draft",
+      { err: String(err), stage: ctx.stage },
+      "Context-rewriter chain exhausted — falling back to the original draft",
     );
     return draft;
   }
-  return { subject: String(parsed.subject), body: String(parsed.body) };
 }
 
-/**
- * Top-level entry point for the dispatcher. Mirrors generateFollowupEmail
- * from followupGenerator.ts — same signature, same error semantics — so
- * the scheduler can branch between them without restructuring its call
- * site.
- */
 export async function generateContextFollowup(
   ctx: FollowupContext,
 ): Promise<GeneratedContextFollowup> {
@@ -245,8 +156,8 @@ export async function generateContextFollowup(
   );
 
   // CB-1 cost gate: when the deterministic layer flags the draft we already
-  // know it needs a rewrite, so we skip the Opus critic call and rewrite
-  // directly from the deterministic findings. The Opus critic runs only on a
+  // know it needs a rewrite, so we skip the LLM critic call and rewrite
+  // directly from the deterministic findings. The LLM critic runs only on a
   // draft that is already deterministically clean. The guards are unchanged;
   // only the timing of the critic call changes.
   let critique: ContextCriticResult;
@@ -260,21 +171,25 @@ export async function generateContextFollowup(
     };
     logger.info(
       { stage: ctx.stage, matches: deterministicCheck.matches.slice(0, 5) },
-      "Context-flow deterministic violations detected — rewriting without an Opus critic call",
+      "Context-flow deterministic violations detected — rewriting without an LLM critic call",
     );
   } else {
     try {
-      // Critic runs on Gemini (flash-lite) with the in-house Sonnet critic as
-      // the fallback — same provider switch and shared breaker as the doctrine
-      // critic, using this flow's own critic prompts.
+      // Critic runs the shared critic waterfall with this flow's own prompts.
       critique = await runCriticWithProvider({
-        anthropicCritic: () => critiqueContextDraft(ctx, draft),
-        geminiSystemParts: [UNTRUSTED_DATA_SYSTEM_CLAUSE, CONTEXT_CRITIC_SYSTEM],
-        geminiUser: getContextCriticUserPrompt(ctx, draft),
+        systemParts: [UNTRUSTED_DATA_SYSTEM_CLAUSE, CONTEXT_CRITIC_SYSTEM],
+        user: getContextCriticUserPrompt(ctx, draft),
         label: "context_critic",
         prospectName: ctx.prospect_name,
       });
     } catch (err) {
+      // F-3.7b: a spent row budget is NOT a critic outage. The catch below is
+      // deliberately fail-open — a transient critic problem should ship the
+      // draft rather than fail the row — but "ship the original draft" on the
+      // strength of a DEADLINE would put an un-critiqued email in a client's
+      // inbox. The doctrine flow has always rethrown here; these two never did.
+      // Closing that gap so all three flows obey the same rule.
+      if (err instanceof GenerationDeadlineError) throw err;
       // Critic failure is non-fatal: ship the original draft. We log but
       // don't block delivery on a transient critic problem.
       logger.warn({ err }, "Context-critic call failed — shipping original draft");
@@ -302,6 +217,9 @@ export async function generateContextFollowup(
     logger.info({ stage: ctx.stage }, "Context-follow-up rewritten after critic feedback");
     return finalize(rewritten);
   } catch (err) {
+    // F-3.7b: rewriteContextDraft rethrows a spent budget precisely so it can
+    // travel — swallowing it here would defeat that guard one frame up.
+    if (err instanceof GenerationDeadlineError) throw err;
     logger.warn(
       { err, stage: ctx.stage },
       "Context-rewriter failed — shipping original draft",

@@ -26,9 +26,10 @@
  *   F2: more direct ASK, narrower scope
  *   F3: close-the-loop ("should I assume this is parked?")
  *
- * Pipeline mirrors the existing 3-call shape (Sonnet writer -> Opus
- * critic -> Sonnet rewriter). The critic is the safety net for
- * forbidden phrases, missing structural elements, and tone-tier drift.
+ * Pipeline mirrors the existing 3-call shape (writer -> critic ->
+ * rewriter, each on its own Gemini/OpenAI waterfall — see
+ * lib/modelPolicy.ts). The critic is the safety net for forbidden
+ * phrases, missing structural elements, and tone-tier drift.
  */
 
 // ──────────────────────────────────────────────────────────────────────

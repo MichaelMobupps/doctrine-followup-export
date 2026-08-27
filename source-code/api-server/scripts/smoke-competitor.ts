@@ -41,7 +41,7 @@ import { buildWriterExemplarBlock } from "../lib/exemplarLibrary";
 import { buildWriterCompetitorBlock, selectCompetitors } from "../lib/competitorLibrary";
 import { detectCompetitorScriptViolations } from "../lib/competitorScriptLint";
 import { geminiGenerateJson, isGeminiConfigured } from "../lib/gemini";
-import { getPrimaryGeminiModel } from "../services/writerProvider";
+import { getPrimaryWriterModel } from "../services/writerProvider";
 import { computeCostUsd } from "../lib/pricing";
 import { detectAllDeterministicViolations } from "../lib/doctrineLint";
 import { detectStructuralViolations, mergeViolationReports } from "../lib/structuralLint";
@@ -165,7 +165,7 @@ function geminiCostUsd(model: string, usage: {
 async function main(): Promise<void> {
   const opts = parseArgs(process.argv.slice(2));
   const live = !opts.dry && isGeminiConfigured();
-  const model = getPrimaryGeminiModel();
+  const model = getPrimaryWriterModel();
   const log: string[] = [];
   const say = (s: string): void => {
     console.log(s);

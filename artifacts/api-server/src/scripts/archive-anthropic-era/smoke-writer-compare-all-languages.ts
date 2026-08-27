@@ -40,23 +40,23 @@
  * or a hard error; 2 incomplete because the cost cap stopped the run.
  */
 import { writeFileSync } from "node:fs";
-import { anthropic, MODEL_DRAFT_GENERATOR, cachedSystem } from "../lib/anthropic";
-import { withAnthropicRetry } from "../services/anthropicRetry";
+import { anthropic, MODEL_DRAFT_GENERATOR, cachedSystem } from "../../lib/anthropic";
+import { withAnthropicRetry } from "../../services/anthropicRetry";
 import {
   getFollowupSystemPrompt,
   getFollowupUserPrompt,
   type FollowupContext,
-} from "../services/followupPrompts";
-import { UNTRUSTED_DATA_SYSTEM_CLAUSE } from "../lib/promptInjection";
-import { detectAllDeterministicViolations } from "../lib/doctrineLint";
-import { detectStructuralViolations, mergeViolationReports } from "../lib/structuralLint";
-import { buildWriterExemplarBlock } from "../lib/exemplarLibrary";
-import { buildWriterCompetitorBlock } from "../lib/competitorLibrary";
-import { stripClosingFromBody } from "../services/signatureStripper";
-import { shapeFollowupBody, selectLayoutProfile } from "../lib/layoutShaper";
-import { geminiGenerateJson, isGeminiConfigured } from "../lib/gemini";
-import { getPrimaryGeminiModel } from "../services/writerProvider";
-import { computeCostUsd } from "../lib/pricing";
+} from "../../services/followupPrompts";
+import { UNTRUSTED_DATA_SYSTEM_CLAUSE } from "../../lib/promptInjection";
+import { detectAllDeterministicViolations } from "../../lib/doctrineLint";
+import { detectStructuralViolations, mergeViolationReports } from "../../lib/structuralLint";
+import { buildWriterExemplarBlock } from "../../lib/exemplarLibrary";
+import { buildWriterCompetitorBlock } from "../../lib/competitorLibrary";
+import { stripClosingFromBody } from "../../services/signatureStripper";
+import { shapeFollowupBody, selectLayoutProfile } from "../../lib/layoutShaper";
+import { geminiGenerateJson, isGeminiConfigured } from "../../lib/gemini";
+import { getPrimaryGeminiModel } from "../../services/writerProvider";
+import { computeCostUsd } from "../../lib/pricing";
 
 // ---- all 36 doctrine languages (same set as the sibling all-languages smokes) ----
 const ALL_LANGS: string[] = [

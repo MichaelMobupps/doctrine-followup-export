@@ -24,13 +24,13 @@
  *      USER message, never in the cached system prefix.
  */
 import { createHash } from "node:crypto";
-import { cachedSystem, PROMPT_CACHE_TTL } from "../lib/anthropic";
-import { UNTRUSTED_DATA_SYSTEM_CLAUSE } from "../lib/promptInjection";
+import { cachedSystem, PROMPT_CACHE_TTL } from "../../lib/anthropic";
+import { UNTRUSTED_DATA_SYSTEM_CLAUSE } from "../../lib/promptInjection";
 import {
   getFollowupSystemPrompt,
   getFollowupUserPrompt,
   type FollowupContext,
-} from "../services/followupPrompts";
+} from "../../services/followupPrompts";
 
 // Full doctrine matrix across all four script families.
 const LANGS: string[] = [

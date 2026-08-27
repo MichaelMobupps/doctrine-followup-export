@@ -1,17 +1,10 @@
-import { anthropic, MODEL_DRAFT_GENERATOR, MODEL_CRITIC, MODEL_REWRITER, withOpusReasoning, cachedSystem, assertCriticModelAllowed } from "../lib/anthropic";
-import { withAnthropicRetry } from "./anthropicRetry";
 // F-3.7b: a spent row budget is terminal for the row and must outrank every
 // fail-open path below it.
 import { GenerationDeadlineError } from "../lib/generationDeadline";
-// B7r: usage tracker import. recordUsageBestEffort is no-op when called
-// outside a runWithUsageContext scope, so safe to call from any path.
-import { recordUsageBestEffort } from "../lib/usageTracker";
 import type { FollowupContext } from "./followupPrompts";
 import {
   getFollowupSystemPrompt,
   getFollowupUserPrompt,
-  getCriticSystemPrompt,
-  getCriticUserPrompt,
   getRewriterSystemPrompt,
   getRewriterUserPrompt,
 } from "./followupPrompts";
@@ -37,18 +30,20 @@ import { shapeFollowupBody, selectLayoutProfile } from "../lib/layoutShaper";
 import { extractGreetingName, hasUsableProspectName } from "../lib/greetingName";
 import { checkOutputIntegrity, UNTRUSTED_DATA_SYSTEM_CLAUSE } from "../lib/promptInjection";
 import { runCritic } from "./criticProvider";
-// Writer fallback chain (Gemini Flash -> Gemini Pro -> Sonnet) and its two
-// inputs: grey-area routing and the exemplar few-shot lift. The chain governs
-// the draft and rewrite stages; the critic stage is governed by criticProvider.
-import { runWriter, type WriterResult, type AnthropicWriterFn } from "./writerProvider";
+// Writer fallback waterfall (lib/modelPolicy.ts: Gemini Flash-Lite -> GPT-5.4-nano
+// -> Gemini 3.7 Flash -> GPT-5.4-mini) and its two inputs: grey-area routing and
+// the exemplar few-shot lift. The waterfall governs the draft and rewrite stages;
+// the critic stage is governed by criticProvider.
+import { runWriter, writerRole } from "./writerProvider";
 import { isGreyArea } from "../lib/greyArea";
 import { buildWriterExemplarBlock } from "../lib/exemplarLibrary";
 import { buildWriterCompetitorBlock } from "../lib/competitorLibrary";
 
 // Compose the writer study block: the in-region competitor reference followed by
 // the gold-standard exemplars. Both are prepended to the user turn (never the
-// cached system prefix) so they reach every writer tier and do not bust the
-// Sonnet system-prompt cache. Either part may be empty and is dropped cleanly.
+// system prefix) so they reach every writer tier while leaving the static system
+// prefix byte-identical across calls, which is what both vendors' prompt caches
+// key on. Either part may be empty and is dropped cleanly.
 function buildWriterStudyBlock(ctx: FollowupContext): string {
   return [buildWriterCompetitorBlock(ctx), buildWriterExemplarBlock(ctx)]
     .filter((b) => b && b.length > 0)
@@ -265,92 +260,20 @@ function detectMetaLanguage(text: string): { found: boolean; matches: string[] }
   return { found: matches.length > 0, matches: Array.from(new Set(matches)).slice(0, 5) };
 }
 
-function unescapeJsonString(s: string): string {
-  return s
-    .replace(/\\n/g, "\n")
-    .replace(/\\r/g, "\r")
-    .replace(/\\t/g, "\t")
-    .replace(/\\"/g, '"')
-    .replace(/\\\\/g, "\\");
-}
-
-function parseJsonResponse(text: string): any {
-  let raw = text.replace(/```json\s*|```/g, "").trim();
-
-  const firstBrace = raw.indexOf("{");
-  const lastBrace = raw.lastIndexOf("}");
-  if (firstBrace !== -1 && lastBrace > firstBrace) {
-    raw = raw.slice(firstBrace, lastBrace + 1);
-  }
-
-  try {
-    return JSON.parse(raw);
-  } catch {
-    const subjectMatch = raw.match(/"subject"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-    const bodyMatch = raw.match(/"body"\s*:\s*"((?:[^"\\]|\\[\s\S])*)"\s*\}$/s);
-    if (subjectMatch && bodyMatch) {
-      return {
-        subject: unescapeJsonString(subjectMatch[1]),
-        body: unescapeJsonString(bodyMatch[1]),
-      };
-    }
-    throw new SyntaxError(`Failed to parse AI response as JSON: ${raw.slice(0, 200)}...`);
-  }
-}
-
-// The in-house Sonnet draft writer. This is the final tier of the writer chain
-// and the only path that existed before the chain was added. It keeps the
-// 2-attempt JSON-parse retry, records its own usage, and returns the parsed
-// draft tagged with its tier. runWriter calls this only when both Gemini tiers
-// are unavailable (or for grey-area / anthropic-mode / no-key routing).
-async function generateDraftSonnet(
-  ctx: FollowupContext,
-  userPrompt: string,
-  attempt = 1,
-): Promise<WriterResult> {
-  const maxAttempts = 2;
-  const response = await withAnthropicRetry(
-    () => anthropic.messages.create({
-      model: MODEL_DRAFT_GENERATOR,
-      max_tokens: 8192,
-      system: cachedSystem(UNTRUSTED_DATA_SYSTEM_CLAUSE, getFollowupSystemPrompt()),
-      messages: [{ role: "user", content: userPrompt }],
-    }),
-    { label: "draft" },
-  );
-  // B7r: capture token usage for the activity log. Fire-and-forget.
-  void recordUsageBestEffort(response, "draft");
-
-  const textBlock = response.content.find((b) => b.type === "text");
-  if (!textBlock || textBlock.type !== "text") {
-    throw new Error("No text in draft response");
-  }
-
-  try {
-    const parsed = parseJsonResponse(textBlock.text);
-    if (!parsed.subject || !parsed.body) {
-      throw new Error("Draft missing subject or body");
-    }
-    return {
-      subject: parsed.subject,
-      body: parsed.body,
-      modelUsed: response.model || MODEL_DRAFT_GENERATOR,
-      tier: "anthropic",
-    };
-  } catch (err) {
-    logger.warn({ attempt, rawPreview: textBlock.text.slice(0, 300) }, "Draft JSON parse failed");
-    if (attempt < maxAttempts) {
-      logger.info("Retrying draft generation...");
-      return generateDraftSonnet(ctx, userPrompt, attempt + 1);
-    }
-    throw err;
-  }
-}
-
-// Build the initial draft via the writer fallback chain. The exemplar block is
-// prepended to the user prompt for every tier so the cheaper Gemini tiers write
-// against the same gold-standard examples as Sonnet. The static system prefix is
-// unchanged, so the Sonnet prompt cache is preserved.
+/**
+ * Build the initial draft via the writer waterfall.
+ *
+ * The exemplar block is prepended to the user prompt for every tier, so the
+ * cheapest tier writes against the same gold-standard examples as the dearest
+ * one. The static system prefix is unchanged, which keeps both vendors' prompt
+ * caches warm across a processing batch.
+ *
+ * There is no template fallback. If every tier is unavailable this throws and
+ * the scheduler marks the follow-up failed, which is the honest outcome: the
+ * old hardcoded multilingual template was incomplete across the 36 languages,
+ * glued raw summary paragraphs into template sentences, and — worst — masked
+ * upstream outages by silently degrading quality where nobody would look.
+ */
 async function generateDraft(
   ctx: FollowupContext,
   grey: boolean,
@@ -358,18 +281,14 @@ async function generateDraft(
 ): Promise<GeneratedFollowup> {
   const base = getFollowupUserPrompt(ctx);
   const userPrompt = exemplarBlock ? `${exemplarBlock}\n\n${base}` : base;
-  const anthropicWriter: AnthropicWriterFn = () => generateDraftSonnet(ctx, userPrompt);
-  const result = await runWriter(
-    {
-      label: "draft",
-      greyArea: grey,
-      systemParts: [UNTRUSTED_DATA_SYSTEM_CLAUSE, getFollowupSystemPrompt()],
-      userPrompt,
-      maxOutputTokens: 8192,
-      prospectName: ctx.prospect_name,
-    },
-    anthropicWriter,
-  );
+  const result = await runWriter({
+    role: writerRole("draft", grey),
+    systemParts: [UNTRUSTED_DATA_SYSTEM_CLAUSE, getFollowupSystemPrompt()],
+    userPrompt,
+    maxOutputTokens: 8192,
+    usageLabel: "draft",
+    prospectName: ctx.prospect_name,
+  });
   return { subject: result.subject, body: result.body };
 }
 
@@ -381,77 +300,8 @@ export interface CriticResult {
   needs_rewrite: boolean;
 }
 
-async function critiqueDraft(
-  ctx: FollowupContext,
-  draft: GeneratedFollowup,
-): Promise<CriticResult> {
-  // Critic runs on Sonnet. assertCriticModelAllowed refuses any Opus model.
-  assertCriticModelAllowed(MODEL_CRITIC);
-  const response = await withAnthropicRetry(
-    // Sonnet critic. withOpusReasoning is a passthrough for a non-Opus model.
-    // max_tokens stays at 16000 so the JSON verdict never truncates.
-    () => anthropic.messages.create(withOpusReasoning({
-      model: MODEL_CRITIC,
-      max_tokens: 16000,
-      system: cachedSystem(UNTRUSTED_DATA_SYSTEM_CLAUSE, getCriticSystemPrompt()),
-      messages: [{ role: "user", content: getCriticUserPrompt(ctx, draft) }],
-    })),
-    { label: "critic" },
-  );
-  // B7r: capture token usage for the activity log.
-  void recordUsageBestEffort(response, "critic");
-
-  const textBlock = response.content.find((b) => b.type === "text");
-  if (!textBlock || textBlock.type !== "text") {
-    throw new Error("No text in critic response");
-  }
-
-  const parsed = parseJsonResponse(textBlock.text);
-  return {
-    scores: parsed.scores || {},
-    overall: parsed.overall || 5,
-    issues: parsed.issues || [],
-    suggestions: parsed.suggestions || [],
-    needs_rewrite: parsed.needs_rewrite ?? false,
-  };
-}
-
-// In-house Sonnet rewriter — the final tier of the writer chain for a rewrite.
-async function rewriteDraftSonnet(
-  ctx: FollowupContext,
-  userPrompt: string,
-): Promise<WriterResult> {
-  const response = await withAnthropicRetry(
-    () => anthropic.messages.create({
-      model: MODEL_REWRITER,
-      max_tokens: 8192,
-      system: cachedSystem(UNTRUSTED_DATA_SYSTEM_CLAUSE, getRewriterSystemPrompt()),
-      messages: [{ role: "user", content: userPrompt }],
-    }),
-    { label: "rewriter" },
-  );
-  // B7r: capture token usage for the activity log.
-  void recordUsageBestEffort(response, "rewriter");
-
-  const textBlock = response.content.find((b) => b.type === "text");
-  if (!textBlock || textBlock.type !== "text") {
-    throw new Error("No text in rewriter response");
-  }
-
-  const parsed = parseJsonResponse(textBlock.text);
-  if (!parsed.subject || !parsed.body) {
-    throw new Error("Rewrite missing subject or body");
-  }
-  return {
-    subject: parsed.subject,
-    body: parsed.body,
-    modelUsed: response.model || MODEL_REWRITER,
-    tier: "anthropic",
-  };
-}
-
 /**
- * Rewrite a draft against critic feedback, via the writer fallback chain.
+ * Rewrite a draft against critic feedback, via the writer waterfall.
  *
  * The grey-area flag and exemplar block are optional and computed from ctx when
  * omitted, so external callers (scripts/adversarial-critic.ts) keep the original
@@ -471,18 +321,14 @@ export async function rewriteDraft(
     suggestions: critique.suggestions,
   });
   const userPrompt = block ? `${block}\n\n${base}` : base;
-  const anthropicWriter: AnthropicWriterFn = () => rewriteDraftSonnet(ctx, userPrompt);
-  const result = await runWriter(
-    {
-      label: "rewriter",
-      greyArea: greyFlag,
-      systemParts: [UNTRUSTED_DATA_SYSTEM_CLAUSE, getRewriterSystemPrompt()],
-      userPrompt,
-      maxOutputTokens: 8192,
-      prospectName: ctx.prospect_name,
-    },
-    anthropicWriter,
-  );
+  const result = await runWriter({
+    role: writerRole("rewriter", greyFlag),
+    systemParts: [UNTRUSTED_DATA_SYSTEM_CLAUSE, getRewriterSystemPrompt()],
+    userPrompt,
+    maxOutputTokens: 8192,
+    usageLabel: "rewriter",
+    prospectName: ctx.prospect_name,
+  });
   return { subject: result.subject, body: result.body };
 }
 
@@ -528,16 +374,16 @@ export async function generateFollowupEmail(
     }
   }
 
-  // Writer-chain inputs, computed once and reused for the draft and every
-  // rewrite. grey forces the Sonnet writer for regulated verticals; the study
-  // block (in-region competitors followed by gold-standard exemplars) lifts
-  // every tier toward the doctrine bar.
+  // Writer-waterfall inputs, computed once and reused for the draft and every
+  // rewrite. grey selects the regulated-vertical chain; the study block
+  // (in-region competitors followed by gold-standard exemplars) lifts every tier
+  // toward the doctrine bar.
   const grey = isGreyArea(ctx);
   const exemplarBlock = buildWriterStudyBlock(ctx);
 
   logger.info(
     { prospect: ctx.prospect_name, stage: ctx.stage, previousFollowups: ctx.previous_followups?.length || 0, greyArea: grey },
-    "Step 1: Generating initial draft (writer chain: Gemini Flash -> Gemini Pro -> Sonnet; grey-area stays on Sonnet)",
+    "Step 1: Generating initial draft (writer waterfall; grey-area verticals use their own chain)",
   );
 
   // Step 1: Draft.
@@ -589,7 +435,7 @@ export async function generateFollowupEmail(
 
     logger.info(
       { prospect: ctx.prospect_name, iteration, metaFound: metaCheck.found, metaMatches: metaCheck.matches },
-      `Iteration ${iteration}: Critiquing draft (Sonnet critic)`,
+      `Iteration ${iteration}: Critiquing draft (critic waterfall)`,
     );
 
     // If the critic itself fails after retries, we don't abandon — we return
@@ -597,9 +443,9 @@ export async function generateFollowupEmail(
     //
     // CB-1 cost gate: when the deterministic layer (meta-language or the
     // doctrine and nativeness checks) already flags the draft, we know it
-    // needs a rewrite, so we skip the Opus critic call this iteration and
+    // needs a rewrite, so we skip the LLM critic call this iteration and
     // build the critique from the deterministic findings merged in below.
-    // The Opus critic runs only on a draft that is already deterministically
+    // The LLM critic runs only on a draft that is already deterministically
     // clean, which is where its subjective judgment adds value the free
     // checks cannot. The hallucination and doctrine guards are unchanged;
     // only the timing of the critic call changes.
@@ -608,11 +454,11 @@ export async function generateFollowupEmail(
       critique = { scores: {}, overall: 2, issues: [], suggestions: [], needs_rewrite: true };
       logger.info(
         { prospect: ctx.prospect_name, iteration },
-        `Iteration ${iteration}: deterministic checks flagged the draft, rewriting without an Opus critic call`,
+        `Iteration ${iteration}: deterministic checks flagged the draft, rewriting without an LLM critic call`,
       );
     } else {
       try {
-        critique = await runCritic(ctx, current, () => critiqueDraft(ctx, current));
+        critique = await runCritic(ctx, current);
       } catch (err) {
         // F-3.7b: the critic is deliberately fail-open — a critic outage should
         // ship the best draft rather than fail the row. A spent generation
@@ -691,13 +537,20 @@ export async function generateFollowupEmail(
 
     logger.info(
       { prospect: ctx.prospect_name, iteration },
-      `Iteration ${iteration}: Rewriting draft (writer chain)`,
+      `Iteration ${iteration}: Rewriting draft (writer waterfall)`,
     );
 
     try {
       current = await rewriteDraft(ctx, current, critique, grey, exemplarBlock);
       logger.info({ prospect: ctx.prospect_name, iteration }, "Rewrite complete");
     } catch (err) {
+      // F-3.7b: same rule as the critic catch above — a spent row budget is
+      // NOT a rewriter outage. "Return best seen" here can ship a draft the
+      // deterministic layer has already FLAGGED (on iteration 1 the synthetic
+      // critique makes the flagged draft the best seen so far), and doing that
+      // on the strength of a deadline is exactly what the budget rule forbids.
+      // This catch predates the guard; the audit brought it in line.
+      if (err instanceof GenerationDeadlineError) throw err;
       logger.warn(
         { err: String(err), prospect: ctx.prospect_name, iteration },
         "Rewriter unavailable after retries — returning best draft seen",

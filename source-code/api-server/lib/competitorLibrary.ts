@@ -1,9 +1,9 @@
 /**
  * In-region competitor retrieval and writer prompt block construction.
  *
- * Purpose: lift the writing quality of the cheaper writer tiers (Gemini Flash,
- * Gemini Pro) toward the Sonnet/Opus bar by handing the model ground-truth
- * in-market competitor names. A cheaper model recalls regional competitors
+ * Purpose: lift the writing quality of the cheaper writer tiers toward the
+ * strongest tier's bar by handing the model ground-truth in-market competitor
+ * names. A cheaper model recalls regional competitors
  * unreliably and can name a dominant market leader as a peer, which breaks the
  * doctrine. Injecting a curated, in-region candidate set removes that recall
  * burden and gives the deterministic critic/linter concrete names to check.
@@ -312,8 +312,9 @@ export function selectCompetitors(ctx: CompetitorContext): SelectedCompetitors |
  * selection exists for the context.
  *
  * The block is prepended to the user prompt (alongside the exemplar block) and
- * never to the cached system prefix, so it does not bust the Sonnet system-prompt
- * cache and reaches the Gemini tiers in the same place.
+ * never to the system prefix, which stays byte-identical across calls — that is
+ * what both vendors' prompt caches key on — and so reaches every tier in the
+ * same place.
  */
 export function buildWriterCompetitorBlock(ctx: CompetitorContext): string {
   if (!competitorsEnabled()) return "";

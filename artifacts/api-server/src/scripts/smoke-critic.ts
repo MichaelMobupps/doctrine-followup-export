@@ -1,5 +1,5 @@
 /**
- * Smoke test for the Gemini critic.
+ * Smoke test for the critic waterfall.
  *
  * On-demand diagnostic, not part of the auto-run suite, because it makes a
  * live billed call to Gemini and needs GEMINI_API_KEY. It lives under
@@ -10,15 +10,14 @@
  * flip the model with the env var.
  *
  * What it verifies, fastest checks first:
- *   1. A real price row exists for the configured Gemini model.
- *   2. CRITIC_PROVIDER routing: default is gemini; anthropic mode uses the
- *      Anthropic (Sonnet) critic; gemini mode with no key uses the internal Sonnet critic.
- *   3. Live transport: a real call returns parseable JSON, the verdict has the
+ *   1. Chain shape: at least two tiers, spanning BOTH vendors, no Anthropic
+ *      model (the Aug 2026 ban), and a real price row for every tier — an
+ *      unpriced tier silently bills at DEFAULT_PRICE and corrupts the ledger.
+ *   2. Live transport: a real call returns parseable JSON, the verdict has the
  *      correct shape, and usage and cost are reported. The system prompt is
- *      the exact production construction, including the Gemini focus directive.
- *   4. Integration: in gemini mode runCritic returns a valid verdict (from
- *      Gemini, or from the Sonnet fallback on a 503) and never falls through
- *      to the injected Opus critic.
+ *      the exact production construction, including the critic focus directive.
+ *   3. Integration: runCritic returns a valid verdict through the real
+ *      waterfall.
  *
  * The draft under test is mechanically clean on purpose. In production the
  * deterministic linter rewrites any mechanical violation upstream, so the LLM
@@ -31,7 +30,8 @@
  * Exit codes: 0 every check passed, 1 a real failure, 2 the live call was
  * blocked by a transient Gemini overload (503), which is not a code problem.
  */
-import { runCritic, getCriticProvider, GEMINI_CRITIC_FOCUS } from "../services/criticProvider";
+import { runCritic, GEMINI_CRITIC_FOCUS } from "../services/criticProvider";
+import { getChain, describeChain, isAnthropicModel } from "../lib/modelPolicy";
 import {
   geminiGenerateJson,
   isGeminiConfigured,
@@ -160,10 +160,11 @@ function exitCode(): number {
 }
 
 async function main(): Promise<void> {
-  console.log("=== Gemini critic smoke test ===");
+  console.log("=== critic waterfall smoke test ===");
   console.log("model: " + GEMINI_CRITIC_MODEL + "\n");
 
-  // 1. Pricing row exists for whatever model is configured.
+  // 1. Pricing row exists for the live-transport model this smoke calls
+  // directly. (Every chain tier is checked in section 2.)
   const price = getModelPrice(GEMINI_CRITIC_MODEL);
   check(
     "pricing: row present for configured model " + GEMINI_CRITIC_MODEL,
@@ -171,68 +172,37 @@ async function main(): Promise<void> {
     "input=" + price.input + " output=" + price.output,
   );
 
-  // 2. Routing. The provider and anthropic-mode checks need no network. The
-  // no-key check makes one real Sonnet call, since gemini mode with no key now
-  // uses the internal Sonnet critic rather than the injected Opus critic.
-  const okVerdict: CriticResult = {
-    scores: {},
-    overall: 4,
-    issues: [],
-    suggestions: [],
-    needs_rewrite: false,
-  };
-  let stubCalled = false;
-  const stub = async (): Promise<CriticResult> => {
-    stubCalled = true;
-    return okVerdict;
-  };
-
-  const savedProvider = process.env.CRITIC_PROVIDER;
-  const savedKey = process.env.GEMINI_API_KEY;
-
-  delete process.env.CRITIC_PROVIDER;
-  check("routing: default provider is gemini", getCriticProvider() === "gemini");
-
-  process.env.CRITIC_PROVIDER = "anthropic";
-  stubCalled = false;
-  const r1 = await runCritic(ctx, flawedDraft, stub);
+  // 2. Chain shape. No network. These are the properties that make the
+  // waterfall a waterfall, and each one has been broken at least once while
+  // this migration was being written.
+  const criticChain = getChain("critic");
+  console.log("  chain: " + describeChain(criticChain));
+  check("chain: at least two tiers", criticChain.length >= 2);
   check(
-    "routing: anthropic mode calls the Anthropic critic",
-    stubCalled && r1.overall === 4,
+    "chain: spans both vendors, so one vendor's outage cannot empty it",
+    new Set(criticChain.map((t) => t.provider)).size >= 2,
+    criticChain.map((t) => t.provider).join(","),
   );
-
-  delete process.env.GEMINI_API_KEY;
-  process.env.CRITIC_PROVIDER = "gemini";
-  let injectedUsedNoKey = false;
-  const sentinelNoKey = async (): Promise<CriticResult> => {
-    injectedUsedNoKey = true;
-    return okVerdict;
-  };
-  try {
-    const r2 = await runCritic(ctx, flawedDraft, sentinelNoKey);
+  check(
+    "chain: no Anthropic model (the Aug 2026 ban)",
+    !criticChain.some((t) => isAnthropicModel(t.model)),
+    describeChain(criticChain),
+  );
+  for (const tier of criticChain) {
     check(
-      "routing: gemini mode with no key uses the internal Sonnet critic, not the injected Opus critic",
-      isValidVerdict(r2) && !injectedUsedNoKey,
-      "injectedOpusUsed=" + injectedUsedNoKey,
-    );
-  } catch (e) {
-    check(
-      "routing: gemini mode with no key uses the internal Sonnet critic, not the injected Opus critic",
-      false,
-      String(e),
+      "chain: " + tier.model + " has a real price row",
+      MODEL_PRICES[tier.model] !== undefined,
+      "an unpriced tier bills at DEFAULT_PRICE and corrupts the ledger",
     );
   }
-  if (savedKey) process.env.GEMINI_API_KEY = savedKey;
 
-  // 3. Live Gemini transport, shape, usage, cost. Uses the exact production
+  // 3a. Live Gemini transport, shape, usage, cost. Uses the exact production
   // system construction, including the Gemini focus directive.
   if (!isGeminiConfigured()) {
     failed++;
     console.log(
       "\n  FAIL  live: GEMINI_API_KEY is not set, cannot smoke-test the Gemini path",
     );
-    if (savedProvider === undefined) delete process.env.CRITIC_PROVIDER;
-    else process.env.CRITIC_PROVIDER = savedProvider;
     summary();
     process.exit(exitCode());
   }
@@ -327,36 +297,21 @@ async function main(): Promise<void> {
     );
     check("live: usage metadata present", prompt > 0 && outT > 0);
 
-    // 4. Integration through the real switch. In gemini mode the critic is
-    // Gemini, or Sonnet on a 503 after retries; the injected Opus critic must
-    // never be used. We cannot tell Gemini from the Sonnet fallback by the
-    // return value alone, so we assert the verdict is valid and the injected
-    // Opus critic stayed unused. If a 503 hits here, this also exercises the
-    // real Sonnet fallback, and runCritic logs that it did.
-    process.env.CRITIC_PROVIDER = "gemini";
-    let injectedOpusUsed = false;
-    const sentinelCritic = async (): Promise<CriticResult> => {
-      injectedOpusUsed = true;
-      return okVerdict;
-    };
+    // 3b. Integration through the real waterfall. We cannot tell tier 1 from a
+    // fallback by the return value alone, so we assert the verdict is valid and
+    // let runCritic's own log line report which model served — that line is the
+    // one to read if this check ever passes while the bill looks wrong.
     try {
-      const r3 = await runCritic(ctx, flawedDraft, sentinelCritic);
+      const r3 = await runCritic(ctx, flawedDraft);
       check(
-        "integration: gemini path returns a valid verdict and never uses the injected Opus critic",
-        isValidVerdict(r3) && !injectedOpusUsed,
-        "overall=" + r3.overall + " injectedOpusUsed=" + injectedOpusUsed,
+        "integration: the critic waterfall returns a valid verdict",
+        isValidVerdict(r3),
+        "overall=" + r3.overall,
       );
     } catch (e) {
-      check(
-        "integration: gemini path returns a valid verdict and never uses the injected Opus critic",
-        false,
-        String(e),
-      );
+      check("integration: the critic waterfall returns a valid verdict", false, String(e));
     }
   }
-
-  if (savedProvider === undefined) delete process.env.CRITIC_PROVIDER;
-  else process.env.CRITIC_PROVIDER = savedProvider;
 
   summary();
 }

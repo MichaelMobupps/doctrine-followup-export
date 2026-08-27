@@ -8,6 +8,11 @@ process.env.TZ = "UTC";
 
 import app from "./app";
 import { logger } from "./lib/logger";
+// Aug 2026: every LLM role runs on a Gemini/OpenAI fallback waterfall. Resolve
+// and validate all of them before listening.
+import { validateAllChains, describeChain } from "./lib/modelPolicy";
+import { isGeminiConfigured } from "./lib/gemini";
+import { isOpenAiConfigured } from "./lib/openai";
 import { startCronJobs } from "./cron";
 // B7r: startup migrations import (currently: ensure followup_usage table exists).
 import { runStartupMigrations } from "./lib/startupMigrations";
@@ -21,6 +26,43 @@ if (Intl.DateTimeFormat().resolvedOptions().timeZone !== "UTC") {
   throw new Error(
     `Process timezone is ${Intl.DateTimeFormat().resolvedOptions().timeZone}, not UTC. ` +
     `Doctrine schedule math assumes UTC. Refusing to start.`,
+  );
+}
+
+/**
+ * Resolve every LLM role's model chain at boot.
+ *
+ * This is a deliberate fail-fast. `validateAllChains` throws if any chain — a
+ * built-in or an `LLM_CHAIN_*` env override — names an Anthropic model, and a
+ * malformed override is the kind of thing you want to discover in the deploy
+ * log, not at 2am on the first follow-up of the night.
+ *
+ * It also logs the resolved chains, so "what did this deployment actually run
+ * on?" is answerable from the boot output alone rather than by reading the
+ * source at the commit that was deployed.
+ */
+const resolvedChains = validateAllChains();
+for (const [role, chain] of Object.entries(resolvedChains)) {
+  logger.info({ role, chain: describeChain(chain) }, "LLM chain resolved");
+}
+
+// A missing key does not stop the server — the router simply skips that
+// vendor's tiers — but it silently halves every waterfall, so say so loudly.
+// Losing BOTH is fatal: there would be nothing left to write a follow-up with.
+const geminiOk = isGeminiConfigured();
+const openaiOk = isOpenAiConfigured();
+if (!geminiOk && !openaiOk) {
+  throw new Error(
+    "Neither GEMINI_API_KEY nor OPENAI_API_KEY is set. Every LLM role would " +
+      "have no usable tier, so no follow-up could be generated. Add at least " +
+      "one as a Replit Secret on BOTH the workspace and the deployment.",
+  );
+}
+if (!geminiOk || !openaiOk) {
+  logger.warn(
+    { geminiConfigured: geminiOk, openaiConfigured: openaiOk },
+    "Only one LLM vendor is configured — every fallback waterfall is running at " +
+      "half depth, and a single-vendor outage will stop follow-up generation",
   );
 }
 

@@ -9,7 +9,17 @@
     "start": "node --enable-source-maps ./dist/index.mjs",
     "typecheck": "tsc -b",
     "seed": "node --import tsx src/scripts/seed.ts",
-    "create-labels": "node --import tsx src/scripts/createLabels.ts"
+    "create-labels": "node --import tsx src/scripts/createLabels.ts",
+    "llm:chains": "node --import tsx src/scripts/smoke-llm-waterfall.ts --static-only",
+    "llm:test": "node --import tsx --test src/tests/test-llm-router.ts src/tests/test-model-policy.ts src/tests/test-no-anthropic-on-production-paths.ts src/tests/test-writer-provider.ts",
+    "llm:smoke": "node --import tsx src/scripts/smoke-llm-waterfall.ts",
+    "llm:bench:writer": "node --import tsx src/scripts/bench-llm-quality.ts",
+    "llm:bench:critic": "node --import tsx src/scripts/bench-llm-critic.ts",
+    "llm:e2e": "node --import tsx src/scripts/smoke-writer-heal-all-languages.ts",
+    "llm:bench:pipeline": "node --import tsx src/scripts/bench-llm-pipeline.ts",
+    "llm:smoke:summarizer": "node --import tsx src/scripts/smoke-summarizer-cheap.ts",
+    "llm:smoke:context": "node --import tsx src/scripts/smoke-context-cheap-chain.ts",
+    "llm:smoke:critic": "node --import tsx src/scripts/smoke-critic.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.65.0",

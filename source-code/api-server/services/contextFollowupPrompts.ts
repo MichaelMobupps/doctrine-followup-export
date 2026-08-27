@@ -6,9 +6,10 @@
  * the prior email's content faithfully. No doctrine principles. No
  * vertical taxonomy. No MAFO positioning. No sales language at all.
  *
- * Pipeline mirrors the Doctrine 3-call shape (Sonnet generator → Opus
- * critic → Sonnet rewriter, all adaptive). The critic is the safety net
- * against hallucinations, off-tone drift, and constraint violations.
+ * Pipeline mirrors the Doctrine 3-call shape (generator → critic →
+ * rewriter, each on its own Gemini/OpenAI waterfall — see
+ * lib/modelPolicy.ts). The critic is the safety net against
+ * hallucinations, off-tone drift, and constraint violations.
  */
 
 import type { FollowupContext, PreviousFollowup } from "./followupPrompts";

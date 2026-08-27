@@ -10,9 +10,10 @@
  *
  * This module adds a cheap LLM confirmation that runs ONLY when the regex layer
  * has already flagged FOLLOWUP-ACK (the ~regex-miss subset, a few percent of
- * cells, and only for the ~20 languages the table covers). A single Haiku yes/no
- * reads the opening and confirms whether it references prior outreach. If it does,
- * the false positive is dropped; otherwise the deterministic flag stands.
+ * cells, and only for the ~20 languages the table covers). A single yes/no on
+ * the cheapest chain in the product reads the opening and confirms whether it
+ * references prior outreach. If it does, the false positive is dropped;
+ * otherwise the deterministic flag stands.
  *
  * Safety properties:
  *   - Fail-open CONSERVATIVE: on any error, timeout, disabled flag, or a non-YES
@@ -20,22 +21,32 @@
  *     ever REMOVE a false positive by positively confirming a reference, so the
  *     worst case is "no change from today," never a new failure mode.
  *   - No LLM call unless FOLLOWUP-ACK already fired (regex stays the free path).
- *   - Disable entirely with FOLLOWUP_ACK_LLM_CONFIRM=0. Override the model with
- *     ACK_CONFIRM_MODEL if the Haiku string ever changes.
+ *   - Disable entirely with FOLLOWUP_ACK_LLM_CONFIRM=0. Change the models with
+ *     LLM_CHAIN_ACK_CONFIRM (see lib/modelPolicy.ts).
  */
-import { anthropic } from "./anthropic";
+import { runLlmJson, type LlmJsonSchema } from "./llmRouter";
 import { UNTRUSTED_DATA_SYSTEM_CLAUSE, wrapUntrusted } from "./promptInjection";
 import type { ViolationReport } from "./doctrineLint";
 import { logger } from "./logger";
 
 const ENABLED = process.env.FOLLOWUP_ACK_LLM_CONFIRM !== "0";
-const MODEL = process.env.ACK_CONFIRM_MODEL ?? "claude-haiku-4-5";
 
 const ACK_SYSTEM = `You judge whether the OPENING of a sales follow-up email references or acknowledges a PRIOR message, email, or outreach to the same recipient.
 
 A reference may be explicit or paraphrased, in ANY language. It counts as a reference if the opening points back to an earlier contact, e.g. "following up on my email", "circling back", "as I mentioned", "regarding my previous note", "in addition to the message I sent a few days ago", "picking up on my earlier email". It does NOT count if the opening starts a brand-new pitch with no mention of any earlier contact.
 
-Answer with exactly one word: YES if the opening references prior outreach, NO if it opens cold. Output only YES or NO.`;
+Return ONLY this JSON object: {"answer": "YES"} if the opening references prior outreach, or {"answer": "NO"} if it opens cold.`;
+
+// The answer comes back as a one-key JSON object rather than a bare word.
+// Both vendors constrain structured output through a JSON schema, and OpenAI's
+// json_object mode additionally refuses a prompt that never says "json" — a
+// one-field object is the shape that works identically on both, and it costs
+// about five output tokens.
+const ACK_SCHEMA: LlmJsonSchema = {
+  name: "ack_confirm",
+  properties: { answer: "string" },
+  required: ["answer"],
+};
 
 /**
  * True iff the opening references prior outreach. Returns false on disabled,
@@ -46,15 +57,25 @@ export async function referencesPriorOutreach(body: string, lang: string): Promi
   const opening = body.slice(0, 500).trim();
   if (!opening) return false;
   try {
-    const resp = await anthropic.messages.create({
-      model: MODEL,
-      max_tokens: 5,
-      system: `${UNTRUSTED_DATA_SYSTEM_CLAUSE}\n\n${ACK_SYSTEM}`,
-      messages: [{ role: "user", content: wrapUntrusted("EMAIL_OPENING", opening).block }],
+    const { value } = await runLlmJson<boolean>({
+      role: "ack_confirm",
+      systemParts: [UNTRUSTED_DATA_SYSTEM_CLAUSE, ACK_SYSTEM],
+      user: wrapUntrusted("EMAIL_OPENING", opening).block,
+      maxOutputTokens: 32,
+      schema: ACK_SCHEMA,
+      usage: { kind: "aux", app: "followup_ack_confirm", label: "ack_confirm" },
+      validate: (parsed) => {
+        const answer = String((parsed as { answer?: unknown }).answer ?? "").trim().toUpperCase();
+        if (!answer.startsWith("YES") && !answer.startsWith("NO")) {
+          // Neither verdict. Advance the waterfall rather than reading an
+          // ambiguous answer as NO — a wrong NO is a needless rewrite, and the
+          // whole point of this module is to stop paying for those.
+          throw new Error(`ack confirm returned neither YES nor NO: ${answer.slice(0, 32)}`);
+        }
+        return answer.startsWith("YES");
+      },
     });
-    const tb = resp.content.find((b) => b.type === "text");
-    const answer = tb && tb.type === "text" ? tb.text.trim().toUpperCase() : "";
-    return answer.startsWith("YES");
+    return value;
   } catch (err) {
     logger.warn({ err: String(err), lang }, "FOLLOWUP-ACK LLM confirm failed — keeping deterministic flag");
     return false;
